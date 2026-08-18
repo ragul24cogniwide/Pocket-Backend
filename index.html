@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pocket Real-Time Messaging Testbed (Neon DB + Render Redis)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; padding: 16px; }
+    header { text-align: center; margin-bottom: 16px; }
+    h1 { font-size: 1.5rem; color: #FFB800; }
+    p.sub { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+    .split-view { display: flex; gap: 16px; height: calc(100vh - 90px); }
+    .client-pane { flex: 1; background: #1e293b; border-radius: 12px; display: flex; flex-direction: column; border: 1px solid #334155; overflow: hidden; }
+    .pane-header { padding: 12px 16px; background: #0f172a; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; }
+    .user-info { display: flex; align-items: center; gap: 8px; }
+    .avatar-circle { width: 32px; height: 32px; border-radius: 16px; background: #FFB800; color: #121212; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 0.85rem; }
+    .status-badge { font-size: 0.7rem; font-weight: bold; padding: 3px 8px; border-radius: 999px; }
+    .status-badge.online { background: #059669; color: #ecfdf5; }
+    .status-badge.offline { background: #dc2626; color: #fef2f2; }
+    .auth-section { padding: 12px 16px; background: #182234; border-bottom: 1px solid #334155; }
+    .otp-alert { background: rgba(255, 184, 0, 0.15); border: 1px dashed #FFB800; color: #FFB800; padding: 6px 10px; border-radius: 6px; font-size: 0.8rem; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+    .row { display: flex; gap: 8px; margin-bottom: 6px; }
+    input[type="text"] { flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 0.85rem; outline: none; }
+    button { padding: 7px 12px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; background: #FFB800; color: #121212; font-size: 0.8rem; }
+    button.sec { background: #38bdf8; color: #0f172a; }
+    button.danger { background: #ef4444; color: #fff; }
+    .messages-area { flex: 1; padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; background: #111827; }
+    .typing-box { font-size: 0.75rem; color: #FFB800; font-style: italic; min-height: 18px; padding: 2px 14px; }
+    .msg { max-width: 78%; padding: 8px 12px; border-radius: 10px; font-size: 0.85rem; line-height: 1.35; position: relative; }
+    .msg.sent { align-self: flex-end; background: #FFB800; color: #121212; border-top-right-radius: 2px; }
+    .msg.received { align-self: flex-start; background: #334155; color: #f8fafc; border-top-left-radius: 2px; }
+    .msg-meta { font-size: 0.65rem; opacity: 0.8; margin-top: 4px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .ticks { font-weight: bold; }
+    .read-btn { background: #10b981; color: white; font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; cursor: pointer; border: none; margin-top: 4px; }
+    .input-bar { padding: 10px 14px; background: #0f172a; display: flex; gap: 8px; border-top: 1px solid #334155; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Pocket Real-Time Messaging Testbed</h1>
+    <p class="sub">Neon PostgreSQL (Async) + Render Redis Pub/Sub + WebSocket OTP Authentication</p>
+  </header>
+
+  <div class="split-view">
+    <!-- User A: +919876543210 -->
+    <div class="client-pane" id="pane-alice">
+      <div class="pane-header">
+        <div class="user-info">
+          <div class="avatar-circle">A</div>
+          <div>
+            <div style="font-weight:bold; font-size:0.9rem;">Alice (+919876543210)</div>
+            <div id="status-text-alice" style="font-size:0.75rem; color:#94a3b8;">Not connected</div>
+          </div>
+        </div>
+        <span class="status-badge offline" id="badge-alice">OFFLINE</span>
+      </div>
+
+      <!-- Auth Section -->
+      <div class="auth-section">
+        <div id="otp-alert-alice" class="otp-alert" style="display:none;">
+          <span id="otp-code-text-alice">OTP: 123456</span>
+          <button style="padding:2px 6px; font-size:0.7rem;" onclick="fillOtp('alice')">Auto Fill</button>
+        </div>
+        <div class="row">
+          <input type="text" id="phone-alice" value="+919876543210" placeholder="Phone Number" />
+          <button onclick="requestOtp('alice')">Send OTP</button>
+        </div>
+        <div class="row">
+          <input type="text" id="otp-alice" placeholder="Enter 6-digit OTP" />
+          <button class="sec" onclick="loginUser('alice', 'Alice')">Verify & Connect</button>
+          <button class="danger" onclick="disconnectSocket('alice')">Disconnect</button>
+        </div>
+      </div>
+
+      <div class="messages-area" id="messages-alice"></div>
+      <div class="typing-box" id="typing-alice"></div>
+
+      <div class="input-bar">
+        <input type="text" id="msg-input-alice" placeholder="Type message to Bob..."
+               oninput="handleTyping('alice', '+919876543211')"
+               onkeydown="if(event.key==='Enter') sendChatMessage('alice', '+919876543211')" />
+        <button onclick="sendChatMessage('alice', '+919876543211')">Send</button>
+      </div>
+    </div>
+
+    <!-- User B: +919876543211 -->
+    <div class="client-pane" id="pane-bob">
+      <div class="pane-header">
+        <div class="user-info">
+          <div class="avatar-circle" style="background:#38bdf8;">B</div>
+          <div>
+            <div style="font-weight:bold; font-size:0.9rem;">Bob (+919876543211)</div>
+            <div id="status-text-bob" style="font-size:0.75rem; color:#94a3b8;">Not connected</div>
+          </div>
+        </div>
+        <span class="status-badge offline" id="badge-bob">OFFLINE</span>
+      </div>
+
+      <!-- Auth Section -->
+      <div class="auth-section">
+        <div id="otp-alert-bob" class="otp-alert" style="display:none;">
+          <span id="otp-code-text-bob">OTP: 123456</span>
+          <button style="padding:2px 6px; font-size:0.7rem;" onclick="fillOtp('bob')">Auto Fill</button>
+        </div>
+        <div class="row">
+          <input type="text" id="phone-bob" value="+919876543211" placeholder="Phone Number" />
+          <button onclick="requestOtp('bob')">Send OTP</button>
+        </div>
+        <div class="row">
+          <input type="text" id="otp-bob" placeholder="Enter 6-digit OTP" />
+          <button class="sec" onclick="loginUser('bob', 'Bob')">Verify & Connect</button>
+          <button class="danger" onclick="disconnectSocket('bob')">Disconnect</button>
+        </div>
+      </div>
+
+      <div class="messages-area" id="messages-bob"></div>
+      <div class="typing-box" id="typing-bob"></div>
+
+      <div class="input-bar">
+        <input type="text" id="msg-input-bob" placeholder="Type message to Alice..."
+               oninput="handleTyping('bob', '+919876543210')"
+               onkeydown="if(event.key==='Enter') sendChatMessage('bob', '+919876543210')" />
+        <button onclick="sendChatMessage('bob', '+919876543210')">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      alice: { token: null, socket: null, typingTimeout: null, devOtp: null, phone: '+919876543210' },
+      bob: { token: null, socket: null, typingTimeout: null, devOtp: null, phone: '+919876543211' }
+    };
+
+    async function requestOtp(user) {
+      const phone = document.getElementById(`phone-${user}`).value.trim();
+      state[user].phone = phone;
+
+      const res = await fetch('/api/auth/send-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone_number: phone })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        state[user].devOtp = data.dev_otp;
+        const alertBox = document.getElementById(`otp-alert-${user}`);
+        document.getElementById(`otp-code-text-${user}`).innerText = `Generated OTP: ${data.dev_otp}`;
+        alertBox.style.display = 'flex';
+      } else {
+        alert(data.detail || 'Failed to generate OTP');
+      }
+    }
+
+    function fillOtp(user) {
+      if (state[user].devOtp) {
+        document.getElementById(`otp-${user}`).value = state[user].devOtp;
+      }
+    }
+
+    async function loginUser(user, defaultName) {
+      const phone = document.getElementById(`phone-${user}`).value.trim();
+      const otp = document.getElementById(`otp-${user}`).value.trim();
+      if (!otp) return alert('Please enter OTP');
+
+      const res = await fetch('/api/auth/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone_number: phone, otp_code: otp, username: defaultName })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        state[user].token = data.access_token;
+        state[user].phone = phone;
+        connectWebSocket(user, phone);
+      } else {
+        alert(data.detail || 'Login failed');
+      }
+    }
+
+    function connectWebSocket(user, phone) {
+      if (state[user].socket) state[user].socket.close();
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws/${encodeURIComponent(phone)}`;
+      const ws = new WebSocket(wsUrl);
+      state[user].socket = ws;
+
+      ws.onopen = () => {
+        document.getElementById(`badge-${user}`).className = 'status-badge online';
+        document.getElementById(`badge-${user}`).innerText = 'ONLINE';
+        document.getElementById(`status-text-${user}`).innerText = 'Connected via WebSocket';
+      };
+
+      ws.onmessage = (event) => {
+        const frame = JSON.parse(event.data);
+        handleInboundFrame(user, frame);
+      };
+
+      ws.onclose = () => {
+        document.getElementById(`badge-${user}`).className = 'status-badge offline';
+        document.getElementById(`badge-${user}`).innerText = 'OFFLINE';
+        document.getElementById(`status-text-${user}`).innerText = 'Disconnected';
+        state[user].socket = null;
+      };
+    }
+
+    function disconnectSocket(user) {
+      if (state[user].socket) {
+        state[user].socket.close();
+      }
+    }
+
+    function handleTyping(sender, receiverPhone) {
+      if (!state[sender].socket) return;
+      state[sender].socket.send(JSON.stringify({
+        type: 'typing_start',
+        data: { receiver_id: receiverPhone }
+      }));
+
+      clearTimeout(state[sender].typingTimeout);
+      state[sender].typingTimeout = setTimeout(() => {
+        if (state[sender].socket) {
+          state[sender].socket.send(JSON.stringify({
+            type: 'typing_stop',
+            data: { receiver_id: receiverPhone }
+          }));
+        }
+      }, 1500);
+    }
+
+    function sendChatMessage(sender, receiverPhone) {
+      const input = document.getElementById(`msg-input-${sender}`);
+      const content = input.value.trim();
+      if (!content || !state[sender].socket) return;
+
+      const tempId = "temp_" + Date.now();
+      const payload = {
+        type: "chat_message",
+        data: {
+          temp_msg_id: tempId,
+          receiver_id: receiverPhone,
+          content: content
+        }
+      };
+
+      state[sender].socket.send(JSON.stringify(payload));
+
+      renderMessage(sender, {
+        id: tempId,
+        type: 'sent',
+        content: content,
+        status: 'SENT',
+        ticks: '✓',
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      });
+
+      input.value = '';
+    }
+
+    function markMessageAsRead(receiverUser, messageId, senderPhone) {
+      if (!state[receiverUser].socket) return;
+      state[receiverUser].socket.send(JSON.stringify({
+        type: "ack_read",
+        data: { message_id: messageId, sender_id: senderPhone }
+      }));
+      const btn = document.getElementById(`read-btn-${receiverUser}-${messageId}`);
+      if (btn) btn.remove();
+    }
+
+    function handleInboundFrame(currentUser, frame) {
+      const { type, data } = frame;
+
+      if (type === "ack_sent") {
+        updateMessageStatus(currentUser, data.temp_msg_id, data.message_id, "SENT", "✓");
+      } else if (type === "ack_delivered") {
+        updateMessageStatus(currentUser, null, data.message_id, "DELIVERED", "✓✓");
+      } else if (type === "ack_read") {
+        updateMessageStatus(currentUser, null, data.message_id, "READ", "✓✓ (Read)");
+      } else if (type === "chat_message") {
+        renderMessage(currentUser, {
+          id: data.message_id,
+          type: 'received',
+          senderId: data.sender_id,
+          content: data.content,
+          status: data.status,
+          ticks: '',
+          time: new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        });
+      } else if (type === "typing_start") {
+        document.getElementById(`typing-${currentUser}`).innerText = `${data.sender_id} is typing...`;
+      } else if (type === "typing_stop") {
+        document.getElementById(`typing-${currentUser}`).innerText = "";
+      } else if (type === "presence_update") {
+        console.log(`Presence update for ${data.user_id}: is_online=${data.is_online}`);
+      }
+    }
+
+    function renderMessage(user, msg) {
+      const container = document.getElementById(`messages-${user}`);
+      const div = document.createElement('div');
+      div.className = `msg ${msg.type}`;
+      div.id = `msg-${user}-${msg.id}`;
+
+      let readAction = '';
+      if (msg.type === 'received') {
+        readAction = `<button id="read-btn-${user}-${msg.id}" class="read-btn" onclick="markMessageAsRead('${user}', '${msg.id}', '${msg.senderId}')">Mark as Read</button>`;
+      }
+
+      div.innerHTML = `
+        <div>${msg.content}</div>
+        <div class="msg-meta">
+          <span>${msg.time}</span>
+          <span class="ticks" id="status-${user}-${msg.id}">${msg.ticks || ''}</span>
+        </div>
+        ${readAction}
+      `;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function updateMessageStatus(user, tempId, actualId, statusText, ticks) {
+      let targetId = actualId;
+      if (tempId && document.getElementById(`msg-${user}-${tempId}`)) {
+        const msgEl = document.getElementById(`msg-${user}-${tempId}`);
+        msgEl.id = `msg-${user}-${actualId}`;
+        const statusEl = document.getElementById(`status-${user}-${tempId}`);
+        statusEl.id = `status-${user}-${actualId}`;
+        targetId = actualId;
+      }
+      const el = document.getElementById(`status-${user}-${targetId}`);
+      if (el) el.innerText = ticks;
+    }
+  </script>
+</body>
+</html>
