@@ -112,6 +112,18 @@ class ConnectionManager:
     # -------------------------------------------------------------------------
     # Messaging & Routing
     # -------------------------------------------------------------------------
+    def _find_local_ws(self, user_id: str) -> Optional[WebSocket]:
+        """Finds WebSocket connection with exact match or phone digit tolerance."""
+        if user_id in self.active_connections:
+            return self.active_connections[user_id]
+        digits = "".join(filter(str.isdigit, str(user_id)))
+        if len(digits) >= 8:
+            for conn_id, ws in self.active_connections.items():
+                conn_digits = "".join(filter(str.isdigit, str(conn_id)))
+                if conn_digits and (digits.endswith(conn_digits) or conn_digits.endswith(digits)):
+                    return ws
+        return None
+
     async def send_personal_message(self, user_id: str, message_payload: dict[str, Any]) -> bool:
         """
         Routes a payload directly to the user if on this local node,
@@ -119,14 +131,13 @@ class ConnectionManager:
         Returns True if delivered locally or published to Redis.
         """
         # 1. Local delivery check
-        if user_id in self.active_connections:
-            ws = self.active_connections[user_id]
+        target_ws = self._find_local_ws(user_id)
+        if target_ws:
             try:
-                await ws.send_text(json.dumps(message_payload))
+                await target_ws.send_text(json.dumps(message_payload))
                 return True
             except Exception as e:
                 logger.warning("Local send failed for %s: %s", user_id, e)
-                await self.disconnect(user_id)
                 return False
 
         # 2. Distributed Redis Pub/Sub routing
@@ -153,9 +164,9 @@ class ConnectionManager:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     payload_str = message["data"]
-                    if user_id in self.active_connections:
-                        ws = self.active_connections[user_id]
-                        await ws.send_text(payload_str)
+                    target_ws = self._find_local_ws(user_id)
+                    if target_ws:
+                        await target_ws.send_text(payload_str)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -168,12 +179,22 @@ class ConnectionManager:
     # Presence & Broadcasts
     # -------------------------------------------------------------------------
     async def is_user_online(self, user_id: str) -> bool:
-        """Checks if a user is currently online on any node."""
-        if user_id in self.active_connections:
+        """Checks if a user is currently online on any node with phone digit matching."""
+        if not user_id:
+            return False
+        if self._find_local_ws(user_id):
             return True
         if self.redis:
             try:
-                return bool(await self.redis.sismember(REDIS_PRESENCE_KEY, user_id))
+                if await self.redis.sismember(REDIS_PRESENCE_KEY, user_id):
+                    return True
+                members = await self.redis.smembers(REDIS_PRESENCE_KEY)
+                digits = "".join(filter(str.isdigit, str(user_id)))
+                if len(digits) >= 8:
+                    for m in members:
+                        m_digits = "".join(filter(str.isdigit, str(m)))
+                        if m_digits and (digits.endswith(m_digits) or m_digits.endswith(digits)):
+                            return True
             except Exception:
                 pass
         return False

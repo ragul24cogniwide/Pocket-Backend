@@ -419,10 +419,12 @@ async def sync_device_contacts(
 @app.get("/api/messages/{other_user_id}")
 async def get_messages_with_user(
     other_user_id: str,
+    limit: int = 30,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves full chronological message history with a specific contact."""
+    """Retrieves paginated message history (default: latest 30 messages)."""
     stmt = (
         select(Message)
         .where(
@@ -431,11 +433,14 @@ async def get_messages_with_user(
                 (Message.sender_id == other_user_id) & (Message.receiver_id == current_user.id),
             )
         )
-        .order_by(Message.timestamp.asc())
+        .order_by(desc(Message.timestamp))
+        .offset(offset)
+        .limit(limit)
     )
     result = await db.execute(stmt)
     messages = result.scalars().all()
-    return [msg.to_dict() for msg in messages]
+    ordered_messages = list(reversed(messages))
+    return [msg.to_dict() for msg in ordered_messages]
 
 
 # -----------------------------------------------------------------------------
@@ -523,8 +528,34 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
 
     bot_name = bot_names[receiver_id]
 
-    # 1. Send typing indicator after 500ms
-    await asyncio.sleep(0.6)
+    # 1. Send typing indicator and mark incoming messages as READ
+    await asyncio.sleep(0.5)
+    now_read = datetime.now(timezone.utc)
+    try:
+        async with async_session_factory() as read_db:
+            await read_db.execute(
+                update(Message)
+                .where(
+                    Message.sender_id == sender_id,
+                    Message.receiver_id == receiver_id,
+                    Message.status != "READ",
+                )
+                .values(status="READ", read_at=now_read)
+            )
+            await read_db.commit()
+
+        ack_read_frame = {
+            "type": "ack_read",
+            "data": {
+                "reader_id": receiver_id,
+                "sender_id": sender_id,
+                "read_at": now_read.isoformat(),
+            },
+        }
+        await manager.send_personal_message(sender_id, ack_read_frame)
+    except Exception as read_err:
+        logger.warning("Bot mark read error: %s", read_err)
+
     typing_start_frame = {
         "type": "typing_start",
         "data": {
@@ -535,7 +566,7 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
     await manager.send_personal_message(sender_id, typing_start_frame)
 
     # 2. Formulate smart context-aware response
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(1.0)
     lowered = user_content.lower()
 
     if "hello" in lowered or "hi" in lowered or "hey" in lowered:
