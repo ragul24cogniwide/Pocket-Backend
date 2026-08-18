@@ -746,7 +746,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "status": message_dict["status"],
                     },
                 }
-                await manager.send_personal_message(user_id, ack_sent_frame)
+                try:
+                    await websocket.send_text(json.dumps(ack_sent_frame))
+                except Exception:
+                    await manager.send_personal_message(user_id, ack_sent_frame)
 
                 # Forward to Receiver
                 chat_frame = {
