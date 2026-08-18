@@ -64,6 +64,8 @@ async def send_push_notification(
                     sound="default",
                     channel_id="pocket_messages",
                     priority="high",
+                    default_sound=True,
+                    default_vibrate_timings=True,
                 ),
             ),
         )
