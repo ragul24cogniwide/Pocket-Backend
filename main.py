@@ -833,7 +833,67 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     await manager.send_personal_message(sender_id, ack_read_frame)
 
             # -----------------------------------------------------------------
-            # 4. HEARTBEAT / PING
+            # 4. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
+            # -----------------------------------------------------------------
+            elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
+                receiver_id = data.get("receiver_id")
+                if receiver_id:
+                    call_data = {**data, "caller_id": data.get("caller_id", user_id), "sender_id": user_id}
+                    call_frame = {
+                        "type": frame_type,
+                        "data": call_data,
+                    }
+                    delivered = await manager.send_personal_message(receiver_id, call_frame)
+
+                    # If offer and user is offline, send high-priority push notification
+                    if frame_type == "call_offer" and not delivered:
+                        async def dispatch_call_push():
+                            try:
+                                async with async_session_factory() as push_db:
+                                    r_stmt = select(User).where(User.id == receiver_id)
+                                    r_res = await push_db.execute(r_stmt)
+                                    rec_user = r_res.scalar_one_or_none()
+
+                                    s_stmt = select(User).where(User.id == user_id)
+                                    s_res = await push_db.execute(s_stmt)
+                                    sender_user = s_res.scalar_one_or_none()
+
+                                    if rec_user and rec_user.fcm_token:
+                                        await send_push_notification(
+                                            fcm_token=rec_user.fcm_token,
+                                            sender_name=sender_user.username if sender_user else "Pocket",
+                                            content="📞 Incoming Voice Call...",
+                                            data_payload={
+                                                "type": "incoming_call",
+                                                "caller_id": user_id,
+                                                "caller_name": sender_user.username if sender_user else "Pocket User",
+                                                "call_id": data.get("call_id", f"call_{int(datetime.now().timestamp())}"),
+                                            },
+                                        )
+                            except Exception as c_err:
+                                logger.warning("Error dispatching call push: %s", c_err)
+
+                        asyncio.create_task(dispatch_call_push())
+
+                    # If calling a demo contact (1, 2, 3, 4), simulate auto-answer after 2s for interactive testing
+                    if frame_type == "call_offer" and str(receiver_id) in ("1", "2", "3", "4"):
+                        async def simulate_demo_answer():
+                            await asyncio.sleep(2.0)
+                            ans_frame = {
+                                "type": "call_answer",
+                                "data": {
+                                    "call_id": data.get("call_id"),
+                                    "caller_id": receiver_id,
+                                    "receiver_id": user_id,
+                                    "sender_id": receiver_id,
+                                },
+                            }
+                            await manager.send_personal_message(user_id, ans_frame)
+
+                        asyncio.create_task(simulate_demo_answer())
+
+            # -----------------------------------------------------------------
+            # 5. HEARTBEAT / PING
             # -----------------------------------------------------------------
             elif frame_type == "ping":
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
