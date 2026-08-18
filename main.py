@@ -29,6 +29,7 @@ from notifications import send_push_notification
 from schemas import (
     AuthResponse,
     ChatContactItem,
+    SendMessageRequest,
     SendOtpRequest,
     SendOtpResponse,
     SyncContactsRequest,
