@@ -13,22 +13,48 @@ firebase_initialized = False
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
+    import glob
+    import json
 
-    # Look for firebase service account credentials file
-    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-service-account.json")
-    if os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-        firebase_initialized = True
-        logger.info("Firebase Admin SDK initialized with credentials from %s", cred_path)
-    else:
-        # Check if default application credentials exist
+    # 1. Check raw JSON env variable
+    cred_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
+    if cred_json_str:
+        try:
+            cred_dict = json.loads(cred_json_str)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            firebase_initialized = True
+            logger.info("Firebase Admin SDK initialized from FIREBASE_CREDENTIALS_JSON env var")
+        except Exception as e:
+            logger.warning("Error parsing FIREBASE_CREDENTIALS_JSON: %s", e)
+
+    # 2. Check explicit path env variable or default local JSON file
+    if not firebase_initialized:
+        possible_files = [
+            os.getenv("FIREBASE_CREDENTIALS_PATH", "pocket-c078e-firebase-adminsdk-fbsvc-6e06639f59.json"),
+            "pocket-c078e-firebase-adminsdk-fbsvc-6e06639f59.json",
+            "firebase-service-account.json",
+        ] + glob.glob("*firebase*.json")
+
+        for f_path in possible_files:
+            if f_path and os.path.exists(f_path):
+                try:
+                    cred = credentials.Certificate(f_path)
+                    firebase_admin.initialize_app(cred)
+                    firebase_initialized = True
+                    logger.info("Firebase Admin SDK initialized with credentials from %s", f_path)
+                    break
+                except Exception as err:
+                    logger.warning("Failed to init with %s: %s", f_path, err)
+
+    if not firebase_initialized:
+        # Check Application Default Credentials
         try:
             firebase_admin.initialize_app()
             firebase_initialized = True
             logger.info("Firebase Admin SDK initialized with Application Default Credentials")
         except Exception:
-            logger.info("Firebase credentials not found (%s). Push notifications will run in mock mode until credentials are provided.", cred_path)
+            logger.info("Push notifications will run in mock mode until credentials are provided.")
 except Exception as e:
     logger.warning("Firebase Admin initialization skipped: %s", e)
 

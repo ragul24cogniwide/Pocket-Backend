@@ -868,8 +868,35 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     await manager.send_personal_message(receiver_id, typing_frame)
 
             # -----------------------------------------------------------------
-            # 3. READ RECEIPTS
+            # 3. READ & DELIVERY RECEIPTS
             # -----------------------------------------------------------------
+            elif frame_type == "ack_delivered":
+                sender_id = data.get("sender_id")
+                message_id = data.get("message_id")
+                if sender_id and message_id:
+                    now = datetime.now(timezone.utc)
+                    async with async_session_factory() as db:
+                        stmt = (
+                            update(Message)
+                            .where(
+                                Message.id == message_id,
+                                Message.status == "SENT",
+                            )
+                            .values(status="DELIVERED", delivered_at=now)
+                        )
+                        await db.execute(stmt)
+                        await db.commit()
+
+                    ack_del_frame = {
+                        "type": "ack_delivered",
+                        "data": {
+                            "message_id": message_id,
+                            "receiver_id": user_id,
+                            "delivered_at": now.isoformat(),
+                        },
+                    }
+                    await manager.send_personal_message(sender_id, ack_del_frame)
+
             elif frame_type == "mark_read":
                 sender_id = data.get("sender_id")  # original sender of the messages being read
                 if sender_id:

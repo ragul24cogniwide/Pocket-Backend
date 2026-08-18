@@ -2,8 +2,8 @@
 .env
 .env.*
 
-# Firebase service account credentials (DO NOT COMMIT)
-*firebase-adminsdk*.json
+# Firebase credentials (DO NOT COMMIT)
+*firebase*.json
 firebase-service-account.json
 
 # Python virtual environment
