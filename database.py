@@ -85,7 +85,8 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         # Gentle column addition for PostgreSQL / SQLite if columns were added later
         try:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500);"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;"))
+            await conn.execute(text("ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT;"))
         except Exception:
             pass
         try:

@@ -35,7 +35,7 @@ class User(Base):
         String(20), default="#FFB800", nullable=False
     )
     avatar_url: Mapped[Optional[str]] = mapped_column(
-        String(500), nullable=True, default=None
+        Text, nullable=True, default=None
     )
     quote: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, default="Hey there! I am using Pocket."

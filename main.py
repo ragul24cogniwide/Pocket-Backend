@@ -226,28 +226,33 @@ async def update_user_profile(
     db: AsyncSession = Depends(get_db),
 ):
     """Updates the authenticated user's profile details (username, avatar_url, avatar_color, quote)."""
-    if payload.username is not None and payload.username.strip():
-        current_user.username = payload.username.strip()
-    if payload.avatar_url is not None:
-        current_user.avatar_url = payload.avatar_url.strip() if payload.avatar_url else None
-    if payload.avatar_color is not None and payload.avatar_color.strip():
-        current_user.avatar_color = payload.avatar_color.strip()
-    if payload.quote is not None:
-        current_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Pocket."
+    try:
+        if payload.username is not None and payload.username.strip():
+            current_user.username = payload.username.strip()
+        if payload.avatar_url is not None:
+            current_user.avatar_url = payload.avatar_url.strip() if payload.avatar_url else None
+        if payload.avatar_color is not None and payload.avatar_color.strip():
+            current_user.avatar_color = payload.avatar_color.strip()
+        if payload.quote is not None:
+            current_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Pocket."
 
-    await db.commit()
-    await db.refresh(current_user)
+        await db.commit()
+        await db.refresh(current_user)
 
-    return UserProfileResponse(
-        id=current_user.id,
-        phone_number=current_user.phone_number,
-        username=current_user.username,
-        avatar_color=current_user.avatar_color,
-        avatar_url=current_user.avatar_url,
-        quote=current_user.quote or "Hey there! I am using Pocket.",
-        is_online=current_user.is_online,
-        last_seen=current_user.last_seen.isoformat() if current_user.last_seen else None,
-    )
+        return UserProfileResponse(
+            id=current_user.id,
+            phone_number=current_user.phone_number,
+            username=current_user.username,
+            avatar_color=current_user.avatar_color,
+            avatar_url=current_user.avatar_url,
+            quote=current_user.quote or "Hey there! I am using Pocket.",
+            is_online=current_user.is_online,
+            last_seen=current_user.last_seen.isoformat() if current_user.last_seen else None,
+        )
+    except Exception as e:
+        logger.error("Error updating user profile: %s", e, exc_info=True)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database update failed: {str(e)}")
 
 
 @app.post("/api/users/fcm-token")
