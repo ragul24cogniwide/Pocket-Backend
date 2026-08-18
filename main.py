@@ -967,10 +967,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                         asyncio.create_task(dispatch_call_push())
 
-                    # If calling a demo contact (1, 2, 3, 4), simulate auto-answer after 2s for interactive testing
-                    if frame_type == "call_offer" and str(receiver_id) in ("1", "2", "3", "4"):
+                    # If calling a demo contact (1, 2, 3, 4) or demo numbers, simulate auto-answer after 2s for interactive testing
+                    demo_targets = ("1", "2", "3", "4", "+919876543210", "+919876543211", "+919123456782", "+919988776653", "+919811223344")
+                    if frame_type == "call_offer" and str(receiver_id) in demo_targets:
                         async def simulate_demo_answer():
-                            await asyncio.sleep(2.0)
+                            await asyncio.sleep(1.8)
                             ans_frame = {
                                 "type": "call_answer",
                                 "data": {
