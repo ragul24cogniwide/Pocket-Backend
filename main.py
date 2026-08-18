@@ -216,6 +216,10 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
 
 @app.put("/api/users/profile", response_model=UserProfileResponse)
 @app.patch("/api/users/profile", response_model=UserProfileResponse)
+@app.post("/api/users/profile", response_model=UserProfileResponse)
+@app.put("/api/profile", response_model=UserProfileResponse)
+@app.patch("/api/profile", response_model=UserProfileResponse)
+@app.post("/api/profile", response_model=UserProfileResponse)
 async def update_user_profile(
     payload: UpdateProfileRequest,
     current_user: User = Depends(get_current_user),
