@@ -3,7 +3,7 @@ Pydantic v2 schemas for authentication, users, and real-time messaging payloads.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
