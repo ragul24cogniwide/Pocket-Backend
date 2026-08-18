@@ -1,0 +1,38 @@
+services:
+  pocket-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pocket-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PORT=8000
+    volumes:
+      - .:/app
+    depends_on:
+      - pocket-redis
+    networks:
+      - pocket-network
+
+  pocket-redis:
+    image: redis:7-alpine
+    container_name: pocket-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pocket-network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  pocket-network:
+    driver: bridge
