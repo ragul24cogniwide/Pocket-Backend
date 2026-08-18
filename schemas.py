@@ -84,3 +84,5 @@ class SyncContactsResponse(BaseModel):
 class SendMessageRequest(BaseModel):
     receiver_id: str
     content: str
+    temp_msg_id: Optional[str] = None
+    reply_to: Optional[Any] = None

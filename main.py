@@ -452,6 +452,64 @@ async def get_messages_with_user(
     return [msg.to_dict() for msg in ordered_messages]
 
 
+@app.post("/api/messages/send")
+async def send_message_rest(
+    payload: SendMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sends a message via REST with immediate DB persistence and WebSocket dispatch."""
+    receiver_id = payload.receiver_id
+    content = payload.content.strip()
+    client_temp_id = payload.temp_msg_id or f"temp_{int(datetime.now().timestamp() * 1000)}"
+
+    rec_stmt = select(User).where(User.id == receiver_id)
+    rec_res = await db.execute(rec_stmt)
+    if not rec_res.scalar_one_or_none():
+        names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
+        rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
+        db.add(User(id=receiver_id, phone_number=receiver_id, username=rec_name, avatar_color="#3B82F6", is_online=False))
+        await db.commit()
+
+    is_rec_online = await manager.is_user_online(receiver_id)
+    initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
+    now = datetime.now(timezone.utc)
+
+    reply_to_str = json.dumps(payload.reply_to) if isinstance(payload.reply_to, dict) else (str(payload.reply_to) if payload.reply_to else None)
+
+    new_msg = Message(
+        sender_id=current_user.id,
+        receiver_id=receiver_id,
+        content=content,
+        reply_to=reply_to_str,
+        timestamp=now,
+        status=initial_status,
+        delivered_at=now if is_rec_online else None,
+    )
+    db.add(new_msg)
+    await db.commit()
+    await db.refresh(new_msg)
+
+    message_dict = new_msg.to_dict()
+
+    # Forward to Receiver via WebSocket
+    chat_frame = {
+        "type": "chat_message",
+        "data": message_dict,
+    }
+    await manager.send_personal_message(receiver_id, chat_frame)
+
+    # Trigger smart bot auto-reply for demo contacts
+    asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
+
+    return {
+        "status": "success",
+        "temp_msg_id": client_temp_id,
+        "message_id": message_dict["message_id"],
+        **message_dict,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Offline Queue Flush Helper
 # -----------------------------------------------------------------------------
@@ -720,11 +778,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     is_rec_online = await manager.is_user_online(receiver_id)
                     initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
                     now = datetime.now(timezone.utc)
+                    reply_to_raw = data.get("reply_to")
+                    reply_to_str = json.dumps(reply_to_raw) if isinstance(reply_to_raw, dict) else (str(reply_to_raw) if reply_to_raw else None)
 
                     new_msg = Message(
                         sender_id=user_id,
                         receiver_id=receiver_id,
                         content=content,
+                        reply_to=reply_to_str,
                         timestamp=now,
                         status=initial_status,
                         delivered_at=now if is_rec_online else None,

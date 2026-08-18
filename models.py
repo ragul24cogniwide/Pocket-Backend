@@ -4,6 +4,7 @@ SQLAlchemy 2.0 Async ORM Models for Pocket Messenger.
 
 from typing import Optional
 import enum
+import json
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
@@ -139,6 +140,9 @@ class Message(Base):
         default="SENT",
         nullable=False,
     )
+    reply_to: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None
+    )
     delivered_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -155,12 +159,20 @@ class Message(Base):
     )
 
     def to_dict(self) -> dict:
+        parsed_reply = None
+        if self.reply_to:
+            try:
+                parsed_reply = json.loads(self.reply_to)
+            except Exception:
+                parsed_reply = {"text": self.reply_to}
+
         return {
             "id": self.id,
             "message_id": self.id,
             "sender_id": self.sender_id,
             "receiver_id": self.receiver_id,
             "content": self.content,
+            "reply_to": parsed_reply,
             "timestamp": self.timestamp.isoformat() if self.timestamp else datetime.now(timezone.utc).isoformat(),
             "status": self.status.value if hasattr(self.status, 'value') else str(self.status),
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,

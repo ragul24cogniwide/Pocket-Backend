@@ -97,6 +97,10 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token VARCHAR(255);"))
         except Exception:
             pass
+        try:
+            await conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;"))
+        except Exception:
+            pass
 
     # Seed default mock/demo contacts so chatting with any ID (1, 2, 3, 4) never throws Foreign Key errors
     async with async_session_factory() as session:
