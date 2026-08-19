@@ -24,11 +24,12 @@ from auth import (
 )
 from connection_manager import manager
 from database import async_session_factory, get_db, init_db
-from models import Message, MessageStatus, OtpRecord, User
+from models import Message, MessageStatus, OtpRecord, User, Status
 from notifications import send_push_notification
 from schemas import (
     AuthResponse,
     ChatContactItem,
+    CreateStatusRequest,
     SendMessageRequest,
     SendOtpRequest,
     SendOtpResponse,
@@ -266,6 +267,123 @@ async def update_fcm_token(
     current_user.fcm_token = payload.fcm_token
     await db.commit()
     return {"message": "FCM token updated successfully", "fcm_token": payload.fcm_token}
+
+
+# -----------------------------------------------------------------------------
+# Status & Stories Endpoints (24-Hour Ephemeral Status)
+# -----------------------------------------------------------------------------
+@app.post("/api/statuses")
+async def create_status(
+    payload: CreateStatusRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Creates a new 24-hour status story in PostgreSQL."""
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=24)
+    new_status = Status(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        type=payload.type,
+        media_url=payload.media_url,
+        caption=payload.caption,
+        bg_gradient=payload.bg_gradient or "#1E293B",
+        viewers="[]",
+        created_at=now,
+        expires_at=expires,
+    )
+    db.add(new_status)
+    await db.commit()
+    await db.refresh(new_status)
+    return new_status.to_dict()
+
+
+@app.get("/api/statuses/feed")
+async def get_status_feed(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns active 24h statuses from PostgreSQL for current user and all contacts."""
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(Status)
+        .where(Status.expires_at > now)
+        .order_by(Status.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    all_statuses = result.scalars().all()
+
+    my_statuses = []
+    contact_dict = {}
+
+    for s in all_statuses:
+        st_dict = s.to_dict()
+        if s.user_id == current_user.id or s.user_id == current_user.phone_number:
+            my_statuses.append(st_dict)
+        else:
+            cid = s.user_id
+            if cid not in contact_dict:
+                contact_dict[cid] = {
+                    "contactId": cid,
+                    "userName": st_dict["userName"],
+                    "avatar": st_dict["avatar"],
+                    "avatarColor": st_dict["avatarColor"],
+                    "avatarUrl": st_dict["avatarUrl"],
+                    "latestTime": st_dict["time"],
+                    "stories": [],
+                }
+            contact_dict[cid]["stories"].append(st_dict)
+
+    return {
+        "my_statuses": my_statuses,
+        "contact_statuses": list(contact_dict.values()),
+    }
+
+
+@app.post("/api/statuses/{status_id}/view")
+async def mark_status_viewed(
+    status_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Records that current user viewed the status."""
+    stmt = select(Status).where(Status.id == status_id)
+    result = await db.execute(stmt)
+    st = result.scalar_one_or_none()
+    if not st:
+        raise HTTPException(status_code=404, detail="Status not found")
+
+    viewers = []
+    if st.viewers:
+        try:
+            viewers = json.loads(st.viewers)
+        except Exception:
+            viewers = []
+
+    if current_user.id not in viewers:
+        viewers.append(current_user.id)
+        st.viewers = json.dumps(viewers)
+        await db.commit()
+
+    return {"message": "Status view recorded", "viewsCount": len(viewers)}
+
+
+@app.delete("/api/statuses/{status_id}")
+async def delete_status(
+    status_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deletes a status posted by current user."""
+    stmt = select(Status).where(Status.id == status_id, Status.user_id == current_user.id)
+    result = await db.execute(stmt)
+    st = result.scalar_one_or_none()
+    if not st:
+        raise HTTPException(status_code=404, detail="Status not found or unauthorized")
+
+    await db.delete(st)
+    await db.commit()
+    return {"message": "Status deleted successfully"}
 
 
 # -----------------------------------------------------------------------------

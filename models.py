@@ -178,3 +178,71 @@ class Message(Base):
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "read_at": self.read_at.isoformat() if self.read_at else None,
         }
+
+
+class Status(Base):
+    __tablename__ = "statuses"
+
+    id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+        index=True,
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    type: Mapped[str] = mapped_column(
+        String(20), default="image", nullable=False
+    )
+    media_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None
+    )
+    caption: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None
+    )
+    bg_gradient: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, default="#1E293B"
+    )
+    viewers: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default="[]"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+
+    user: Mapped["User"] = relationship("User")
+
+    def to_dict(self) -> dict:
+        parsed_viewers = []
+        if self.viewers:
+            try:
+                parsed_viewers = json.loads(self.viewers)
+            except Exception:
+                parsed_viewers = []
+
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "userName": self.user.username if self.user else "Pocket User",
+            "avatar": self.user.username[:2].upper() if self.user and self.user.username else "PK",
+            "avatarColor": self.user.avatar_color if self.user else "#FFB800",
+            "avatarUrl": self.user.avatar_url if self.user else None,
+            "type": self.type,
+            "uri": self.media_url,
+            "caption": self.caption,
+            "bgGradient": self.bg_gradient,
+            "viewsCount": len(parsed_viewers),
+            "viewers": parsed_viewers,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "time": self.created_at.strftime("%I:%M %p") if self.created_at else "Just now",
+        }
+

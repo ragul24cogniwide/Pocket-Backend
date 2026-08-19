@@ -86,3 +86,11 @@ class SendMessageRequest(BaseModel):
     content: str
     temp_msg_id: Optional[str] = None
     reply_to: Optional[Any] = None
+
+
+class CreateStatusRequest(BaseModel):
+    type: str = "image" # 'image' | 'video' | 'text'
+    media_url: Optional[str] = None
+    caption: Optional[str] = None
+    bg_gradient: Optional[str] = "#1E293B"
+
