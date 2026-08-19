@@ -120,12 +120,12 @@ async def server_keep_alive_loop():
             target_url = f"{RENDER_EXTERNAL_URL}/api/health"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(target_url)
-                logger.info("[KeepAlive] Render self-ping (10s) status: %s", resp.status_code)
+                logger.info("[KeepAlive] Render self-ping (20s) status: %s", resp.status_code)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.warning("[KeepAlive] Notice: %s", e)
-        await asyncio.sleep(10)  # Ping every 10 seconds
+        await asyncio.sleep(20)  # Ping every 20 seconds
 
 
 @asynccontextmanager
