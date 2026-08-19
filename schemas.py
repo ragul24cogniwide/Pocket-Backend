@@ -94,3 +94,8 @@ class CreateStatusRequest(BaseModel):
     caption: Optional[str] = None
     bg_gradient: Optional[str] = "#1E293B"
 
+
+class EditMessageRequest(BaseModel):
+    content: str
+
+

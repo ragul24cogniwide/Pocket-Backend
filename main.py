@@ -31,6 +31,7 @@ from schemas import (
     AuthResponse,
     ChatContactItem,
     CreateStatusRequest,
+    EditMessageRequest,
     SendMessageRequest,
     SendOtpRequest,
     SendOtpResponse,
@@ -628,6 +629,86 @@ async def send_message_rest(
         "message_id": message_dict["message_id"],
         **message_dict,
     }
+
+
+@app.put("/api/messages/{message_id}")
+async def edit_message(
+    message_id: str,
+    payload: EditMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Edits a message sent by the current user and broadcasts the update to the recipient.
+    """
+    stmt = select(Message).where(Message.id == message_id)
+    result = await db.execute(stmt)
+    msg = result.scalar_one_or_none()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only edit your own messages")
+
+    msg.content = payload.content.strip()
+    await db.commit()
+    await db.refresh(msg)
+
+    # Broadcast edit frame to receiver over WebSocket
+    edit_frame = {
+        "type": "message_edited",
+        "data": {
+            "message_id": msg.id,
+            "sender_id": msg.sender_id,
+            "receiver_id": msg.receiver_id,
+            "content": msg.content,
+            "is_edited": True,
+        },
+    }
+    await manager.send_personal_message(msg.receiver_id, edit_frame)
+
+    return {"status": "success", "message": msg.to_dict(), "is_edited": True}
+
+
+@app.delete("/api/messages/{message_id}")
+async def delete_message(
+    message_id: str,
+    for_everyone: bool = True,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Deletes a message for the user or for everyone.
+    """
+    stmt = select(Message).where(Message.id == message_id)
+    result = await db.execute(stmt)
+    msg = result.scalar_one_or_none()
+
+    if not msg:
+        return {"status": "success", "message_id": message_id, "deleted": True}
+
+    if for_everyone and msg.sender_id == current_user.id:
+        receiver_id = msg.receiver_id
+        await db.delete(msg)
+        await db.commit()
+
+        # Broadcast delete frame to receiver
+        delete_frame = {
+            "type": "message_deleted",
+            "data": {
+                "message_id": message_id,
+                "sender_id": current_user.id,
+                "receiver_id": receiver_id,
+            },
+        }
+        await manager.send_personal_message(receiver_id, delete_frame)
+    else:
+        # Delete for self only
+        await db.delete(msg)
+        await db.commit()
+
+    return {"status": "success", "message_id": message_id, "deleted": True}
 
 
 # -----------------------------------------------------------------------------
