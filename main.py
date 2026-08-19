@@ -799,7 +799,29 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
             "type": "chat_message",
             "data": bot_msg.to_dict(),
         }
-        await manager.send_personal_message(sender_id, msg_frame)
+        delivered = await manager.send_personal_message(sender_id, msg_frame)
+
+        if not delivered:
+            # User is in background / app closed -> Send FCM Push Notification
+            u_stmt = select(User).where(User.id == sender_id)
+            u_res = await db.execute(u_stmt)
+            target_user = u_res.scalar_one_or_none()
+
+            b_stmt = select(User).where(User.id == bot_id)
+            b_res = await db.execute(b_stmt)
+            bot_user = b_res.scalar_one_or_none()
+
+            if target_user and target_user.fcm_token:
+                await send_push_notification(
+                    fcm_token=target_user.fcm_token,
+                    sender_name=bot_user.username if bot_user else "Rahul Sharma",
+                    content=bot_reply,
+                    data_payload={
+                        "sender_id": bot_id,
+                        "receiver_id": sender_id,
+                        "message_id": bot_msg.id,
+                    },
+                )
 
 
 # -----------------------------------------------------------------------------
