@@ -82,6 +82,9 @@ async def send_push_notification(
 
     try:
         data_strings = {k: str(v) for k, v in (data_payload or {}).items()}
+        is_call = data_strings.get("type") == "incoming_call"
+        channel_id = "pocket_calls" if is_call else "pocket_messages"
+
         message = messaging.Message(
             notification=messaging.Notification(
                 title=sender_name,
@@ -93,10 +96,21 @@ async def send_push_notification(
                 priority="high",
                 notification=messaging.AndroidNotification(
                     sound="default",
-                    channel_id="pocket_messages",
+                    channel_id=channel_id,
                     priority="high",
                     default_sound=True,
                     default_vibrate_timings=True,
+                    visibility="public" if is_call else "private",
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound="default",
+                        badge=1,
+                        content_available=True,
+                    )
                 ),
             ),
         )
@@ -106,3 +120,4 @@ async def send_push_notification(
     except Exception as e:
         logger.error("Failed to send FCM push notification: %s", e)
         return False
+

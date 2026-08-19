@@ -54,6 +54,8 @@ class UpdateProfileRequest(BaseModel):
 
 class UpdateFcmTokenRequest(BaseModel):
     fcm_token: str
+    user_id: Optional[str] = None
+    phone_number: Optional[str] = None
 
 
 # Contact & Chat Overview

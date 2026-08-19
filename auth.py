@@ -77,7 +77,22 @@ async def get_current_user(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found.",
+            detail="User not found in database.",
         )
 
     return user
+
+
+async def get_current_user_optional(
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[User]:
+    """Optional FastAPI dependency for routes that can accept either JWT or body params."""
+    if not auth or not auth.credentials:
+        return None
+    payload = decode_access_token(auth.credentials)
+    if not payload or "sub" not in payload:
+        return None
+    user_id = payload["sub"]
+    result = await db.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()

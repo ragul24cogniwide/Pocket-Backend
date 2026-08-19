@@ -22,6 +22,7 @@ from auth import (
     create_access_token,
     generate_otp_code,
     get_current_user,
+    get_current_user_optional,
 )
 from connection_manager import manager
 from database import async_session_factory, get_db, init_db
@@ -50,6 +51,81 @@ DEV_MODE_EXPOSE_OTP = os.getenv("DEV_MODE_EXPOSE_OTP", "true").lower() == "true"
 OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "5"))
 
 
+async def dispatch_push_to_user(
+    sender_id: str,
+    receiver_id: str,
+    content: str,
+    data_payload: Optional[dict] = None,
+):
+    """Dispatches high-priority push notification to offline receiver with phone tolerance."""
+    try:
+        async with async_session_factory() as push_db:
+            # 1. Look up receiver
+            rec_digits = "".join(filter(str.isdigit, str(receiver_id)))
+            r_stmt = select(User).where(
+                or_(
+                    User.id == receiver_id,
+                    User.phone_number == receiver_id,
+                    User.phone_number.endswith(rec_digits) if len(rec_digits) >= 8 else False,
+                    User.id.endswith(rec_digits) if len(rec_digits) >= 8 else False,
+                )
+            )
+            r_res = await push_db.execute(r_stmt)
+            rec_user = r_res.scalar_one_or_none()
+
+            # 2. Look up sender name
+            send_digits = "".join(filter(str.isdigit, str(sender_id)))
+            s_stmt = select(User).where(
+                or_(
+                    User.id == sender_id,
+                    User.phone_number == sender_id,
+                    User.phone_number.endswith(send_digits) if len(send_digits) >= 8 else False,
+                )
+            )
+            s_res = await push_db.execute(s_stmt)
+            sender_user = s_res.scalar_one_or_none()
+
+            if rec_user and rec_user.fcm_token:
+                sender_title = (
+                    sender_user.username
+                    if sender_user
+                    else f"User {sender_id[-4:]}" if len(sender_id) >= 4 else "Pocket"
+                )
+                payload_dict = {
+                    "sender_id": sender_id,
+                    "receiver_id": receiver_id,
+                    **(data_payload or {}),
+                }
+                await send_push_notification(
+                    fcm_token=rec_user.fcm_token,
+                    sender_name=sender_title,
+                    content=content,
+                    data_payload=payload_dict,
+                )
+    except Exception as err:
+        logger.warning("Error dispatching offline push to %s: %s", receiver_id, err)
+
+
+
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://pocket-backend-7lmx.onrender.com").strip().rstrip("/")
+
+
+async def server_keep_alive_loop():
+    """Background task that periodically pings the server to prevent Render idle sleep."""
+    import httpx
+    while True:
+        try:
+            await asyncio.sleep(600)  # Ping every 10 minutes
+            target_url = f"{RENDER_EXTERNAL_URL}/api/health"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(target_url)
+                logger.info("[KeepAlive] Render self-ping status: %s", resp.status_code)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("[KeepAlive] Notice: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown hooks."""
@@ -57,7 +133,9 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Initializing connection manager & Redis Pub/Sub...")
     await manager.initialize()
+    keep_alive_task = asyncio.create_task(server_keep_alive_loop())
     yield
+    keep_alive_task.cancel()
     logger.info("Shutting down connection manager...")
     await manager.shutdown()
 
@@ -76,6 +154,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/health")
+@app.get("/api/ping")
+async def health_check():
+    """Lightweight 0ms health check for keep-alive pings and uptime monitors."""
+    return {
+        "status": "active",
+        "service": "Pocket Messaging Backend",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+from fastapi.staticfiles import StaticFiles
+import base64
+
+os.makedirs("uploads/audio", exist_ok=True)
+os.makedirs("uploads/images", exist_ok=True)
+
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+
+# -----------------------------------------------------------------------------
+# Media & Audio Upload Endpoint
+# -----------------------------------------------------------------------------
+@app.post("/api/upload/audio")
+async def upload_audio(payload: dict):
+    """
+    Saves recorded voice audio (.m4a AAC) to cloud server and returns streaming URL.
+    """
+    try:
+        audio_base64 = payload.get("audio_base64") or payload.get("base64")
+        duration = payload.get("duration", 0)
+
+        if not audio_base64:
+            raise HTTPException(status_code=400, detail="Audio base64 data required")
+
+        if "," in audio_base64:
+            audio_base64 = audio_base64.split(",", 1)[1]
+
+        audio_bytes = base64.b64decode(audio_base64)
+        file_id = f"voice_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.m4a"
+        file_path = os.path.join("uploads", "audio", file_id)
+
+        with open(file_path, "wb") as f:
+            f.write(audio_bytes)
+
+        # Public relative or absolute path
+        media_url = f"/uploads/audio/{file_id}"
+        logger.info("Saved voice note (%d bytes, %ds) to %s", len(audio_bytes), duration, file_path)
+
+        return {
+            "status": "success",
+            "media_url": media_url,
+            "url": media_url,
+            "duration": duration,
+            "file_name": file_id,
+        }
+    except Exception as e:
+        logger.error("Audio upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Audio upload failed: {str(e)}")
 
 
 # -----------------------------------------------------------------------------
@@ -262,13 +401,33 @@ async def update_user_profile(
 @app.post("/api/users/fcm-token")
 async def update_fcm_token(
     payload: UpdateFcmTokenRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """Updates device FCM Push Token for background notifications."""
-    current_user.fcm_token = payload.fcm_token
-    await db.commit()
-    return {"message": "FCM token updated successfully", "fcm_token": payload.fcm_token}
+    target_user = current_user
+    if not target_user and (payload.user_id or payload.phone_number):
+        identifier = (payload.user_id or payload.phone_number or "").strip()
+        digits = "".join(filter(str.isdigit, identifier))
+        stmt = select(User).where(
+            or_(
+                User.id == identifier,
+                User.phone_number == identifier,
+                User.phone_number.endswith(digits) if len(digits) >= 8 else False,
+                User.id.endswith(digits) if len(digits) >= 8 else False,
+            )
+        )
+        res = await db.execute(stmt)
+        target_user = res.scalar_one_or_none()
+
+    if target_user:
+        target_user.fcm_token = payload.fcm_token
+        await db.commit()
+        logger.info("Updated FCM token for user %s (%s)", target_user.id, target_user.username)
+        return {"message": "FCM token updated successfully", "fcm_token": payload.fcm_token}
+
+    return {"message": "FCM token received", "fcm_token": payload.fcm_token}
+
 
 
 # -----------------------------------------------------------------------------
@@ -623,7 +782,19 @@ async def send_message_rest(
         "type": "chat_message",
         "data": message_dict,
     }
-    await manager.send_personal_message(receiver_id, chat_frame)
+    delivered = await manager.send_personal_message(receiver_id, chat_frame)
+
+    if not delivered:
+        asyncio.create_task(
+            dispatch_push_to_user(
+                sender_id=current_user.id,
+                receiver_id=receiver_id,
+                content=content,
+                data_payload={
+                    "message_id": message_dict["message_id"],
+                },
+            )
+        )
 
     # Trigger smart bot auto-reply for demo contacts
     asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
@@ -1055,32 +1226,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                 if not delivered:
                     # Receiver is offline / app is closed -> Dispatch Background Push Notification
-                    async def dispatch_offline_push():
-                        try:
-                            async with async_session_factory() as push_db:
-                                r_stmt = select(User).where(User.id == receiver_id)
-                                r_res = await push_db.execute(r_stmt)
-                                rec_user = r_res.scalar_one_or_none()
-
-                                s_stmt = select(User).where(User.id == user_id)
-                                s_res = await push_db.execute(s_stmt)
-                                sender_user = s_res.scalar_one_or_none()
-
-                                if rec_user and rec_user.fcm_token:
-                                    await send_push_notification(
-                                        fcm_token=rec_user.fcm_token,
-                                        sender_name=sender_user.username if sender_user else "Pocket",
-                                        content=content,
-                                        data_payload={
-                                            "sender_id": user_id,
-                                            "receiver_id": receiver_id,
-                                            "message_id": message_dict["message_id"],
-                                        },
-                                    )
-                        except Exception as p_err:
-                            logger.warning("Error dispatching offline push: %s", p_err)
-
-                    asyncio.create_task(dispatch_offline_push())
+                    asyncio.create_task(
+                        dispatch_push_to_user(
+                            sender_id=user_id,
+                            receiver_id=receiver_id,
+                            content=content,
+                            data_payload={
+                                "message_id": message_dict["message_id"],
+                            },
+                        )
+                    )
 
                 # Trigger smart bot responder if receiver is a demo contact
                 asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
@@ -1172,33 +1327,18 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
                     # If offer and user is offline, send high-priority push notification
                     if frame_type == "call_offer" and not delivered:
-                        async def dispatch_call_push():
-                            try:
-                                async with async_session_factory() as push_db:
-                                    r_stmt = select(User).where(User.id == receiver_id)
-                                    r_res = await push_db.execute(r_stmt)
-                                    rec_user = r_res.scalar_one_or_none()
-
-                                    s_stmt = select(User).where(User.id == user_id)
-                                    s_res = await push_db.execute(s_stmt)
-                                    sender_user = s_res.scalar_one_or_none()
-
-                                    if rec_user and rec_user.fcm_token:
-                                        await send_push_notification(
-                                            fcm_token=rec_user.fcm_token,
-                                            sender_name=sender_user.username if sender_user else "Pocket",
-                                            content="📞 Incoming Voice Call...",
-                                            data_payload={
-                                                "type": "incoming_call",
-                                                "caller_id": user_id,
-                                                "caller_name": sender_user.username if sender_user else "Pocket User",
-                                                "call_id": data.get("call_id", f"call_{int(datetime.now().timestamp())}"),
-                                            },
-                                        )
-                            except Exception as c_err:
-                                logger.warning("Error dispatching call push: %s", c_err)
-
-                        asyncio.create_task(dispatch_call_push())
+                        asyncio.create_task(
+                            dispatch_push_to_user(
+                                sender_id=user_id,
+                                receiver_id=receiver_id,
+                                content="📞 Incoming Voice Call...",
+                                data_payload={
+                                    "type": "incoming_call",
+                                    "caller_id": user_id,
+                                    "call_id": data.get("call_id", f"call_{int(datetime.now(timezone.utc).timestamp())}"),
+                                },
+                            )
+                        )
 
                     # If calling a demo contact (1, 2, 3, 4) or demo numbers, simulate auto-answer after 2s for interactive testing
                     demo_targets = ("1", "2", "3", "4", "+919876543210", "+919876543211", "+919123456782", "+919988776653", "+919811223344")
