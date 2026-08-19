@@ -596,7 +596,12 @@ async def send_message_rest(
     initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
     now = datetime.now(timezone.utc)
 
-    reply_to_str = json.dumps(payload.reply_to) if isinstance(payload.reply_to, dict) else (str(payload.reply_to) if payload.reply_to else None)
+    combined_extra = {}
+    if payload.reply_to:
+        combined_extra["reply_to"] = payload.reply_to
+    if payload.metadata:
+        combined_extra["metadata"] = payload.metadata
+    reply_to_str = json.dumps(combined_extra) if combined_extra else None
 
     new_msg = Message(
         sender_id=current_user.id,
@@ -1002,7 +1007,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
                     now = datetime.now(timezone.utc)
                     reply_to_raw = data.get("reply_to")
-                    reply_to_str = json.dumps(reply_to_raw) if isinstance(reply_to_raw, dict) else (str(reply_to_raw) if reply_to_raw else None)
+                    metadata_raw = data.get("metadata")
+                    combined_extra = {}
+                    if reply_to_raw:
+                        combined_extra["reply_to"] = reply_to_raw
+                    if metadata_raw:
+                        combined_extra["metadata"] = metadata_raw
+                    reply_to_str = json.dumps(combined_extra) if combined_extra else None
 
                     new_msg = Message(
                         sender_id=user_id,

@@ -160,9 +160,18 @@ class Message(Base):
 
     def to_dict(self) -> dict:
         parsed_reply = None
+        parsed_metadata = None
         if self.reply_to:
             try:
-                parsed_reply = json.loads(self.reply_to)
+                raw_data = json.loads(self.reply_to)
+                if isinstance(raw_data, dict):
+                    if "metadata" in raw_data or "reply_to" in raw_data:
+                        parsed_metadata = raw_data.get("metadata")
+                        parsed_reply = raw_data.get("reply_to")
+                    else:
+                        parsed_reply = raw_data
+                else:
+                    parsed_reply = {"text": str(raw_data)}
             except Exception:
                 parsed_reply = {"text": self.reply_to}
 
@@ -173,11 +182,13 @@ class Message(Base):
             "receiver_id": self.receiver_id,
             "content": self.content,
             "reply_to": parsed_reply,
+            "metadata": parsed_metadata,
             "timestamp": self.timestamp.isoformat() if self.timestamp else datetime.now(timezone.utc).isoformat(),
             "status": self.status.value if hasattr(self.status, 'value') else str(self.status),
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "read_at": self.read_at.isoformat() if self.read_at else None,
         }
+
 
 
 class Status(Base):
