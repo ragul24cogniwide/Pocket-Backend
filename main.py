@@ -107,23 +107,25 @@ async def dispatch_push_to_user(
 
 
 
+import httpx
+
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://pocket-backend-7lmx.onrender.com").strip().rstrip("/")
 
 
 async def server_keep_alive_loop():
     """Background task that periodically pings the server to prevent Render idle sleep."""
-    import httpx
+    await asyncio.sleep(5)  # Initial warm-up ping 5s after startup
     while True:
         try:
-            await asyncio.sleep(600)  # Ping every 10 minutes
             target_url = f"{RENDER_EXTERNAL_URL}/api/health"
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(target_url)
-                logger.info("[KeepAlive] Render self-ping status: %s", resp.status_code)
+                logger.info("[KeepAlive] Render self-ping (10s) status: %s", resp.status_code)
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.warning("[KeepAlive] Notice: %s", e)
+        await asyncio.sleep(10)  # Ping every 10 seconds
 
 
 @asynccontextmanager
