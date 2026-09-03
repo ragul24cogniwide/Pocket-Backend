@@ -5,6 +5,8 @@ Delivers high-priority background push notifications when recipient is offline /
 
 import os
 import logging
+import asyncio
+from datetime import timedelta
 from typing import Optional
 
 logger = logging.getLogger("Notifications")
@@ -94,17 +96,22 @@ async def send_push_notification(
             token=fcm_token,
             android=messaging.AndroidConfig(
                 priority="high",
+                ttl=timedelta(seconds=60) if is_call else timedelta(days=1),
                 notification=messaging.AndroidNotification(
                     sound="default",
                     channel_id=channel_id,
-                    priority="high",
+                    priority="max" if is_call else "high",
                     default_sound=True,
                     default_vibrate_timings=True,
                     visibility="public" if is_call else "private",
+                    sticky=True if is_call else False,
                 ),
             ),
             apns=messaging.APNSConfig(
-                headers={"apns-priority": "10"},
+                headers={
+                    "apns-priority": "10",
+                    "apns-push-type": "alert",
+                },
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
                         sound="default",
@@ -114,7 +121,7 @@ async def send_push_notification(
                 ),
             ),
         )
-        response = messaging.send(message)
+        response = await asyncio.to_thread(messaging.send, message)
         logger.info("FCM push sent successfully: %s", response)
         return True
     except Exception as e:

@@ -42,7 +42,7 @@ class User(Base):
         String(255), nullable=True, default="Hey there! I am using Pocket."
     )
     fcm_token: Mapped[Optional[str]] = mapped_column(
-        String(255), nullable=True, default=None
+        Text, nullable=True, default=None
     )
     is_online: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
@@ -240,13 +240,26 @@ class Status(Base):
             except Exception:
                 parsed_viewers = []
 
+        user_name = "Pocket User"
+        avatar = "PK"
+        avatar_color = "#FFB800"
+        avatar_url = None
+        try:
+            if self.user:
+                user_name = self.user.username or "Pocket User"
+                avatar = self.user.username[:2].upper() if self.user.username else "PK"
+                avatar_color = self.user.avatar_color or "#FFB800"
+                avatar_url = self.user.avatar_url
+        except Exception:
+            pass
+
         return {
             "id": self.id,
             "user_id": self.user_id,
-            "userName": self.user.username if self.user else "Pocket User",
-            "avatar": self.user.username[:2].upper() if self.user and self.user.username else "PK",
-            "avatarColor": self.user.avatar_color if self.user else "#FFB800",
-            "avatarUrl": self.user.avatar_url if self.user else None,
+            "userName": user_name,
+            "avatar": avatar,
+            "avatarColor": avatar_color,
+            "avatarUrl": avatar_url,
             "type": self.type,
             "uri": self.media_url,
             "caption": self.caption,

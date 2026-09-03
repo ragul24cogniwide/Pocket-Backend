@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
@@ -62,12 +63,13 @@ async def dispatch_push_to_user(
         async with async_session_factory() as push_db:
             # 1. Look up receiver
             rec_digits = "".join(filter(str.isdigit, str(receiver_id)))
+            rec_last10 = rec_digits[-10:] if len(rec_digits) >= 10 else rec_digits
             r_stmt = select(User).where(
                 or_(
                     User.id == receiver_id,
                     User.phone_number == receiver_id,
-                    User.phone_number.endswith(rec_digits) if len(rec_digits) >= 8 else False,
-                    User.id.endswith(rec_digits) if len(rec_digits) >= 8 else False,
+                    User.phone_number.endswith(rec_last10) if len(rec_last10) >= 7 else False,
+                    User.id.endswith(rec_last10) if len(rec_last10) >= 7 else False,
                 )
             )
             r_res = await push_db.execute(r_stmt)
@@ -75,11 +77,13 @@ async def dispatch_push_to_user(
 
             # 2. Look up sender name
             send_digits = "".join(filter(str.isdigit, str(sender_id)))
+            send_last10 = send_digits[-10:] if len(send_digits) >= 10 else send_digits
             s_stmt = select(User).where(
                 or_(
                     User.id == sender_id,
                     User.phone_number == sender_id,
-                    User.phone_number.endswith(send_digits) if len(send_digits) >= 8 else False,
+                    User.phone_number.endswith(send_last10) if len(send_last10) >= 7 else False,
+                    User.id.endswith(send_last10) if len(send_last10) >= 7 else False,
                 )
             )
             s_res = await push_db.execute(s_stmt)
@@ -181,6 +185,51 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # -----------------------------------------------------------------------------
 # Media & Audio Upload Endpoint
 # -----------------------------------------------------------------------------
+@app.post("/api/upload/image")
+@app.post("/api/upload/media")
+async def upload_image(payload: dict):
+    """
+    Saves image / photo (.jpg/.png) from base64 data to cloud server and returns streaming URL.
+    """
+    try:
+        image_base64 = payload.get("image_base64") or payload.get("base64") or payload.get("media_base64")
+        file_ext = payload.get("ext", "jpg").replace(".", "")
+
+        if not image_base64:
+            raise HTTPException(status_code=400, detail="Image base64 data required")
+
+        if "," in image_base64:
+            # Extract extension if in data URI (e.g. data:image/png;base64,...)
+            if "data:image/" in image_base64:
+                try:
+                    header = image_base64.split(";")[0]
+                    file_ext = header.split("/")[1]
+                except Exception:
+                    pass
+            image_base64 = image_base64.split(",", 1)[1]
+
+        image_bytes = base64.b64decode(image_base64)
+        file_id = f"photo_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.{file_ext}"
+        file_path = os.path.join("uploads", "images", file_id)
+
+        with open(file_path, "wb") as f:
+            f.write(image_bytes)
+
+        media_url = f"/uploads/images/{file_id}"
+        logger.info("Saved photo (%d bytes) to %s", len(image_bytes), file_path)
+
+        return {
+            "status": "success",
+            "media_url": media_url,
+            "url": media_url,
+            "file_name": file_id,
+            "size": len(image_bytes),
+        }
+    except Exception as e:
+        logger.error("Image upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
+
+
 @app.post("/api/upload/audio")
 async def upload_audio(payload: dict):
     """
@@ -441,7 +490,7 @@ async def create_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Creates a new 24-hour status story in PostgreSQL."""
+    """Creates a new 24-hour status story in PostgreSQL and broadcasts to peers."""
     now = datetime.now(timezone.utc)
     expires = now + timedelta(hours=24)
     new_status = Status(
@@ -457,8 +506,17 @@ async def create_status(
     )
     db.add(new_status)
     await db.commit()
-    await db.refresh(new_status)
-    return new_status.to_dict()
+    new_status.user = current_user
+    st_dict = new_status.to_dict()
+
+    # Real-time WebSocket broadcast to all connected contacts
+    asyncio.create_task(
+        manager.broadcast({
+            "type": "status_update",
+            "data": st_dict,
+        })
+    )
+    return st_dict
 
 
 @app.get("/api/statuses/feed")
@@ -466,10 +524,11 @@ async def get_status_feed(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns active 24h statuses from PostgreSQL for current user and all contacts."""
+    """Returns active 24h statuses with eager-loaded user profiles from PostgreSQL."""
     now = datetime.now(timezone.utc)
     stmt = (
         select(Status)
+        .options(joinedload(Status.user))
         .where(Status.expires_at > now)
         .order_by(Status.created_at.desc())
     )
@@ -486,13 +545,15 @@ async def get_status_feed(
         else:
             cid = s.user_id
             if cid not in contact_dict:
+                user_obj = s.user
                 contact_dict[cid] = {
                     "contactId": cid,
-                    "userName": st_dict["userName"],
-                    "avatar": st_dict["avatar"],
-                    "avatarColor": st_dict["avatarColor"],
-                    "avatarUrl": st_dict["avatarUrl"],
-                    "latestTime": st_dict["time"],
+                    "phone_number": user_obj.phone_number if user_obj else cid,
+                    "userName": st_dict.get("userName") or (user_obj.username if user_obj else "Pocket User"),
+                    "avatar": st_dict.get("avatar") or "PK",
+                    "avatarColor": st_dict.get("avatarColor") or "#FFB800",
+                    "avatarUrl": st_dict.get("avatarUrl"),
+                    "latestTime": st_dict.get("time") or "Just now",
                     "stories": [],
                 }
             contact_dict[cid]["stories"].append(st_dict)
@@ -784,19 +845,20 @@ async def send_message_rest(
         "type": "chat_message",
         "data": message_dict,
     }
-    delivered = await manager.send_personal_message(receiver_id, chat_frame)
-
-    if not delivered:
-        asyncio.create_task(
-            dispatch_push_to_user(
-                sender_id=current_user.id,
-                receiver_id=receiver_id,
-                content=content,
-                data_payload={
-                    "message_id": message_dict["message_id"],
-                },
-            )
+    # Dispatch FCM push notification to receiver for background/closed device alerts
+    asyncio.create_task(
+        dispatch_push_to_user(
+            sender_id=current_user.id,
+            receiver_id=receiver_id,
+            content=content,
+            data_payload={
+                "type": "chat_message",
+                "message_id": message_dict["message_id"],
+                "sender_id": current_user.id,
+                "sender_name": current_user.username or "Pocket User",
+            },
         )
+    )
 
     # Trigger smart bot auto-reply for demo contacts
     asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
@@ -1226,18 +1288,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 }
                 delivered = await manager.send_personal_message(receiver_id, chat_frame)
 
-                if not delivered:
-                    # Receiver is offline / app is closed -> Dispatch Background Push Notification
-                    asyncio.create_task(
-                        dispatch_push_to_user(
-                            sender_id=user_id,
-                            receiver_id=receiver_id,
-                            content=content,
-                            data_payload={
-                                "message_id": message_dict["message_id"],
-                            },
-                        )
+                # Dispatch FCM Push Notification so background/closed devices receive tray alert
+                asyncio.create_task(
+                    dispatch_push_to_user(
+                        sender_id=user_id,
+                        receiver_id=receiver_id,
+                        content=content,
+                        data_payload={
+                            "type": "chat_message",
+                            "message_id": message_dict["message_id"],
+                            "sender_id": user_id,
+                        },
                     )
+                )
 
                 # Trigger smart bot responder if receiver is a demo contact
                 asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
@@ -1318,47 +1381,65 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 4. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
             # -----------------------------------------------------------------
             elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
-                receiver_id = data.get("receiver_id")
-                if receiver_id:
-                    call_data = {**data, "caller_id": data.get("caller_id", user_id), "sender_id": user_id}
+                # Determine target recipient for the call frame
+                target_id = data.get("receiver_id")
+                if not target_id or str(target_id) == str(user_id):
+                    target_id = data.get("caller_id") or data.get("other_user_id")
+
+                if target_id and str(target_id) != str(user_id):
+                    call_data = {
+                        **data,
+                        "sender_id": user_id,
+                        "caller_id": data.get("caller_id", user_id),
+                        "receiver_id": target_id,
+                    }
                     call_frame = {
                         "type": frame_type,
                         "data": call_data,
                     }
-                    delivered = await manager.send_personal_message(receiver_id, call_frame)
+                    delivered = await manager.send_personal_message(target_id, call_frame)
+                    logger.info("[VoiceCall] Frame %s from %s to %s (delivered: %s)", frame_type, user_id, target_id, delivered)
 
-                    # If offer and user is offline, send high-priority push notification
-                    if frame_type == "call_offer" and not delivered:
+                    # For voice call offers, ALWAYS dispatch high-priority FCM push notification
+                    # to ensure background, locked, or closed devices immediately wake up, vibrate, and ring!
+                    if frame_type == "call_offer":
+                        caller_name = data.get("caller_name") or f"User {str(user_id)[-4:]}"
                         asyncio.create_task(
                             dispatch_push_to_user(
                                 sender_id=user_id,
-                                receiver_id=receiver_id,
-                                content="📞 Incoming Voice Call...",
+                                receiver_id=target_id,
+                                content=f"📞 Incoming voice call from {caller_name}...",
                                 data_payload={
                                     "type": "incoming_call",
-                                    "caller_id": user_id,
+                                    "caller_id": str(user_id),
+                                    "caller_name": caller_name,
+                                    "caller_avatar": data.get("caller_avatar", "PK"),
+                                    "caller_color": data.get("caller_color", "#FFB800"),
+                                    "caller_avatar_url": data.get("caller_avatar_url", ""),
                                     "call_id": data.get("call_id", f"call_{int(datetime.now(timezone.utc).timestamp())}"),
                                 },
                             )
                         )
 
-                    # If calling a demo contact (1, 2, 3, 4) or demo numbers, simulate auto-answer after 2s for interactive testing
-                    demo_targets = ("1", "2", "3", "4", "+919876543210", "+919876543211", "+919123456782", "+919988776653", "+919811223344")
-                    if frame_type == "call_offer" and str(receiver_id) in demo_targets:
-                        async def simulate_demo_answer():
-                            await asyncio.sleep(1.8)
-                            ans_frame = {
-                                "type": "call_answer",
-                                "data": {
-                                    "call_id": data.get("call_id"),
-                                    "caller_id": receiver_id,
-                                    "receiver_id": user_id,
-                                    "sender_id": receiver_id,
-                                },
-                            }
-                            await manager.send_personal_message(user_id, ans_frame)
+                    # Demo contact simulation ONLY for mock bots (1, 2, 3, 4) when offline
+                    demo_mock_ids = ("1", "2", "3", "4")
+                    if frame_type == "call_offer" and str(target_id) in demo_mock_ids:
+                        is_target_online = await manager.is_user_online(target_id)
+                        if not is_target_online:
+                            async def simulate_demo_answer():
+                                await asyncio.sleep(2.0)
+                                ans_frame = {
+                                    "type": "call_answer",
+                                    "data": {
+                                        "call_id": data.get("call_id"),
+                                        "caller_id": target_id,
+                                        "receiver_id": user_id,
+                                        "sender_id": target_id,
+                                    },
+                                }
+                                await manager.send_personal_message(user_id, ans_frame)
 
-                        asyncio.create_task(simulate_demo_answer())
+                            asyncio.create_task(simulate_demo_answer())
 
             # -----------------------------------------------------------------
             # 5. HEARTBEAT / PING

@@ -94,7 +94,8 @@ async def init_db() -> None:
         except Exception:
             pass
         try:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token VARCHAR(255);"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;"))
+            await conn.execute(text("ALTER TABLE users ALTER COLUMN fcm_token TYPE TEXT;"))
         except Exception:
             pass
         try:
