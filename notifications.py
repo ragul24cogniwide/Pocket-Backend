@@ -85,11 +85,16 @@ async def send_push_notification(
     try:
         data_strings = {k: str(v) for k, v in (data_payload or {}).items()}
         is_call = data_strings.get("type") == "incoming_call"
-        channel_id = "pocket_calls" if is_call else "pocket_messages"
+        channel_id = "pocket_messages"
+        display_title = (
+            f"📞 Incoming Call: {sender_name}"
+            if is_call and not sender_name.startswith("📞")
+            else sender_name
+        )
 
         message = messaging.Message(
             notification=messaging.Notification(
-                title=sender_name,
+                title=display_title,
                 body=content,
             ),
             data=data_strings,

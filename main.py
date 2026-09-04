@@ -61,33 +61,41 @@ async def dispatch_push_to_user(
     """Dispatches high-priority push notification to offline receiver with phone tolerance."""
     try:
         async with async_session_factory() as push_db:
-            # 1. Look up receiver
+            # 1. Look up receiver with active token prioritization
             rec_digits = "".join(filter(str.isdigit, str(receiver_id)))
             rec_last10 = rec_digits[-10:] if len(rec_digits) >= 10 else rec_digits
-            r_stmt = select(User).where(
-                or_(
-                    User.id == receiver_id,
-                    User.phone_number == receiver_id,
-                    User.phone_number.endswith(rec_last10) if len(rec_last10) >= 7 else False,
-                    User.id.endswith(rec_last10) if len(rec_last10) >= 7 else False,
+            r_stmt = (
+                select(User)
+                .where(
+                    or_(
+                        User.id == receiver_id,
+                        User.phone_number == receiver_id,
+                        User.phone_number.endswith(rec_last10) if len(rec_last10) >= 7 else False,
+                        User.id.endswith(rec_last10) if len(rec_last10) >= 7 else False,
+                    )
                 )
+                .order_by(desc(User.fcm_token.isnot(None)), desc(User.last_seen))
             )
             r_res = await push_db.execute(r_stmt)
-            rec_user = r_res.scalar_one_or_none()
+            rec_user = r_res.scalars().first()
 
             # 2. Look up sender name
             send_digits = "".join(filter(str.isdigit, str(sender_id)))
             send_last10 = send_digits[-10:] if len(send_digits) >= 10 else send_digits
-            s_stmt = select(User).where(
-                or_(
-                    User.id == sender_id,
-                    User.phone_number == sender_id,
-                    User.phone_number.endswith(send_last10) if len(send_last10) >= 7 else False,
-                    User.id.endswith(send_last10) if len(send_last10) >= 7 else False,
+            s_stmt = (
+                select(User)
+                .where(
+                    or_(
+                        User.id == sender_id,
+                        User.phone_number == sender_id,
+                        User.phone_number.endswith(send_last10) if len(send_last10) >= 7 else False,
+                        User.id.endswith(send_last10) if len(send_last10) >= 7 else False,
+                    )
                 )
+                .order_by(desc(User.last_seen))
             )
             s_res = await push_db.execute(s_stmt)
-            sender_user = s_res.scalar_one_or_none()
+            sender_user = s_res.scalars().first()
 
             if rec_user and rec_user.fcm_token:
                 sender_title = (
@@ -106,6 +114,8 @@ async def dispatch_push_to_user(
                     content=content,
                     data_payload=payload_dict,
                 )
+            else:
+                logger.info("[Push] User %s has no active FCM token registered (rec_user=%s)", receiver_id, rec_user is not None)
     except Exception as err:
         logger.warning("Error dispatching offline push to %s: %s", receiver_id, err)
 
@@ -460,16 +470,20 @@ async def update_fcm_token(
     if not target_user and (payload.user_id or payload.phone_number):
         identifier = (payload.user_id or payload.phone_number or "").strip()
         digits = "".join(filter(str.isdigit, identifier))
-        stmt = select(User).where(
-            or_(
-                User.id == identifier,
-                User.phone_number == identifier,
-                User.phone_number.endswith(digits) if len(digits) >= 8 else False,
-                User.id.endswith(digits) if len(digits) >= 8 else False,
+        stmt = (
+            select(User)
+            .where(
+                or_(
+                    User.id == identifier,
+                    User.phone_number == identifier,
+                    User.phone_number.endswith(digits) if len(digits) >= 8 else False,
+                    User.id.endswith(digits) if len(digits) >= 8 else False,
+                )
             )
+            .order_by(desc(User.last_seen))
         )
         res = await db.execute(stmt)
-        target_user = res.scalar_one_or_none()
+        target_user = res.scalars().first()
 
     if target_user:
         target_user.fcm_token = payload.fcm_token
@@ -626,8 +640,17 @@ async def list_available_contacts(
     contacts = []
     seen_identifiers = set()
 
+    # Pre-calculate current_user identifiers
+    cur_ids = {current_user.id, current_user.phone_number}
+    cur_digits = "".join(filter(str.isdigit, str(current_user.id)))
+    cur_last10 = cur_digits[-10:] if len(cur_digits) >= 7 else cur_digits
+    if cur_last10:
+        cur_ids.add(cur_last10)
+        cur_ids.add(f"+91{cur_last10}")
+    cur_ids = {str(x) for x in cur_ids if x}
+
     for u in users:
-        # Avoid duplicate mock IDs pointing to same contact
+        # Avoid duplicate contacts pointing to same user
         norm_key = u.username.lower().strip()
         if norm_key in seen_identifiers:
             continue
@@ -635,25 +658,42 @@ async def list_available_contacts(
 
         is_online = await manager.is_user_online(u.id)
 
+        # Collect target user identifier aliases
+        u_ids = {u.id, u.phone_number}
+        u_digits = "".join(filter(str.isdigit, str(u.id)))
+        u_last10 = u_digits[-10:] if len(u_digits) >= 7 else u_digits
+        if u_last10:
+            u_ids.add(u_last10)
+            u_ids.add(f"+91{u_last10}")
+        u_ids = {str(x) for x in u_ids if x}
+
         # Get latest message between current_user and u
         msg_stmt = (
             select(Message)
             .where(
                 or_(
-                    (Message.sender_id == current_user.id) & (Message.receiver_id == u.id),
-                    (Message.sender_id == u.id) & (Message.receiver_id == current_user.id),
+                    Message.sender_id.in_(cur_ids) & Message.receiver_id.in_(u_ids),
+                    Message.sender_id.in_(u_ids) & Message.receiver_id.in_(cur_ids),
+                    (
+                        Message.sender_id.endswith(cur_last10) & Message.receiver_id.endswith(u_last10)
+                        if cur_last10 and u_last10 else False
+                    ),
+                    (
+                        Message.sender_id.endswith(u_last10) & Message.receiver_id.endswith(cur_last10)
+                        if cur_last10 and u_last10 else False
+                    ),
                 )
             )
             .order_by(desc(Message.timestamp))
             .limit(1)
         )
         msg_res = await db.execute(msg_stmt)
-        latest_msg = msg_res.scalar_one_or_none()
+        latest_msg = msg_res.scalars().first()
 
         # Count unread messages from u to current_user
         unread_stmt = select(func.count(Message.id)).where(
-            Message.sender_id == u.id,
-            Message.receiver_id == current_user.id,
+            Message.sender_id.in_(u_ids),
+            Message.receiver_id.in_(cur_ids),
             Message.status != "READ",
         )
         unread_res = await db.execute(unread_stmt)
@@ -666,27 +706,32 @@ async def list_available_contacts(
         )
 
         contacts.append(
-            ChatContactItem(
-                id=u.id,
-                phone_number=u.phone_number,
-                name=u.username,
-                avatar=initials,
-                avatar_color=u.avatar_color,
-                avatar_url=u.avatar_url,
-                quote=u.quote or "Hey there! I am using Pocket.",
-                online=is_online,
-                last_message=latest_msg.content if latest_msg else (u.quote or "Tap to start conversation"),
-                time=(
-                    latest_msg.timestamp.strftime("%I:%M %p")
-                    if latest_msg
-                    else ""
-                ),
-                unread=unread_count,
-                last_seen=u.last_seen.isoformat() if u.last_seen else None,
+            (
+                latest_msg.timestamp.timestamp() if latest_msg and latest_msg.timestamp else 0.0,
+                ChatContactItem(
+                    id=u.id,
+                    phone_number=u.phone_number,
+                    name=u.username,
+                    avatar=initials,
+                    avatar_color=u.avatar_color,
+                    avatar_url=u.avatar_url,
+                    quote=u.quote or "Hey there! I am using Pocket.",
+                    online=is_online,
+                    last_message=latest_msg.content if latest_msg else (u.quote or "Tap to start conversation"),
+                    time=(
+                        latest_msg.timestamp.strftime("%I:%M %p")
+                        if latest_msg and latest_msg.timestamp
+                        else ""
+                    ),
+                    unread=unread_count,
+                    last_seen=u.last_seen.isoformat() if u.last_seen else None,
+                )
             )
         )
 
-    return contacts
+    # Sort contacts: active conversations with recent messages first, then remaining contacts
+    contacts.sort(key=lambda x: (x[0], x[1].name), reverse=True)
+    return [c[1] for c in contacts]
 
 
 # -----------------------------------------------------------------------------
@@ -771,18 +816,71 @@ async def sync_device_contacts(
 @app.get("/api/messages/{other_user_id}")
 async def get_messages_with_user(
     other_user_id: str,
-    limit: int = 30,
+    limit: int = 50,
     offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves paginated message history (default: latest 30 messages)."""
+    """Retrieves paginated message history (default: latest 50 messages) with phone tolerance."""
+    other_user_id = other_user_id.strip()
+
+    # 1. Collect all possible identifier aliases for current_user
+    cur_ids = {current_user.id, current_user.phone_number}
+    cur_digits = "".join(filter(str.isdigit, str(current_user.id)))
+    cur_last10 = cur_digits[-10:] if len(cur_digits) >= 7 else cur_digits
+    if cur_last10:
+        cur_ids.add(cur_last10)
+        cur_ids.add(f"+91{cur_last10}")
+        if cur_digits:
+            cur_ids.add(f"+{cur_digits}")
+
+    # 2. Collect all possible identifier aliases for other_user
+    other_ids = {other_user_id}
+    other_digits = "".join(filter(str.isdigit, str(other_user_id)))
+    other_last10 = other_digits[-10:] if len(other_digits) >= 7 else other_digits
+    if other_last10:
+        other_ids.add(other_last10)
+        other_ids.add(f"+91{other_last10}")
+        if other_digits:
+            other_ids.add(f"+{other_digits}")
+
+    # Look up other user in DB to retrieve their exact db id & phone_number
+    o_stmt = (
+        select(User)
+        .where(
+            or_(
+                User.id == other_user_id,
+                User.phone_number == other_user_id,
+                User.phone_number.endswith(other_last10) if other_last10 else False,
+                User.id.endswith(other_last10) if other_last10 else False,
+            )
+        )
+        .order_by(desc(User.last_seen))
+    )
+    o_res = await db.execute(o_stmt)
+    o_user = o_res.scalars().first()
+    if o_user:
+        other_ids.add(o_user.id)
+        other_ids.add(o_user.phone_number)
+
+    # Clean out None or empty values
+    cur_ids = {str(i) for i in cur_ids if i}
+    other_ids = {str(i) for i in other_ids if i}
+
     stmt = (
         select(Message)
         .where(
             or_(
-                (Message.sender_id == current_user.id) & (Message.receiver_id == other_user_id),
-                (Message.sender_id == other_user_id) & (Message.receiver_id == current_user.id),
+                Message.sender_id.in_(cur_ids) & Message.receiver_id.in_(other_ids),
+                Message.sender_id.in_(other_ids) & Message.receiver_id.in_(cur_ids),
+                (
+                    Message.sender_id.endswith(cur_last10) & Message.receiver_id.endswith(other_last10)
+                    if cur_last10 and other_last10 else False
+                ),
+                (
+                    Message.sender_id.endswith(other_last10) & Message.receiver_id.endswith(cur_last10)
+                    if cur_last10 and other_last10 else False
+                ),
             )
         )
         .order_by(desc(Message.timestamp))
