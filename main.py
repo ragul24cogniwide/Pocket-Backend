@@ -130,45 +130,53 @@ active_call_sessions: dict[str, dict] = {}
 
 
 async def broadcast_call_frame(target_id: str, frame_type: str, data: dict) -> bool:
-    """Delivers call signaling frame across all known aliases of target_id."""
+    """Delivers call signaling frame across all known aliases of target_id with zero-latency Fast Path."""
     delivered = False
     call_frame = {"type": frame_type, "data": data}
 
-    targets = {str(target_id).strip()}
-    digits = "".join(filter(str.isdigit, str(target_id)))
+    target_str = str(target_id).strip()
+    targets = {target_str}
+    digits = "".join(filter(str.isdigit, target_str))
     if len(digits) >= 8:
         last10 = digits[-10:]
         targets.add(last10)
         targets.add(f"+91{last10}")
         targets.add(digits)
 
-    # Check DB for user id and phone aliases
-    try:
-        async with async_session_factory() as call_db:
-            stmt = (
-                select(User)
-                .where(
-                    or_(
-                        User.id == str(target_id),
-                        User.phone_number == str(target_id),
-                        User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                        User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                    )
-                )
-            )
-            res = await call_db.execute(stmt)
-            user_obj = res.scalars().first()
-            if user_obj:
-                if user_obj.id:
-                    targets.add(str(user_obj.id))
-                if user_obj.phone_number:
-                    targets.add(str(user_obj.phone_number))
-    except Exception as e:
-        logger.warning("[CallRouting] DB alias lookup error: %s", e)
-
-    for t in targets:
+    # 1. FAST PATH: Deliver immediately to active socket connections (0ms overhead)
+    for t in list(targets):
         if await manager.send_personal_message(t, call_frame):
             delivered = True
+
+    # 2. If not yet delivered, check DB for mapped phone/id aliases as fallback
+    if not delivered:
+        try:
+            async with async_session_factory() as call_db:
+                stmt = (
+                    select(User)
+                    .where(
+                        or_(
+                            User.id == target_str,
+                            User.phone_number == target_str,
+                            User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                            User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                        )
+                    )
+                )
+                res = await call_db.execute(stmt)
+                user_obj = res.scalars().first()
+                if user_obj:
+                    extra_targets = set()
+                    if user_obj.id:
+                        extra_targets.add(str(user_obj.id))
+                    if user_obj.phone_number:
+                        extra_targets.add(str(user_obj.phone_number))
+                    for t in extra_targets:
+                        if t not in targets:
+                            if await manager.send_personal_message(t, call_frame):
+                                delivered = True
+        except Exception as e:
+            logger.warning("[CallRouting] DB alias lookup fallback error: %s", e)
 
     return delivered
 
@@ -334,14 +342,39 @@ async def upload_audio(payload: dict):
 async def call_offer_endpoint(payload: CallOfferRequest):
     """Initiates an outgoing call offer, updates active session, sends push notification, and broadcasts over WS."""
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    caller_name = payload.caller_name
+    caller_avatar = payload.caller_avatar
+    caller_avatar_url = payload.caller_avatar_url
+    caller_color = payload.caller_color
+
+    # Enrich caller profile details from DB if missing or default
+    if not caller_avatar_url or not caller_name or caller_name == "Pocket User":
+        try:
+            async with async_session_factory() as db:
+                c_stmt = select(User).where(or_(User.id == str(payload.caller_id), User.phone_number == str(payload.caller_id)))
+                c_res = await db.execute(c_stmt)
+                caller_user = c_res.scalars().first()
+                if caller_user:
+                    if caller_user.username:
+                        caller_name = caller_user.username
+                    if caller_user.avatar_url:
+                        caller_avatar_url = caller_user.avatar_url
+                    if caller_user.avatar_color:
+                        caller_color = caller_user.avatar_color
+                    if caller_user.username and len(caller_user.username) >= 2:
+                        caller_avatar = caller_user.username[:2].upper()
+        except Exception as e:
+            logger.warning("[CallOffer] Caller enrichment error: %s", e)
+
     active_call_sessions[payload.call_id] = {
         "call_id": payload.call_id,
         "caller_id": payload.caller_id,
         "receiver_id": payload.receiver_id,
-        "caller_name": payload.caller_name or "Pocket User",
-        "caller_avatar": payload.caller_avatar or "PK",
-        "caller_color": payload.caller_color or "#FFB800",
-        "caller_avatar_url": payload.caller_avatar_url,
+        "caller_name": caller_name or "Pocket User",
+        "caller_avatar": caller_avatar or "PK",
+        "caller_color": caller_color or "#FFB800",
+        "caller_avatar_url": caller_avatar_url,
         "status": "ringing",
         "created_at": now_iso,
         "updated_at": now_iso,
@@ -352,15 +385,15 @@ async def call_offer_endpoint(payload: CallOfferRequest):
         "caller_id": payload.caller_id,
         "receiver_id": payload.receiver_id,
         "sender_id": payload.caller_id,
-        "caller_name": payload.caller_name or "Pocket User",
-        "caller_avatar": payload.caller_avatar or "PK",
-        "caller_avatar_url": payload.caller_avatar_url,
-        "caller_color": payload.caller_color or "#FFB800",
+        "caller_name": caller_name or "Pocket User",
+        "caller_avatar": caller_avatar or "PK",
+        "caller_avatar_url": caller_avatar_url,
+        "caller_color": caller_color or "#FFB800",
     }
     delivered = await broadcast_call_frame(payload.receiver_id, "call_offer", call_data)
 
     # Dispatch high-priority FCM wake-up call push
-    caller_title = payload.caller_name or f"User {str(payload.caller_id)[-4:]}"
+    caller_title = caller_name or f"User {str(payload.caller_id)[-4:]}"
     asyncio.create_task(
         dispatch_push_to_user(
             sender_id=payload.caller_id,
@@ -870,6 +903,43 @@ async def delete_status(
 # -----------------------------------------------------------------------------
 # User Discovery & Contacts
 # -----------------------------------------------------------------------------
+@app.get("/api/users/profile/{user_id}")
+@app.get("/api/users/{user_id}")
+async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_db)):
+    """Returns a user's public profile information (username, avatar, avatar_color, online status)."""
+    uid_str = str(user_id).strip()
+    digits = "".join(filter(str.isdigit, uid_str))
+
+    stmt = (
+        select(User)
+        .where(
+            or_(
+                User.id == uid_str,
+                User.phone_number == uid_str,
+                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+            )
+        )
+    )
+    res = await db.execute(stmt)
+    user = res.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    is_online = await manager.is_user_online(user.id)
+    return {
+        "id": user.id,
+        "phone_number": user.phone_number,
+        "username": user.username,
+        "avatar_url": user.avatar_url,
+        "avatar_color": user.avatar_color or "#FFB800",
+        "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "PK",
+        "quote": user.quote or "Hey there! I am using Pocket.",
+        "is_online": is_online,
+        "last_seen": user.last_seen.isoformat() if user.last_seen else None,
+    }
+
+
 @app.get("/api/users", response_model=List[ChatContactItem])
 async def list_available_contacts(
     current_user: User = Depends(get_current_user),
@@ -1719,7 +1789,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     await manager.send_personal_message(sender_id, ack_read_frame)
 
             # -----------------------------------------------------------------
-            # 4. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
+            # 4. REAL-TIME CALL AUDIO CHUNK FORWARDING (Zero-Latency Relay)
+            # -----------------------------------------------------------------
+            elif frame_type == "call_audio_chunk":
+                target_id = data.get("receiver_id")
+                if target_id and str(target_id) != str(user_id):
+                    # Zero-overhead streaming to target user's active socket
+                    await manager.send_personal_message(str(target_id), payload)
+
+            # -----------------------------------------------------------------
+            # 5. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
             # -----------------------------------------------------------------
             elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
                 # Determine target recipient for the call frame
@@ -1731,10 +1810,43 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 now_iso = datetime.now(timezone.utc).isoformat()
 
                 if frame_type == "call_offer":
+                    caller_id_val = str(data.get("caller_id", user_id))
+                    caller_name = data.get("caller_name")
+                    caller_avatar_url = data.get("caller_avatar_url")
+                    caller_color = data.get("caller_color", "#FFB800")
+                    caller_avatar = data.get("caller_avatar", "PK")
+
+                    if not caller_avatar_url or not caller_name or caller_name == "Pocket User":
+                        try:
+                            async with async_session_factory() as db:
+                                c_stmt = select(User).where(or_(User.id == caller_id_val, User.phone_number == caller_id_val))
+                                c_res = await db.execute(c_stmt)
+                                caller_user = c_res.scalars().first()
+                                if caller_user:
+                                    if caller_user.username:
+                                        caller_name = caller_user.username
+                                    if caller_user.avatar_url:
+                                        caller_avatar_url = caller_user.avatar_url
+                                    if caller_user.avatar_color:
+                                        caller_color = caller_user.avatar_color
+                                    if caller_user.username and len(caller_user.username) >= 2:
+                                        caller_avatar = caller_user.username[:2].upper()
+                        except Exception:
+                            pass
+
+                    data["caller_name"] = caller_name or f"User {caller_id_val[-4:]}"
+                    data["caller_avatar_url"] = caller_avatar_url
+                    data["caller_color"] = caller_color
+                    data["caller_avatar"] = caller_avatar
+
                     active_call_sessions[call_id] = {
                         "call_id": call_id,
                         "caller_id": user_id,
                         "receiver_id": target_id,
+                        "caller_name": data["caller_name"],
+                        "caller_avatar": data["caller_avatar"],
+                        "caller_color": data["caller_color"],
+                        "caller_avatar_url": data["caller_avatar_url"],
                         "status": "ringing",
                         "created_at": now_iso,
                         "updated_at": now_iso,
