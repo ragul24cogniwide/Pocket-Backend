@@ -102,3 +102,38 @@ class EditMessageRequest(BaseModel):
     content: str
 
 
+# Voice Calling Schemas
+class CallOfferRequest(BaseModel):
+    call_id: str
+    caller_id: str
+    receiver_id: str
+    caller_name: Optional[str] = "Pocket User"
+    caller_avatar: Optional[str] = "PK"
+    caller_avatar_url: Optional[str] = None
+    caller_color: Optional[str] = "#FFB800"
+
+
+class CallAnswerRequest(BaseModel):
+    call_id: str
+    caller_id: str
+    receiver_id: str
+    sdp: Optional[str] = None
+
+
+class CallRejectRequest(BaseModel):
+    call_id: str
+    caller_id: Optional[str] = None
+    receiver_id: Optional[str] = None
+    other_user_id: Optional[str] = None
+    reason: Optional[str] = "declined"
+
+
+class CallEndRequest(BaseModel):
+    call_id: str
+    caller_id: Optional[str] = None
+    receiver_id: Optional[str] = None
+    other_user_id: Optional[str] = None
+    duration: Optional[int] = 0
+    reason: Optional[str] = "ended"
+
+

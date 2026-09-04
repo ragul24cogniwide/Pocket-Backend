@@ -112,68 +112,113 @@ class ConnectionManager:
     # -------------------------------------------------------------------------
     # Messaging & Routing
     # -------------------------------------------------------------------------
-    def _find_local_ws(self, user_id: str) -> Optional[WebSocket]:
-        """Finds WebSocket connection with exact match or phone digit tolerance."""
-        if user_id in self.active_connections:
-            return self.active_connections[user_id]
-        digits = "".join(filter(str.isdigit, str(user_id)))
+    def _find_all_local_ws(self, user_id: str) -> list[WebSocket]:
+        """Finds all active local WebSocket connections matching exact ID or phone digits."""
+        matched: list[WebSocket] = []
+        uid_str = str(user_id).strip()
+        if uid_str in self.active_connections:
+            matched.append(self.active_connections[uid_str])
+
+        digits = "".join(filter(str.isdigit, uid_str))
         if len(digits) >= 8:
-            for conn_id, ws in self.active_connections.items():
+            for conn_id, ws in list(self.active_connections.items()):
+                if ws in matched:
+                    continue
                 conn_digits = "".join(filter(str.isdigit, str(conn_id)))
-                if conn_digits and (digits.endswith(conn_digits) or conn_digits.endswith(digits)):
-                    return ws
-        return None
+                if conn_digits and (
+                    digits.endswith(conn_digits)
+                    or conn_digits.endswith(digits)
+                    or (len(digits) >= 10 and len(conn_digits) >= 10 and digits[-10:] == conn_digits[-10:])
+                ):
+                    matched.append(ws)
+        return matched
+
+    def _find_local_ws(self, user_id: str) -> Optional[WebSocket]:
+        """Finds a primary local WebSocket connection for user_id."""
+        sockets = self._find_all_local_ws(user_id)
+        return sockets[0] if sockets else None
 
     async def send_personal_message(self, user_id: str, message_payload: dict[str, Any]) -> bool:
         """
         Routes a payload directly to the user if on this local node,
         or publishes to user's Redis channel for multi-node delivery.
-        Returns True if delivered locally or published to Redis.
+        Fans out to all matching local sockets and multi-alias Redis channels.
         """
-        # 1. Local delivery check
-        target_ws = self._find_local_ws(user_id)
-        if target_ws:
-            try:
-                await target_ws.send_text(json.dumps(message_payload))
-                return True
-            except Exception as e:
-                logger.warning("Local send failed for %s: %s", user_id, e)
-                return False
+        delivered = False
+        payload_str = json.dumps(message_payload)
 
-        # 2. Distributed Redis Pub/Sub routing
+        # 1. Local delivery check (fan-out to all matching active sockets)
+        target_sockets = self._find_all_local_ws(user_id)
+        if target_sockets:
+            for ws in list(target_sockets):
+                try:
+                    await ws.send_text(payload_str)
+                    delivered = True
+                except Exception as e:
+                    logger.warning("Local send failed for socket (%s): %s", user_id, e)
+                    # Clean up dead socket reference
+                    for k, v in list(self.active_connections.items()):
+                        if v == ws:
+                            self.active_connections.pop(k, None)
+
+        # 2. Distributed Redis Pub/Sub routing (publish to primary and alias channels)
         if self.redis:
             try:
-                channel = f"user:{user_id}"
-                subscribers = await self.redis.publish(channel, json.dumps(message_payload))
-                return subscribers > 0
+                channels = [f"user:{user_id}"]
+                digits = "".join(filter(str.isdigit, str(user_id)))
+                if len(digits) >= 8:
+                    last10 = digits[-10:]
+                    channels.append(f"user:{last10}")
+                    channels.append(f"user:+91{last10}")
+                    channels.append(f"user:{digits}")
+
+                # Publish to unique channels
+                for ch in set(channels):
+                    subscribers = await self.redis.publish(ch, payload_str)
+                    if subscribers > 0:
+                        delivered = True
             except Exception as e:
                 logger.error("Redis publish error for %s: %s", user_id, e)
 
-        return False
+        return delivered
 
     async def _listen_user_channel(self, user_id: str) -> None:
-        """Background task that reads messages published to `user:<user_id>` channel."""
+        """Background task that reads messages published to `user:<user_id>` and alias channels."""
         if not self.redis:
             return
 
         pubsub = self.redis.pubsub()
-        channel = f"user:{user_id}"
-        await pubsub.subscribe(channel)
+        channels = [f"user:{user_id}"]
+        digits = "".join(filter(str.isdigit, str(user_id)))
+        if len(digits) >= 8:
+            last10 = digits[-10:]
+            channels.append(f"user:{last10}")
+            channels.append(f"user:+91{last10}")
+            channels.append(f"user:{digits}")
+
+        unique_channels = list(set(channels))
+        await pubsub.subscribe(*unique_channels)
 
         try:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     payload_str = message["data"]
-                    target_ws = self._find_local_ws(user_id)
-                    if target_ws:
-                        await target_ws.send_text(payload_str)
+                    target_sockets = self._find_all_local_ws(user_id)
+                    for ws in target_sockets:
+                        try:
+                            await ws.send_text(payload_str)
+                        except Exception:
+                            pass
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error("PubSub error for user %s: %s", user_id, e)
         finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.aclose()
+            try:
+                await pubsub.unsubscribe(*unique_channels)
+                await pubsub.aclose()
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # Presence & Broadcasts

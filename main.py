@@ -31,6 +31,10 @@ from models import Message, MessageStatus, OtpRecord, User, Status
 from notifications import send_push_notification
 from schemas import (
     AuthResponse,
+    CallAnswerRequest,
+    CallEndRequest,
+    CallOfferRequest,
+    CallRejectRequest,
     ChatContactItem,
     CreateStatusRequest,
     EditMessageRequest,
@@ -119,6 +123,54 @@ async def dispatch_push_to_user(
     except Exception as err:
         logger.warning("Error dispatching offline push to %s: %s", receiver_id, err)
 
+
+# In-memory active call sessions registry
+# call_id -> { "status": "ringing" | "answered" | "ended" | "rejected", "caller_id": ..., "receiver_id": ..., "created_at": ..., "updated_at": ... }
+active_call_sessions: dict[str, dict] = {}
+
+
+async def broadcast_call_frame(target_id: str, frame_type: str, data: dict) -> bool:
+    """Delivers call signaling frame across all known aliases of target_id."""
+    delivered = False
+    call_frame = {"type": frame_type, "data": data}
+
+    targets = {str(target_id).strip()}
+    digits = "".join(filter(str.isdigit, str(target_id)))
+    if len(digits) >= 8:
+        last10 = digits[-10:]
+        targets.add(last10)
+        targets.add(f"+91{last10}")
+        targets.add(digits)
+
+    # Check DB for user id and phone aliases
+    try:
+        async with async_session_factory() as call_db:
+            stmt = (
+                select(User)
+                .where(
+                    or_(
+                        User.id == str(target_id),
+                        User.phone_number == str(target_id),
+                        User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                        User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                    )
+                )
+            )
+            res = await call_db.execute(stmt)
+            user_obj = res.scalars().first()
+            if user_obj:
+                if user_obj.id:
+                    targets.add(str(user_obj.id))
+                if user_obj.phone_number:
+                    targets.add(str(user_obj.phone_number))
+    except Exception as e:
+        logger.warning("[CallRouting] DB alias lookup error: %s", e)
+
+    for t in targets:
+        if await manager.send_personal_message(t, call_frame):
+            delivered = True
+
+    return delivered
 
 
 import httpx
@@ -275,7 +327,198 @@ async def upload_audio(payload: dict):
         }
     except Exception as e:
         logger.error("Audio upload failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Audio upload failed: {str(e)}")
+# -----------------------------------------------------------------------------
+# Voice Call Signaling Endpoints (Dual-Channel Handshake & REST Fallback)
+# -----------------------------------------------------------------------------
+@app.post("/api/call/offer")
+async def call_offer_endpoint(payload: CallOfferRequest):
+    """Initiates an outgoing call offer, updates active session, sends push notification, and broadcasts over WS."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    active_call_sessions[payload.call_id] = {
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.receiver_id,
+        "caller_name": payload.caller_name or "Pocket User",
+        "caller_avatar": payload.caller_avatar or "PK",
+        "caller_color": payload.caller_color or "#FFB800",
+        "caller_avatar_url": payload.caller_avatar_url,
+        "status": "ringing",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    call_data = {
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.receiver_id,
+        "sender_id": payload.caller_id,
+        "caller_name": payload.caller_name or "Pocket User",
+        "caller_avatar": payload.caller_avatar or "PK",
+        "caller_avatar_url": payload.caller_avatar_url,
+        "caller_color": payload.caller_color or "#FFB800",
+    }
+    delivered = await broadcast_call_frame(payload.receiver_id, "call_offer", call_data)
+
+    # Dispatch high-priority FCM wake-up call push
+    caller_title = payload.caller_name or f"User {str(payload.caller_id)[-4:]}"
+    asyncio.create_task(
+        dispatch_push_to_user(
+            sender_id=payload.caller_id,
+            receiver_id=payload.receiver_id,
+            content=f"📞 Incoming voice call from {caller_title}...",
+            data_payload={
+                "type": "incoming_call",
+                "caller_id": str(payload.caller_id),
+                "caller_name": caller_title,
+                "caller_avatar": payload.caller_avatar or "PK",
+                "caller_color": payload.caller_color or "#FFB800",
+                "caller_avatar_url": payload.caller_avatar_url or "",
+                "call_id": payload.call_id,
+            },
+        )
+    )
+
+    return {"status": "ringing", "call_id": payload.call_id, "delivered": delivered}
+
+
+@app.post("/api/call/answer")
+async def call_answer_endpoint(payload: CallAnswerRequest):
+    """Answers an incoming call, sets session to 'answered', notifies caller immediately over WS and push."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    session = active_call_sessions.get(payload.call_id, {})
+    session.update({
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.receiver_id,
+        "status": "answered",
+        "answered_at": now_iso,
+        "updated_at": now_iso,
+    })
+    active_call_sessions[payload.call_id] = session
+
+    call_data = {
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.caller_id,
+        "sender_id": payload.receiver_id,
+        "sdp": payload.sdp,
+    }
+    delivered = await broadcast_call_frame(payload.caller_id, "call_answer", call_data)
+    logger.info("[VoiceCall REST] Call answered: %s (caller: %s, delivered: %s)", payload.call_id, payload.caller_id, delivered)
+
+    # Wake-up / answer push notification to caller
+    asyncio.create_task(
+        dispatch_push_to_user(
+            sender_id=payload.receiver_id,
+            receiver_id=payload.caller_id,
+            content="Call Answered",
+            data_payload={
+                "type": "call_answered",
+                "call_id": payload.call_id,
+                "receiver_id": str(payload.receiver_id),
+            },
+        )
+    )
+
+    return {"status": "answered", "call_id": payload.call_id, "delivered": delivered}
+
+
+@app.post("/api/call/reject")
+async def call_reject_endpoint(payload: CallRejectRequest):
+    """Declines an incoming call and terminates for both sides."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    session = active_call_sessions.get(payload.call_id, {})
+    session.update({
+        "call_id": payload.call_id,
+        "status": "rejected",
+        "reason": payload.reason or "declined",
+        "updated_at": now_iso,
+    })
+    active_call_sessions[payload.call_id] = session
+
+    target = payload.caller_id or payload.receiver_id or payload.other_user_id
+    call_data = {
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.receiver_id,
+        "reason": payload.reason or "declined",
+    }
+    if target:
+        await broadcast_call_frame(target, "call_reject", call_data)
+        asyncio.create_task(
+            dispatch_push_to_user(
+                sender_id=str(payload.receiver_id or "system"),
+                receiver_id=str(target),
+                content="Call Declined",
+                data_payload={
+                    "type": "call_rejected",
+                    "call_id": payload.call_id,
+                    "reason": payload.reason or "declined",
+                },
+            )
+        )
+
+    return {"status": "rejected", "call_id": payload.call_id}
+
+
+@app.post("/api/call/end")
+async def call_end_endpoint(payload: CallEndRequest):
+    """Ends an ongoing call and terminates for both sides immediately."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    session = active_call_sessions.get(payload.call_id, {})
+    session.update({
+        "call_id": payload.call_id,
+        "status": "ended",
+        "duration": payload.duration or 0,
+        "updated_at": now_iso,
+    })
+    active_call_sessions[payload.call_id] = session
+
+    targets = set()
+    if payload.caller_id:
+        targets.add(payload.caller_id)
+    if payload.receiver_id:
+        targets.add(payload.receiver_id)
+    if payload.other_user_id:
+        targets.add(payload.other_user_id)
+
+    call_data = {
+        "call_id": payload.call_id,
+        "caller_id": payload.caller_id,
+        "receiver_id": payload.receiver_id,
+        "duration": payload.duration or 0,
+    }
+    for t in targets:
+        await broadcast_call_frame(t, "call_end", call_data)
+        asyncio.create_task(
+            dispatch_push_to_user(
+                sender_id="system",
+                receiver_id=str(t),
+                content="Call Ended",
+                data_payload={
+                    "type": "call_ended",
+                    "call_id": payload.call_id,
+                },
+            )
+        )
+
+    return {"status": "ended", "call_id": payload.call_id}
+
+
+@app.get("/api/call/status/{call_id}")
+async def get_call_status(call_id: str):
+    """Returns active call status ('ringing', 'answered', 'ended', 'rejected', 'unknown')."""
+    session = active_call_sessions.get(call_id)
+    if not session:
+        return {"call_id": call_id, "status": "unknown"}
+    return {
+        "call_id": call_id,
+        "status": session.get("status", "unknown"),
+        "caller_id": session.get("caller_id"),
+        "receiver_id": session.get("receiver_id"),
+        "created_at": session.get("created_at"),
+        "answered_at": session.get("answered_at"),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -1484,22 +1727,58 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if not target_id or str(target_id) == str(user_id):
                     target_id = data.get("caller_id") or data.get("other_user_id")
 
+                call_id = data.get("call_id") or f"call_{int(datetime.now(timezone.utc).timestamp())}"
+                now_iso = datetime.now(timezone.utc).isoformat()
+
+                if frame_type == "call_offer":
+                    active_call_sessions[call_id] = {
+                        "call_id": call_id,
+                        "caller_id": user_id,
+                        "receiver_id": target_id,
+                        "status": "ringing",
+                        "created_at": now_iso,
+                        "updated_at": now_iso,
+                    }
+                elif frame_type == "call_answer":
+                    session = active_call_sessions.get(call_id, {})
+                    session.update({
+                        "call_id": call_id,
+                        "status": "answered",
+                        "answered_at": now_iso,
+                        "updated_at": now_iso,
+                    })
+                    active_call_sessions[call_id] = session
+                elif frame_type == "call_reject":
+                    session = active_call_sessions.get(call_id, {})
+                    session.update({
+                        "call_id": call_id,
+                        "status": "rejected",
+                        "reason": data.get("reason", "declined"),
+                        "updated_at": now_iso,
+                    })
+                    active_call_sessions[call_id] = session
+                elif frame_type == "call_end":
+                    session = active_call_sessions.get(call_id, {})
+                    session.update({
+                        "call_id": call_id,
+                        "status": "ended",
+                        "duration": data.get("duration", 0),
+                        "updated_at": now_iso,
+                    })
+                    active_call_sessions[call_id] = session
+
                 if target_id and str(target_id) != str(user_id):
                     call_data = {
                         **data,
                         "sender_id": user_id,
                         "caller_id": data.get("caller_id", user_id),
                         "receiver_id": target_id,
+                        "call_id": call_id,
                     }
-                    call_frame = {
-                        "type": frame_type,
-                        "data": call_data,
-                    }
-                    delivered = await manager.send_personal_message(target_id, call_frame)
-                    logger.info("[VoiceCall] Frame %s from %s to %s (delivered: %s)", frame_type, user_id, target_id, delivered)
+                    delivered = await broadcast_call_frame(target_id, frame_type, call_data)
+                    logger.info("[VoiceCall WS] Frame %s from %s to %s (delivered: %s)", frame_type, user_id, target_id, delivered)
 
                     # For voice call offers, ALWAYS dispatch high-priority FCM push notification
-                    # to ensure background, locked, or closed devices immediately wake up, vibrate, and ring!
                     if frame_type == "call_offer":
                         caller_name = data.get("caller_name") or f"User {str(user_id)[-4:]}"
                         asyncio.create_task(
@@ -1514,7 +1793,32 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                     "caller_avatar": data.get("caller_avatar", "PK"),
                                     "caller_color": data.get("caller_color", "#FFB800"),
                                     "caller_avatar_url": data.get("caller_avatar_url", ""),
-                                    "call_id": data.get("call_id", f"call_{int(datetime.now(timezone.utc).timestamp())}"),
+                                    "call_id": call_id,
+                                },
+                            )
+                        )
+                    elif frame_type == "call_answer":
+                        asyncio.create_task(
+                            dispatch_push_to_user(
+                                sender_id=user_id,
+                                receiver_id=target_id,
+                                content="Call Answered",
+                                data_payload={
+                                    "type": "call_answered",
+                                    "call_id": call_id,
+                                    "receiver_id": str(user_id),
+                                },
+                            )
+                        )
+                    elif frame_type in ("call_end", "call_reject"):
+                        asyncio.create_task(
+                            dispatch_push_to_user(
+                                sender_id=user_id,
+                                receiver_id=target_id,
+                                content="Call Ended" if frame_type == "call_end" else "Call Declined",
+                                data_payload={
+                                    "type": "call_ended" if frame_type == "call_end" else "call_rejected",
+                                    "call_id": call_id,
                                 },
                             )
                         )
@@ -1526,16 +1830,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         if not is_target_online:
                             async def simulate_demo_answer():
                                 await asyncio.sleep(2.0)
-                                ans_frame = {
-                                    "type": "call_answer",
-                                    "data": {
-                                        "call_id": data.get("call_id"),
-                                        "caller_id": target_id,
-                                        "receiver_id": user_id,
-                                        "sender_id": target_id,
-                                    },
+                                ans_data = {
+                                    "call_id": call_id,
+                                    "caller_id": target_id,
+                                    "receiver_id": user_id,
+                                    "sender_id": target_id,
                                 }
-                                await manager.send_personal_message(user_id, ans_frame)
+                                await broadcast_call_frame(user_id, "call_answer", ans_data)
 
                             asyncio.create_task(simulate_demo_answer())
 
