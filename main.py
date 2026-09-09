@@ -129,8 +129,8 @@ async def dispatch_push_to_user(
 active_call_sessions: dict[str, dict] = {}
 
 
-async def broadcast_call_frame(target_id: str, frame_type: str, data: dict) -> bool:
-    """Delivers call signaling frame across all known aliases of target_id with zero-latency Fast Path."""
+async def broadcast_call_frame(target_id: str, frame_type: str, data: dict, sender_id: Optional[str] = None) -> bool:
+    """Delivers call signaling frame across all known aliases of target_id with zero-latency Fast Path, excluding caller."""
     delivered = False
     call_frame = {"type": frame_type, "data": data}
 
@@ -142,6 +142,16 @@ async def broadcast_call_frame(target_id: str, frame_type: str, data: dict) -> b
         targets.add(last10)
         targets.add(f"+91{last10}")
         targets.add(digits)
+
+    # Exclude sender's own identifiers from targets so caller never receives their own call_offer
+    if sender_id:
+        sender_str = str(sender_id).strip()
+        sender_digits = "".join(filter(str.isdigit, sender_str))
+        sender_last10 = sender_digits[-10:] if len(sender_digits) >= 8 else sender_digits
+        targets = {
+            t for t in targets
+            if t != sender_str and (not sender_last10 or not "".join(filter(str.isdigit, t)).endswith(sender_last10))
+        }
 
     # 1. FAST PATH: Deliver immediately to active socket connections (0ms overhead)
     for t in list(targets):
@@ -1256,6 +1266,8 @@ async def send_message_rest(
         "type": "chat_message",
         "data": message_dict,
     }
+    await manager.send_personal_message(receiver_id, chat_frame)
+
     # Dispatch FCM push notification to receiver for background/closed device alerts
     asyncio.create_task(
         dispatch_push_to_user(
@@ -1792,7 +1804,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 4. REAL-TIME CALL AUDIO CHUNK FORWARDING (Zero-Latency Relay)
             # -----------------------------------------------------------------
             elif frame_type == "call_audio_chunk":
-                target_id = data.get("receiver_id")
+                target_id = data.get("receiver_id") or data.get("other_user_id") or data.get("caller_id")
                 if target_id and str(target_id) != str(user_id):
                     # Zero-overhead streaming to target user's active socket
                     await manager.send_personal_message(str(target_id), payload)
@@ -1803,7 +1815,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
                 # Determine target recipient for the call frame
                 target_id = data.get("receiver_id")
-                if not target_id or str(target_id) == str(user_id):
+                if (not target_id or str(target_id) == str(user_id)) and frame_type != "call_offer":
                     target_id = data.get("caller_id") or data.get("other_user_id")
 
                 call_id = data.get("call_id") or f"call_{int(datetime.now(timezone.utc).timestamp())}"
@@ -1879,7 +1891,22 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     })
                     active_call_sessions[call_id] = session
 
-                if target_id and str(target_id) != str(user_id):
+                def is_same_user_id(u1: str, u2: str) -> bool:
+                    if not u1 or not u2:
+                        return False
+                    s1, s2 = str(u1).strip(), str(u2).strip()
+                    if s1 == s2:
+                        return True
+                    d1 = "".join(filter(str.isdigit, s1))
+                    d2 = "".join(filter(str.isdigit, s2))
+                    if d1 and d2:
+                        if d1 == d2:
+                            return True
+                        if len(d1) >= 7 and len(d2) >= 7:
+                            return d1.endswith(d2) or d2.endswith(d1)
+                    return False
+
+                if target_id and not is_same_user_id(target_id, user_id):
                     call_data = {
                         **data,
                         "sender_id": user_id,
@@ -1887,7 +1914,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "receiver_id": target_id,
                         "call_id": call_id,
                     }
-                    delivered = await broadcast_call_frame(target_id, frame_type, call_data)
+                    delivered = await broadcast_call_frame(target_id, frame_type, call_data, sender_id=user_id)
                     logger.info("[VoiceCall WS] Frame %s from %s to %s (delivered: %s)", frame_type, user_id, target_id, delivered)
 
                     # For voice call offers, ALWAYS dispatch high-priority FCM push notification

@@ -31,10 +31,19 @@ class ConnectionManager:
         if self.redis_url.startswith("redis-cli -u "):
             self.redis_url = self.redis_url.replace("redis-cli -u ", "", 1).strip()
         self.redis: Optional[aioredis.Redis] = None
+        self.node_id = str(uuid.uuid4())
         # Local active connections on this server node: {user_id: WebSocket}
         self.active_connections: dict[str, WebSocket] = {}
         # Background Redis Pub/Sub listener tasks: {user_id: asyncio.Task}
         self._pubsub_tasks: dict[str, asyncio.Task] = {}
+
+    @staticmethod
+    def _canonical_id(user_id: str) -> str:
+        s = str(user_id).strip()
+        digits = "".join(filter(str.isdigit, s))
+        if len(digits) >= 10:
+            return digits[-10:]
+        return s
 
     async def initialize(self) -> None:
         """Initializes Redis connection pool with SSL support for Render/Redis Cloud."""
@@ -74,13 +83,30 @@ class ConnectionManager:
     async def connect(self, user_id: str, websocket: WebSocket) -> None:
         """Accepts WebSocket connection and subscribes to personal Redis channel."""
         await websocket.accept()
+
+        # Clean up any existing pubsub task for this user before registering a new one
+        if user_id in self._pubsub_tasks:
+            try:
+                self._pubsub_tasks[user_id].cancel()
+            except Exception:
+                pass
+            self._pubsub_tasks.pop(user_id, None)
+
+        if user_id in self.active_connections:
+            old_ws = self.active_connections[user_id]
+            if old_ws != websocket:
+                try:
+                    await old_ws.close()
+                except Exception:
+                    pass
+
         self.active_connections[user_id] = websocket
 
         # Record presence in Redis and local node
         if self.redis:
             try:
                 await self.redis.sadd(REDIS_PRESENCE_KEY, user_id)
-                # Spawn personal Pub/Sub listener for distributed message routing
+                # Spawn single personal Pub/Sub listener for distributed message routing
                 task = asyncio.create_task(self._listen_user_channel(user_id))
                 self._pubsub_tasks[user_id] = task
             except Exception as e:
@@ -96,7 +122,10 @@ class ConnectionManager:
             del self.active_connections[user_id]
 
         if user_id in self._pubsub_tasks:
-            self._pubsub_tasks[user_id].cancel()
+            try:
+                self._pubsub_tasks[user_id].cancel()
+            except Exception:
+                pass
             del self._pubsub_tasks[user_id]
 
         if self.redis:
@@ -141,8 +170,8 @@ class ConnectionManager:
     async def send_personal_message(self, user_id: str, message_payload: dict[str, Any]) -> bool:
         """
         Routes a payload directly to the user if on this local node,
-        or publishes to user's Redis channel for multi-node delivery.
-        Fans out to all matching local sockets and multi-alias Redis channels.
+        and publishes to user's canonical Redis channel for other cluster nodes.
+        Avoids duplicate local delivery.
         """
         delivered = False
         payload_str = json.dumps(message_payload)
@@ -161,48 +190,45 @@ class ConnectionManager:
                         if v == ws:
                             self.active_connections.pop(k, None)
 
-        # 2. Distributed Redis Pub/Sub routing (publish to primary and alias channels)
+        # 2. Distributed Redis Pub/Sub routing (publish ONLY once to canonical channel)
         if self.redis:
             try:
-                channels = [f"user:{user_id}"]
-                digits = "".join(filter(str.isdigit, str(user_id)))
-                if len(digits) >= 8:
-                    last10 = digits[-10:]
-                    channels.append(f"user:{last10}")
-                    channels.append(f"user:+91{last10}")
-                    channels.append(f"user:{digits}")
-
-                # Publish to unique channels
-                for ch in set(channels):
-                    subscribers = await self.redis.publish(ch, payload_str)
-                    if subscribers > 0:
-                        delivered = True
+                ch = f"user:{self._canonical_id(user_id)}"
+                envelope = json.dumps({
+                    "origin_node": self.node_id,
+                    "payload": message_payload,
+                })
+                subscribers = await self.redis.publish(ch, envelope)
+                if subscribers > 0:
+                    delivered = True
             except Exception as e:
                 logger.error("Redis publish error for %s: %s", user_id, e)
 
         return delivered
 
     async def _listen_user_channel(self, user_id: str) -> None:
-        """Background task that reads messages published to `user:<user_id>` and alias channels."""
+        """Background task that reads messages published to `user:<canonical_user_id>` from peer nodes."""
         if not self.redis:
             return
 
         pubsub = self.redis.pubsub()
-        channels = [f"user:{user_id}"]
-        digits = "".join(filter(str.isdigit, str(user_id)))
-        if len(digits) >= 8:
-            last10 = digits[-10:]
-            channels.append(f"user:{last10}")
-            channels.append(f"user:+91{last10}")
-            channels.append(f"user:{digits}")
-
-        unique_channels = list(set(channels))
-        await pubsub.subscribe(*unique_channels)
+        channel = f"user:{self._canonical_id(user_id)}"
+        await pubsub.subscribe(channel)
 
         try:
             async for message in pubsub.listen():
                 if message["type"] == "message":
-                    payload_str = message["data"]
+                    raw_data = message["data"]
+                    try:
+                        parsed = json.loads(raw_data)
+                        # Avoid duplicate delivery if this node already sent to local sockets
+                        if isinstance(parsed, dict) and parsed.get("origin_node") == self.node_id:
+                            continue
+                        payload_data = parsed.get("payload", parsed) if isinstance(parsed, dict) else parsed
+                        payload_str = json.dumps(payload_data)
+                    except Exception:
+                        payload_str = raw_data
+
                     target_sockets = self._find_all_local_ws(user_id)
                     for ws in target_sockets:
                         try:
@@ -215,7 +241,7 @@ class ConnectionManager:
             logger.error("PubSub error for user %s: %s", user_id, e)
         finally:
             try:
-                await pubsub.unsubscribe(*unique_channels)
+                await pubsub.unsubscribe(channel)
                 await pubsub.aclose()
             except Exception:
                 pass
