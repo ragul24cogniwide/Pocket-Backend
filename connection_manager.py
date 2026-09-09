@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import ssl
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 import redis.asyncio as aioredis
