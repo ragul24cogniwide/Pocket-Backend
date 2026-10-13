@@ -117,6 +117,18 @@ class ConnectionManager:
         await self.broadcast_presence(user_id, is_online=True)
         logger.info("User connected: %s (Active local sockets: %d)", user_id, len(self.active_connections))
 
+        # Send current online users snapshot to this connecting user immediately
+        try:
+            online_users = list(self.active_connections.keys())
+            await websocket.send_text(json.dumps({
+                "type": "online_users_snapshot",
+                "data": {
+                    "online_user_ids": online_users
+                }
+            }))
+        except Exception:
+            pass
+
     async def disconnect(self, user_id: str) -> None:
         """Removes local connection and cleans up Pub/Sub subscription."""
         if user_id in self.active_connections:
@@ -135,8 +147,9 @@ class ConnectionManager:
             except Exception as e:
                 logger.error("Error clearing Redis presence for %s: %s", user_id, e)
 
-        # Broadcast offline presence update
-        await self.broadcast_presence(user_id, is_online=False)
+        # Broadcast offline presence update with last seen timestamp
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self.broadcast_presence(user_id, is_online=False, last_seen=now_iso)
         logger.info("User disconnected: %s (Active local sockets: %d)", user_id, len(self.active_connections))
 
     # -------------------------------------------------------------------------
@@ -271,14 +284,16 @@ class ConnectionManager:
                 pass
         return False
 
-    async def broadcast_presence(self, user_id: str, is_online: bool) -> None:
+    async def broadcast_presence(self, user_id: str, is_online: bool, last_seen: Optional[str] = None) -> None:
         """Notifies all connected clients about user presence change."""
+        now_iso = datetime.now(timezone.utc).isoformat()
         frame = {
             "type": "presence_update",
             "data": {
                 "user_id": user_id,
                 "is_online": is_online,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "last_seen": last_seen or (now_iso if not is_online else None),
+                "timestamp": now_iso,
             },
         }
         # Send to all local connections

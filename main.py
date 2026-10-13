@@ -1980,21 +1980,75 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             asyncio.create_task(simulate_demo_answer())
 
             # -----------------------------------------------------------------
-            # 5. HEARTBEAT / PING
+            # 5. HEARTBEAT / PING & PRESENCE CONTROL
             # -----------------------------------------------------------------
             elif frame_type == "ping":
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
 
+            elif frame_type == "presence_online":
+                async with async_session_factory() as db:
+                    await db.execute(
+                        update(User)
+                        .where(User.id == user_id)
+                        .values(is_online=True)
+                    )
+                    await db.commit()
+                await manager.broadcast_presence(user_id, is_online=True)
+
+            elif frame_type == "presence_offline":
+                now_utc = datetime.now(timezone.utc)
+                async with async_session_factory() as db:
+                    await db.execute(
+                        update(User)
+                        .where(User.id == user_id)
+                        .values(is_online=False, last_seen=now_utc)
+                    )
+                    await db.commit()
+                await manager.broadcast_presence(user_id, is_online=False, last_seen=now_utc.isoformat())
+
+            elif frame_type == "query_presence":
+                target_id = data.get("user_id")
+                if target_id:
+                    is_target_online = await manager.is_user_online(target_id)
+                    target_last_seen = None
+                    async with async_session_factory() as db:
+                        t_stmt = select(User.last_seen).where(User.id == target_id)
+                        t_res = await db.execute(t_stmt)
+                        ls = t_res.scalar_one_or_none()
+                        if ls:
+                            target_last_seen = ls.isoformat()
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "presence_update",
+                            "data": {
+                                "user_id": target_id,
+                                "is_online": is_target_online,
+                                "last_seen": target_last_seen,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                        }))
+                    except Exception:
+                        pass
+
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user %s", user_id)
+        now_utc = datetime.now(timezone.utc)
         await manager.disconnect(user_id)
         async with async_session_factory() as db:
             await db.execute(
                 update(User)
                 .where(User.id == user_id)
-                .values(is_online=False, last_seen=datetime.now(timezone.utc))
+                .values(is_online=False, last_seen=now_utc)
             )
             await db.commit()
     except Exception as e:
         logger.error("WebSocket runtime error for %s: %s", user_id, e)
+        now_utc = datetime.now(timezone.utc)
         await manager.disconnect(user_id)
+        async with async_session_factory() as db:
+            await db.execute(
+                update(User)
+                .where(User.id == user_id)
+                .values(is_online=False, last_seen=now_utc)
+            )
+            await db.commit()
