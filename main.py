@@ -936,7 +936,7 @@ async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_d
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    is_online = await manager.is_user_online(user.id)
+    is_online = await manager.is_user_online(user.id, user.phone_number)
     return {
         "id": user.id,
         "phone_number": user.phone_number,
@@ -979,7 +979,7 @@ async def list_available_contacts(
             continue
         seen_identifiers.add(norm_key)
 
-        is_online = await manager.is_user_online(u.id)
+        is_online = await manager.is_user_online(u.id, u.phone_number)
 
         # Collect target user identifier aliases
         u_ids = {u.id, u.phone_number}
@@ -2009,14 +2009,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             elif frame_type == "query_presence":
                 target_id = data.get("user_id")
                 if target_id:
-                    is_target_online = await manager.is_user_online(target_id)
                     target_last_seen = None
+                    is_target_online = False
                     async with async_session_factory() as db:
-                        t_stmt = select(User.last_seen).where(User.id == target_id)
+                        digits = "".join(filter(str.isdigit, str(target_id)))
+                        t_stmt = select(User).where(
+                            or_(
+                                User.id == str(target_id),
+                                User.phone_number == str(target_id),
+                                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                            )
+                        )
                         t_res = await db.execute(t_stmt)
-                        ls = t_res.scalar_one_or_none()
-                        if ls:
-                            target_last_seen = ls.isoformat()
+                        target_user = t_res.scalars().first()
+                        if target_user:
+                            is_target_online = await manager.is_user_online(target_user.id, target_user.phone_number)
+                            if target_user.last_seen:
+                                target_last_seen = target_user.last_seen.isoformat()
+                        else:
+                            is_target_online = await manager.is_user_online(target_id)
                     try:
                         await websocket.send_text(json.dumps({
                             "type": "presence_update",
@@ -2037,7 +2049,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         async with async_session_factory() as db:
             await db.execute(
                 update(User)
-                .where(User.id == user_id)
+                .where(or_(User.id == user_id, User.phone_number == user_id))
                 .values(is_online=False, last_seen=now_utc)
             )
             await db.commit()
@@ -2048,7 +2060,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         async with async_session_factory() as db:
             await db.execute(
                 update(User)
-                .where(User.id == user_id)
+                .where(or_(User.id == user_id, User.phone_number == user_id))
                 .values(is_online=False, last_seen=now_utc)
             )
             await db.commit()

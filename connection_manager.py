@@ -263,23 +263,50 @@ class ConnectionManager:
     # -------------------------------------------------------------------------
     # Presence & Broadcasts
     # -------------------------------------------------------------------------
-    async def is_user_online(self, user_id: str) -> bool:
+    async def is_user_online(self, user_id: str, phone_number: Optional[str] = None) -> bool:
         """Checks if a user is currently online on any node with phone digit matching."""
-        if not user_id:
+        if not user_id and not phone_number:
             return False
-        if self._find_local_ws(user_id):
+        if user_id and self._find_local_ws(user_id):
             return True
+        if phone_number and self._find_local_ws(phone_number):
+            return True
+
+        # Check digit matching against all local active connections
+        all_checks = [str(user_id) if user_id else "", str(phone_number) if phone_number else ""]
+        for chk in all_checks:
+            if not chk:
+                continue
+            digits = "".join(filter(str.isdigit, chk))
+            if len(digits) >= 8:
+                for conn_id in self.active_connections.keys():
+                    c_digits = "".join(filter(str.isdigit, str(conn_id)))
+                    if c_digits and (
+                        digits.endswith(c_digits)
+                        or c_digits.endswith(digits)
+                        or (len(digits) >= 10 and len(c_digits) >= 10 and digits[-10:] == c_digits[-10:])
+                    ):
+                        return True
+
         if self.redis:
             try:
-                if await self.redis.sismember(REDIS_PRESENCE_KEY, user_id):
-                    return True
+                for chk in all_checks:
+                    if chk and await self.redis.sismember(REDIS_PRESENCE_KEY, chk):
+                        return True
                 members = await self.redis.smembers(REDIS_PRESENCE_KEY)
-                digits = "".join(filter(str.isdigit, str(user_id)))
-                if len(digits) >= 8:
-                    for m in members:
-                        m_digits = "".join(filter(str.isdigit, str(m)))
-                        if m_digits and (digits.endswith(m_digits) or m_digits.endswith(digits)):
-                            return True
+                for chk in all_checks:
+                    if not chk:
+                        continue
+                    digits = "".join(filter(str.isdigit, chk))
+                    if len(digits) >= 8:
+                        for m in members:
+                            m_digits = "".join(filter(str.isdigit, str(m)))
+                            if m_digits and (
+                                digits.endswith(m_digits)
+                                or m_digits.endswith(digits)
+                                or (len(digits) >= 10 and len(m_digits) >= 10 and digits[-10:] == m_digits[-10:])
+                            ):
+                                return True
             except Exception:
                 pass
         return False
