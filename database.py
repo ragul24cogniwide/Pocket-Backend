@@ -64,13 +64,23 @@ class Base(DeclarativeBase):
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency yielding transactional async database sessions."""
+    """Dependency yielding transactional async database sessions with auto-schema healing."""
     async with async_session_factory() as session:
         try:
             yield session
             await session.commit()
-        except Exception:
+        except Exception as exc:
             await session.rollback()
+            err_str = str(exc)
+            if "does not exist" in err_str and ("relation" in err_str or "table" in err_str):
+                import logging
+                logging.getLogger("Database").warning(
+                    "Missing relation detected (%s). Auto-healing database schema...", err_str
+                )
+                try:
+                    await init_db()
+                except Exception as heal_err:
+                    logging.getLogger("Database").error("Auto-heal failed: %s", heal_err)
             raise
         finally:
             await session.close()

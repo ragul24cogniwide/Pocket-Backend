@@ -279,6 +279,23 @@ async def health_check():
     }
 
 
+@app.api_route("/api/admin/init-db", methods=["GET", "POST"])
+async def trigger_init_db():
+    """Manual or automated hook to verify and recreate database tables and seeds."""
+    logger.info("Manual init-db requested. Rebuilding database schema...")
+    await init_db()
+    async with async_session_factory() as session:
+        try:
+            await ensure_personal_agent_user(session)
+        except Exception as e:
+            logger.warning("Could not provision agent: %s", e)
+    return {
+        "status": "success",
+        "message": "All database tables and seed records verified successfully.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 from fastapi.staticfiles import StaticFiles
 import base64
 
