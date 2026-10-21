@@ -137,3 +137,70 @@ class CallEndRequest(BaseModel):
     reason: Optional[str] = "ended"
 
 
+# Meeting / Calendar Schemas
+class MeetingCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    start_time: datetime
+    end_time: datetime
+    timezone: Optional[str] = "UTC"
+    location: Optional[str] = None
+    meeting_link: Optional[str] = None
+    attendees: Optional[List[str]] = None
+    status: Optional[str] = "SCHEDULED"
+
+
+class MeetingUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    timezone: Optional[str] = None
+    location: Optional[str] = None
+    meeting_link: Optional[str] = None
+    attendees: Optional[List[str]] = None
+    status: Optional[str] = None
+
+
+class MeetingResponse(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    description: Optional[str] = None
+    start_time: str
+    end_time: str
+    duration_minutes: int = 30
+    timezone: str = "UTC"
+    location: Optional[str] = None
+    meeting_link: Optional[str] = None
+    attendees: List[str] = []
+    status: str = "SCHEDULED"
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class CheckConflictRequest(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    exclude_meeting_id: Optional[str] = None
+
+
+# Personal AI Agent Schemas
+class AgentChatRequest(BaseModel):
+    content: str
+    client_tz_offset_minutes: Optional[int] = 0
+    conversation_id: Optional[str] = None
+
+
+class AgentChatResponse(BaseModel):
+    reply: str
+    action: Optional[str] = None # e.g. "meeting_scheduled", "schedule_list", "meeting_updated", "meeting_cancelled", "conversation_summary", "clarification_needed"
+    meeting: Optional[Dict[str, Any]] = None
+    meetings: Optional[List[Dict[str, Any]]] = None
+    suggested_actions: Optional[List[str]] = None
+    user_message_id: Optional[str] = None
+    message_id: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+

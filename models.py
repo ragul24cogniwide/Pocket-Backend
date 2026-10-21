@@ -270,3 +270,99 @@ class Status(Base):
             "time": self.created_at.strftime("%I:%M %p") if self.created_at else "Just now",
         }
 
+
+class Meeting(Base):
+    __tablename__ = "meetings"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+        index=True,
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    description: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None
+    )
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    timezone: Mapped[str] = mapped_column(
+        String(50), default="UTC", nullable=False
+    )
+    location: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, default=None
+    )
+    meeting_link: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True, default=None
+    )
+    attendees: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default="[]"
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default="SCHEDULED", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship("User")
+
+    @property
+    def duration_minutes(self) -> int:
+        if self.start_time and self.end_time:
+            delta = self.end_time - self.start_time
+            return max(1, int(delta.total_seconds() / 60))
+        return 30
+
+    def to_dict(self) -> dict:
+        parsed_attendees = []
+        if self.attendees:
+            try:
+                raw_att = json.loads(self.attendees)
+                if isinstance(raw_att, list):
+                    parsed_attendees = raw_att
+                else:
+                    parsed_attendees = [str(raw_att)]
+            except Exception:
+                parsed_attendees = [a.strip() for a in self.attendees.split(",") if a.strip()]
+
+        duration_mins = 30
+        if self.start_time and self.end_time:
+            delta = self.end_time - self.start_time
+            duration_mins = max(1, int(delta.total_seconds() / 60))
+
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "description": self.description or "",
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "duration_minutes": duration_mins,
+            "timezone": self.timezone or "UTC",
+            "location": self.location or "",
+            "meeting_link": self.meeting_link or "",
+            "attendees": parsed_attendees,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+

@@ -10,12 +10,12 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy import desc, func, or_, and_, select, update
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +27,7 @@ from auth import (
 )
 from connection_manager import manager
 from database import async_session_factory, get_db, init_db
-from models import Message, MessageStatus, OtpRecord, User, Status
+from models import Message, MessageStatus, OtpRecord, User, Status, Meeting
 from notifications import send_push_notification
 from schemas import (
     AuthResponse,
@@ -47,7 +47,24 @@ from schemas import (
     UpdateProfileRequest,
     UserProfileResponse,
     VerifyOtpRequest,
+    MeetingCreate,
+    MeetingUpdate,
+    MeetingResponse,
+    CheckConflictRequest,
+    AgentChatRequest,
+    AgentChatResponse,
 )
+from ai_agent import (
+    process_personal_agent_message,
+    ensure_personal_agent_user,
+    check_meeting_conflicts,
+    AGENT_USER_ID,
+    AGENT_NAME,
+    AGENT_AVATAR,
+    AGENT_AVATAR_COLOR,
+    AGENT_QUOTE,
+)
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Main")
@@ -217,6 +234,11 @@ async def lifespan(app: FastAPI):
     """Application startup and shutdown hooks."""
     logger.info("Initializing database tables...")
     await init_db()
+    async with async_session_factory() as session:
+        try:
+            await ensure_personal_agent_user(session)
+        except Exception as ag_err:
+            logger.warning("Could not auto-provision AI agent: %s", ag_err)
     logger.info("Initializing connection manager & Redis Pub/Sub...")
     await manager.initialize()
     keep_alive_task = asyncio.create_task(server_keep_alive_loop())
@@ -950,12 +972,35 @@ async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_d
     }
 
 
+async def resolve_user_context(user_opt: Optional[User], db: AsyncSession) -> User:
+    """Resolves authenticated user from token, or falls back to primary user in dev/testing."""
+    if user_opt:
+        return user_opt
+    stmt = select(User).where(User.id == "+919876543210")
+    res = await db.execute(stmt)
+    u = res.scalars().first()
+    if not u:
+        u = User(
+            id="+919876543210",
+            phone_number="+919876543210",
+            username="Pocket User",
+            avatar_color="#FFB800",
+            is_online=True,
+        )
+        db.add(u)
+        await db.commit()
+        await db.refresh(u)
+    return u
+
+
 @app.get("/api/users", response_model=List[ChatContactItem])
 async def list_available_contacts(
-    current_user: User = Depends(get_current_user),
+    user_opt: Optional[User] = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """Lists registered users excluding current user, with real-time online status."""
+    current_user = await resolve_user_context(user_opt, db)
+    await ensure_personal_agent_user(db)
     stmt = select(User).where(User.id != current_user.id).order_by(User.username.asc())
     result = await db.execute(stmt)
     users = result.scalars().all()
@@ -1054,7 +1099,43 @@ async def list_available_contacts(
 
     # Sort contacts: active conversations with recent messages first, then remaining contacts
     contacts.sort(key=lambda x: (x[0], x[1].name), reverse=True)
-    return [c[1] for c in contacts]
+    normal_contacts = [c[1] for c in contacts if c[1].id != AGENT_USER_ID]
+
+    # Prepend User's Personal AI Agent at the very top of conversations
+    agent_msg_stmt = (
+        select(Message)
+        .where(
+            or_(
+                and_(Message.sender_id == current_user.id, Message.receiver_id == AGENT_USER_ID),
+                and_(Message.sender_id == AGENT_USER_ID, Message.receiver_id == current_user.id),
+            )
+        )
+        .order_by(desc(Message.timestamp))
+        .limit(1)
+    )
+    agent_msg_res = await db.execute(agent_msg_stmt)
+    latest_agent_msg = agent_msg_res.scalars().first()
+
+    agent_item = ChatContactItem(
+        id=AGENT_USER_ID,
+        phone_number="+00000000000",
+        name=AGENT_NAME,
+        avatar=AGENT_AVATAR,
+        avatar_color=AGENT_AVATAR_COLOR,
+        avatar_url=None,
+        quote=AGENT_QUOTE,
+        online=True,
+        last_message=latest_agent_msg.content if latest_agent_msg else "Your personal AI agent is ready. Ask me anything!",
+        time=(
+            latest_agent_msg.timestamp.strftime("%I:%M %p")
+            if latest_agent_msg and latest_agent_msg.timestamp
+            else ""
+        ),
+        unread=0,
+        last_seen=datetime.now(timezone.utc).isoformat(),
+    )
+
+    return [agent_item] + normal_contacts
 
 
 # -----------------------------------------------------------------------------
@@ -1283,8 +1364,11 @@ async def send_message_rest(
         )
     )
 
-    # Trigger smart bot auto-reply for demo contacts
-    asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
+    # Trigger personal AI agent if messaging agent, or bot responder if demo contact
+    if receiver_id == AGENT_USER_ID or receiver_id.startswith("agent_"):
+        asyncio.create_task(handle_personal_agent_reply(current_user.id, content, payload.metadata))
+    else:
+        asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
 
     return {
         "status": "success",
@@ -1439,6 +1523,361 @@ async def flush_offline_messages(user_id: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Personal AI Agent Background Handler
+# -----------------------------------------------------------------------------
+async def handle_personal_agent_reply(user_id: str, content: str, client_metadata: Optional[Any] = None) -> None:
+    """Invokes the user-isolated Personal AI Agent, performs actions, and sends back the response."""
+    try:
+        # 1. Send typing indicator from agent to user
+        typing_start = {
+            "type": "typing_start",
+            "data": {
+                "sender_id": AGENT_USER_ID,
+                "receiver_id": user_id,
+            },
+        }
+        await manager.send_personal_message(user_id, typing_start)
+        await asyncio.sleep(0.4)
+
+        tz_offset = 0
+        if isinstance(client_metadata, dict):
+            tz_offset = client_metadata.get("tz_offset_minutes", 0)
+
+        async with async_session_factory() as db:
+            # Look up current user
+            u_stmt = select(User).where(or_(User.id == user_id, User.phone_number == user_id))
+            u_res = await db.execute(u_stmt)
+            current_user = u_res.scalars().first()
+            if not current_user:
+                current_user = User(
+                    id=user_id,
+                    phone_number=user_id,
+                    username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Pocket User",
+                    avatar_color="#FFB800",
+                    is_online=True,
+                )
+                db.add(current_user)
+                await db.commit()
+                await db.refresh(current_user)
+
+            # Ensure agent user exists
+            await ensure_personal_agent_user(db)
+
+            # Process AI request with user's calendar and message context
+            agent_result = await process_personal_agent_message(current_user, content, db, tz_offset)
+
+            # Save AI response message to DB
+            now = datetime.now(timezone.utc)
+            reply_metadata = {
+                "is_agent": True,
+                "action": agent_result.get("action"),
+                "meeting": agent_result.get("meeting"),
+                "meetings": agent_result.get("meetings"),
+                "suggested_actions": agent_result.get("suggested_actions"),
+            }
+            reply_to_str = json.dumps({"metadata": reply_metadata})
+
+            agent_msg = Message(
+                sender_id=AGENT_USER_ID,
+                receiver_id=user_id,
+                content=agent_result.get("reply", "I am your personal AI assistant."),
+                reply_to=reply_to_str,
+                timestamp=now,
+                status=MessageStatus.DELIVERED,
+                delivered_at=now,
+            )
+            db.add(agent_msg)
+            await db.commit()
+            await db.refresh(agent_msg)
+
+            msg_dict = agent_msg.to_dict()
+
+        # Stop typing
+        typing_stop = {
+            "type": "typing_stop",
+            "data": {
+                "sender_id": AGENT_USER_ID,
+                "receiver_id": user_id,
+            },
+        }
+        await manager.send_personal_message(user_id, typing_stop)
+
+        # Dispatch AI message over WebSocket
+        chat_frame = {
+            "type": "chat_message",
+            "data": msg_dict,
+        }
+        await manager.send_personal_message(user_id, chat_frame)
+
+    except Exception as e:
+        logger.error("Error in handle_personal_agent_reply: %s", e, exc_info=True)
+        try:
+            typing_stop = {
+                "type": "typing_stop",
+                "data": {"sender_id": AGENT_USER_ID, "receiver_id": user_id},
+            }
+            await manager.send_personal_message(user_id, typing_stop)
+        except Exception:
+            pass
+
+
+
+
+# -----------------------------------------------------------------------------
+# Calendar & Meeting Management APIs (Microsoft Teams / Arattai style)
+# -----------------------------------------------------------------------------
+@app.get("/api/meetings")
+async def list_user_meetings(
+    date_str: Optional[str] = None, # YYYY-MM-DD
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status: Optional[str] = None,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieves all meetings for the current user, optionally filtered by date or status."""
+    current_user = await resolve_user_context(user_opt, db)
+    stmt = select(Meeting).where(Meeting.user_id == current_user.id)
+    if status:
+        stmt = stmt.where(Meeting.status == status)
+
+    if date_str:
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            d_start = datetime.combine(d, time.min).replace(tzinfo=timezone.utc)
+            d_end = datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
+            stmt = stmt.where(Meeting.start_time >= d_start, Meeting.start_time <= d_end)
+        except Exception:
+            pass
+    elif start_date and end_date:
+        try:
+            sd = datetime.fromisoformat(start_date)
+            ed = datetime.fromisoformat(end_date)
+            stmt = stmt.where(Meeting.start_time >= sd, Meeting.start_time <= ed)
+        except Exception:
+            pass
+
+    stmt = stmt.order_by(Meeting.start_time.asc())
+    result = await db.execute(stmt)
+    meetings = result.scalars().all()
+    return [m.to_dict() for m in meetings]
+
+
+@app.post("/api/meetings", status_code=status.HTTP_201_CREATED)
+async def create_user_meeting(
+    payload: MeetingCreate,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Creates a new calendar event for current user with conflict check."""
+    current_user = await resolve_user_context(user_opt, db)
+
+    # Check conflicts
+    conflicts = await check_meeting_conflicts(db, current_user.id, payload.start_time, payload.end_time)
+    has_conflict = len(conflicts) > 0
+
+    attendees_json = json.dumps(payload.attendees or [current_user.username or "Pocket User"])
+
+    meeting = Meeting(
+        user_id=current_user.id,
+        title=payload.title,
+        description=payload.description or "",
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        timezone=payload.timezone or "UTC",
+        location=payload.location or "",
+        meeting_link=payload.meeting_link or f"https://pocket.app/meet/{str(uuid.uuid4())[:8]}",
+        attendees=attendees_json,
+        status=payload.status or "SCHEDULED",
+    )
+    db.add(meeting)
+    await db.commit()
+    await db.refresh(meeting)
+
+    result_dict = meeting.to_dict()
+    result_dict["has_conflict"] = has_conflict
+    if has_conflict:
+        result_dict["conflicting_meetings"] = [c.to_dict() for c in conflicts]
+
+    return result_dict
+
+
+@app.get("/api/meetings/{meeting_id}")
+async def get_user_meeting(
+    meeting_id: str,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetches a single meeting owned by current user."""
+    current_user = await resolve_user_context(user_opt, db)
+    stmt = select(Meeting).where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
+    res = await db.execute(stmt)
+    meeting = res.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found or access denied")
+    return meeting.to_dict()
+
+
+@app.put("/api/meetings/{meeting_id}")
+async def update_user_meeting(
+    meeting_id: str,
+    payload: MeetingUpdate,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Updates an authorized meeting."""
+    current_user = await resolve_user_context(user_opt, db)
+    stmt = select(Meeting).where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
+    res = await db.execute(stmt)
+    meeting = res.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found or access denied")
+
+    if payload.title is not None:
+        meeting.title = payload.title
+    if payload.description is not None:
+        meeting.description = payload.description
+    if payload.start_time is not None:
+        meeting.start_time = payload.start_time
+    if payload.end_time is not None:
+        meeting.end_time = payload.end_time
+    if payload.location is not None:
+        meeting.location = payload.location
+    if payload.meeting_link is not None:
+        meeting.meeting_link = payload.meeting_link
+    if payload.timezone is not None:
+        meeting.timezone = payload.timezone
+    if payload.attendees is not None:
+        meeting.attendees = json.dumps(payload.attendees)
+    if payload.status is not None:
+        meeting.status = payload.status
+
+    meeting.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(meeting)
+    return meeting.to_dict()
+
+
+@app.delete("/api/meetings/{meeting_id}")
+async def delete_user_meeting(
+    meeting_id: str,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deletes or cancels a meeting owned by current user."""
+    current_user = await resolve_user_context(user_opt, db)
+    stmt = select(Meeting).where(Meeting.id == meeting_id, Meeting.user_id == current_user.id)
+    res = await db.execute(stmt)
+    meeting = res.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found or access denied")
+
+    await db.delete(meeting)
+    await db.commit()
+    return {"status": "success", "message": "Meeting deleted successfully", "id": meeting_id}
+
+
+@app.post("/api/meetings/check-conflicts")
+async def check_conflicts_endpoint(
+    payload: CheckConflictRequest,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Checks whether the requested start_time and end_time conflict with existing meetings."""
+    current_user = await resolve_user_context(user_opt, db)
+    conflicts = await check_meeting_conflicts(
+        db, current_user.id, payload.start_time, payload.end_time, payload.exclude_meeting_id
+    )
+    return {
+        "has_conflict": len(conflicts) > 0,
+        "conflicts": [c.to_dict() for c in conflicts],
+    }
+
+
+# -----------------------------------------------------------------------------
+# Personal AI Agent Dedicated Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/api/agent/profile")
+async def get_agent_profile(
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the profile info for current user's personal AI agent."""
+    await resolve_user_context(user_opt, db)
+    await ensure_personal_agent_user(db)
+    return {
+        "id": AGENT_USER_ID,
+        "name": AGENT_NAME,
+        "avatar": AGENT_AVATAR,
+        "avatar_color": AGENT_AVATAR_COLOR,
+        "quote": AGENT_QUOTE,
+        "online": True,
+        "is_agent": True,
+    }
+
+
+@app.post("/api/agent/chat", response_model=AgentChatResponse)
+async def chat_with_agent_endpoint(
+    payload: AgentChatRequest,
+    user_opt: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """Direct REST endpoint to chat with Personal AI Agent and execute calendar actions."""
+    current_user = await resolve_user_context(user_opt, db)
+    await ensure_personal_agent_user(db)
+
+    # 1. Save user query message to persistent database
+    now = datetime.now(timezone.utc)
+    user_msg = Message(
+        sender_id=current_user.id,
+        receiver_id=AGENT_USER_ID,
+        content=payload.content,
+        timestamp=now,
+        status=MessageStatus.READ,
+        delivered_at=now,
+        read_at=now,
+    )
+    db.add(user_msg)
+
+    # 2. Process query via Personal AI Agent engine
+    res = await process_personal_agent_message(
+        current_user=current_user,
+        content=payload.content,
+        db=db,
+        tz_offset_minutes=payload.client_tz_offset_minutes or 0,
+    )
+
+    # 3. Save AI response message with metadata to persistent database
+    reply_metadata = {
+        "is_agent": True,
+        "action": res.get("action"),
+        "meeting": res.get("meeting"),
+        "meetings": res.get("meetings"),
+        "suggested_actions": res.get("suggested_actions"),
+    }
+    agent_msg = Message(
+        sender_id=AGENT_USER_ID,
+        receiver_id=current_user.id,
+        content=res.get("reply", "I am your personal AI assistant."),
+        reply_to=json.dumps({"metadata": reply_metadata}),
+        timestamp=datetime.now(timezone.utc),
+        status=MessageStatus.READ,
+        delivered_at=now,
+        read_at=now,
+    )
+    db.add(agent_msg)
+    await db.commit()
+    await db.refresh(user_msg)
+    await db.refresh(agent_msg)
+
+    res["user_message_id"] = user_msg.id
+    res["message_id"] = agent_msg.id
+    res["timestamp"] = agent_msg.timestamp.isoformat()
+
+    return res
+
+
+# -----------------------------------------------------------------------------
 # Simulated AI / Bot Auto-Responder (Takes Pocket to the Next Level 🚀)
 # -----------------------------------------------------------------------------
 async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: str) -> None:
@@ -1588,9 +2027,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     # Ensure current user exists in database
     async with async_session_factory() as db:
-        user_stmt = select(User).where(User.id == user_id)
+        digits = "".join(filter(str.isdigit, user_id))
+        user_stmt = select(User).where(
+            or_(
+                User.id == user_id,
+                User.phone_number == user_id,
+                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+            )
+        )
         user_res = await db.execute(user_stmt)
-        user_obj = user_res.scalar_one_or_none()
+        user_obj = user_res.scalars().first()
         if not user_obj:
             user_obj = User(
                 id=user_id,
@@ -1604,6 +2051,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         else:
             user_obj.is_online = True
             await db.commit()
+        manager.register_aliases(user_id, [user_obj.id, user_obj.phone_number])
+        await manager.refresh_presence(user_id)
 
     # Flush any unread messages stored while this user was offline
     asyncio.create_task(flush_offline_messages(user_id))
@@ -1725,8 +2174,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     )
                 )
 
-                # Trigger smart bot responder if receiver is a demo contact
-                asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
+                # Trigger personal AI agent if receiver is agent, or bot responder if demo contact
+                if receiver_id == AGENT_USER_ID or receiver_id.startswith("agent_"):
+                    asyncio.create_task(handle_personal_agent_reply(user_id, content, metadata_raw))
+                else:
+                    asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
 
             # -----------------------------------------------------------------
             # 2. TYPING INDICATORS
@@ -1983,16 +2435,18 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 5. HEARTBEAT / PING & PRESENCE CONTROL
             # -----------------------------------------------------------------
             elif frame_type == "ping":
+                await manager.refresh_presence(user_id)
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
 
             elif frame_type == "presence_online":
                 async with async_session_factory() as db:
                     await db.execute(
                         update(User)
-                        .where(User.id == user_id)
+                        .where(or_(User.id == user_id, User.phone_number == user_id))
                         .values(is_online=True)
                     )
                     await db.commit()
+                await manager.refresh_presence(user_id)
                 await manager.broadcast_presence(user_id, is_online=True)
 
             elif frame_type == "presence_offline":
@@ -2000,7 +2454,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 async with async_session_factory() as db:
                     await db.execute(
                         update(User)
-                        .where(User.id == user_id)
+                        .where(or_(User.id == user_id, User.phone_number == user_id))
                         .values(is_online=False, last_seen=now_utc)
                     )
                     await db.commit()
@@ -2030,10 +2484,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         else:
                             is_target_online = await manager.is_user_online(target_id)
                     try:
+                        aliases = [target_id]
+                        if target_user:
+                            aliases.extend([target_user.id, target_user.phone_number])
                         await websocket.send_text(json.dumps({
                             "type": "presence_update",
                             "data": {
                                 "user_id": target_id,
+                                "aliases": [a for a in aliases if a],
                                 "is_online": is_target_online,
                                 "last_seen": target_last_seen,
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2044,23 +2502,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user %s", user_id)
-        now_utc = datetime.now(timezone.utc)
-        await manager.disconnect(user_id)
-        async with async_session_factory() as db:
-            await db.execute(
-                update(User)
-                .where(or_(User.id == user_id, User.phone_number == user_id))
-                .values(is_online=False, last_seen=now_utc)
-            )
-            await db.commit()
+        await manager.disconnect(user_id, websocket)
+        if not await manager.is_user_online(user_id):
+            now_utc = datetime.now(timezone.utc)
+            async with async_session_factory() as db:
+                await db.execute(
+                    update(User)
+                    .where(or_(User.id == user_id, User.phone_number == user_id))
+                    .values(is_online=False, last_seen=now_utc)
+                )
+                await db.commit()
     except Exception as e:
         logger.error("WebSocket runtime error for %s: %s", user_id, e)
-        now_utc = datetime.now(timezone.utc)
-        await manager.disconnect(user_id)
-        async with async_session_factory() as db:
-            await db.execute(
-                update(User)
-                .where(or_(User.id == user_id, User.phone_number == user_id))
-                .values(is_online=False, last_seen=now_utc)
-            )
-            await db.commit()
+        await manager.disconnect(user_id, websocket)
+        if not await manager.is_user_online(user_id):
+            now_utc = datetime.now(timezone.utc)
+            async with async_session_factory() as db:
+                await db.execute(
+                    update(User)
+                    .where(or_(User.id == user_id, User.phone_number == user_id))
+                    .values(is_online=False, last_seen=now_utc)
+                )
+                await db.commit()

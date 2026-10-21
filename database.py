@@ -78,7 +78,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
-    from models import User
+    from models import User, Meeting
     from sqlalchemy import select
 
     async with engine.begin() as conn:
