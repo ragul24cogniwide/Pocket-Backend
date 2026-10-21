@@ -380,6 +380,10 @@ MULTIPLE PURPOSE CAPABILITIES:
 6. `summarize_chats`:
    - Trigger when the user asks to summarize recent team conversations or chat discussions.
 
+7. `clarification_needed`:
+   - Trigger when the user suggests or hints at a meeting without an explicit instruction (e.g. "We should arrange a meeting next week", "Maybe we can meet"), OR when the user asks to schedule a meeting but does not provide a date or time.
+   - Reply asking for the missing details politely, and set suggested_actions to possible slots or times.
+
 CURRENT USER CONTEXT:
 - Name: {current_user.username or 'Pocket User'}
 - User's current local date & time: {user_now.strftime('%A, %B %d, %Y at %I:%M %p')}
@@ -622,6 +626,15 @@ Example JSON:
             "suggested_actions": suggested_actions or ["Schedule a meeting", "View in Calendar"],
         }
 
+    elif intent == "clarification_needed":
+        return {
+            "reply": reply,
+            "action": "clarification_needed",
+            "meeting": None,
+            "meetings": None,
+            "suggested_actions": suggested_actions or ["Tomorrow at 3 PM", "Next Monday at 10 AM"],
+        }
+
     return {
         "reply": reply,
         "action": "general_chat",
@@ -647,26 +660,7 @@ async def _process_personal_agent_message_raw(
     user_now = get_user_current_time(tz_offset_minutes)
 
     # -------------------------------------------------------------------------
-    # 0. Powered by Google Gemini (if GEMINI_API_KEY is configured)
-    # -------------------------------------------------------------------------
-    gemini_key = get_gemini_api_key()
-    if gemini_key:
-        try:
-            gemini_result = await call_gemini_agent(
-                current_user=current_user,
-                content=raw_text,
-                db=db,
-                tz_offset_minutes=tz_offset_minutes,
-                user_now=user_now,
-            )
-            if gemini_result:
-                return gemini_result
-        except Exception as e:
-            logger.warning(f"Gemini execution encountered error, falling back to local NLP: {e}")
-
-
-    # -------------------------------------------------------------------------
-    # 1. Intent: Ambiguous Suggestion vs Explicit Command
+    # 0a. Intent: Ambiguous Suggestion vs Explicit Command
     # E.g. "We should arrange a meeting next week" -> Ask confirmation, don't silently create
     # -------------------------------------------------------------------------
     suggestion_patterns = [
@@ -686,6 +680,53 @@ async def _process_personal_agent_message_raw(
             "meetings": None,
             "suggested_actions": ["Schedule for next Monday at 10 AM", "Schedule for tomorrow at 3 PM"],
         }
+
+    # -------------------------------------------------------------------------
+    # 0b. Intent: Missing Date/Time for Explicit Meeting Scheduling
+    # E.g. "Schedule a meeting with the team"
+    # -------------------------------------------------------------------------
+    schedule_keywords = [
+        "schedule a meeting", "book a meeting", "set up a meeting",
+        "arrange a meeting", "create a meeting", "schedule meeting", "book a call"
+    ]
+    if any(kw in lowered for kw in schedule_keywords):
+        target_date = parse_date_string(lowered, user_now)
+        time_tuple = parse_time_string(raw_text)
+        if not target_date and not time_tuple:
+            return {
+                "reply": "I'd be glad to schedule that for you! 📅 Could you please specify the date and time? (For example: 'Tomorrow at 3 PM' or 'Friday at 11 AM')",
+                "action": "clarification_needed",
+                "meeting": None,
+                "meetings": None,
+                "suggested_actions": ["Tomorrow at 3 PM", "Today at 5 PM", "Friday at 11 AM"],
+            }
+        elif not time_tuple:
+            date_str = target_date.strftime("%A, %b %d") if target_date else "that date"
+            return {
+                "reply": f"Got it, for {date_str}! ⏰ What time should I schedule the meeting? (e.g., 3 PM or 10:30 AM)",
+                "action": "clarification_needed",
+                "meeting": None,
+                "meetings": None,
+                "suggested_actions": [f"{date_str} at 10:00 AM", f"{date_str} at 2:00 PM", f"{date_str} at 4:30 PM"],
+            }
+
+    # -------------------------------------------------------------------------
+    # 1. Powered by Google Gemini (if GEMINI_API_KEY is configured)
+    # -------------------------------------------------------------------------
+    gemini_key = get_gemini_api_key()
+    if gemini_key:
+        try:
+            gemini_result = await call_gemini_agent(
+                current_user=current_user,
+                content=raw_text,
+                db=db,
+                tz_offset_minutes=tz_offset_minutes,
+                user_now=user_now,
+            )
+            if gemini_result:
+                return gemini_result
+        except Exception as e:
+            logger.warning(f"Gemini execution encountered error, falling back to local NLP: {e}")
 
     # -------------------------------------------------------------------------
     # 2. Intent: View / List Meetings ("What meetings do I have today?", etc.)
@@ -1183,6 +1224,22 @@ async def process_personal_agent_message(
     Guarantees that all response strings are sanitized and free of raw asterisks (**).
     """
     res = await _process_personal_agent_message_raw(current_user, content, db, tz_offset_minutes)
-    if res and "reply" in res and isinstance(res["reply"], str):
+    if not res:
+        res = {
+            "reply": "I am your personal AI assistant. How can I assist you today?",
+            "action": "general_chat",
+            "meeting": None,
+            "meetings": None,
+            "suggested_actions": ["What meetings do I have today?", "Schedule a meeting"],
+        }
+    if not res.get("reply"):
+        if res.get("meeting"):
+            res["reply"] = f"📅 Meeting scheduled: {res['meeting'].get('title', 'Meeting')}"
+        elif res.get("meetings"):
+            res["reply"] = f"📅 You have {len(res['meetings'])} scheduled meeting(s)."
+        else:
+            res["reply"] = "I am your personal AI assistant. How can I assist you today?"
+    if isinstance(res.get("reply"), str):
         res["reply"] = sanitize_agent_reply(res["reply"])
     return res
+

@@ -712,6 +712,8 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
 
 
 @app.get("/api/auth/me", response_model=UserProfileResponse)
+@app.get("/api/users/profile/me", response_model=UserProfileResponse)
+@app.get("/api/users/me", response_model=UserProfileResponse)
 async def get_my_profile(current_user: User = Depends(get_current_user)):
     """Returns the authenticated user's profile to maintain login state."""
     return UserProfileResponse(
@@ -734,33 +736,50 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
 @app.post("/api/profile", response_model=UserProfileResponse)
 async def update_user_profile(
     payload: UpdateProfileRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    """Updates the authenticated user's profile details (username, avatar_url, avatar_color, quote)."""
+    """Updates user profile details (username, avatar_url, avatar_color, quote)."""
     try:
+        target_user = current_user
+        if not target_user and (payload.user_id or payload.phone_number):
+            identifier = (payload.user_id or payload.phone_number or "").strip()
+            digits = "".join(filter(str.isdigit, identifier))
+            conditions = [User.id == identifier, User.phone_number == identifier]
+            if len(digits) >= 10:
+                last10 = digits[-10:]
+                conditions.append(User.phone_number.endswith(last10))
+                conditions.append(User.id.endswith(last10))
+            result = await db.execute(select(User).where(or_(*conditions)))
+            target_user = result.scalar_one_or_none()
+
+        if not target_user:
+            raise HTTPException(status_code=401, detail="User not identified or authenticated.")
+
         if payload.username is not None and payload.username.strip():
-            current_user.username = payload.username.strip()
+            target_user.username = payload.username.strip()
         if payload.avatar_url is not None:
-            current_user.avatar_url = payload.avatar_url.strip() if payload.avatar_url else None
+            target_user.avatar_url = payload.avatar_url.strip() if payload.avatar_url else None
         if payload.avatar_color is not None and payload.avatar_color.strip():
-            current_user.avatar_color = payload.avatar_color.strip()
+            target_user.avatar_color = payload.avatar_color.strip()
         if payload.quote is not None:
-            current_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Pocket."
+            target_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Pocket."
 
         await db.commit()
-        await db.refresh(current_user)
+        await db.refresh(target_user)
 
         return UserProfileResponse(
-            id=current_user.id,
-            phone_number=current_user.phone_number,
-            username=current_user.username,
-            avatar_color=current_user.avatar_color,
-            avatar_url=current_user.avatar_url,
-            quote=current_user.quote or "Hey there! I am using Pocket.",
-            is_online=current_user.is_online,
-            last_seen=current_user.last_seen.isoformat() if current_user.last_seen else None,
+            id=target_user.id,
+            phone_number=target_user.phone_number,
+            username=target_user.username,
+            avatar_color=target_user.avatar_color,
+            avatar_url=target_user.avatar_url,
+            quote=target_user.quote or "Hey there! I am using Pocket.",
+            is_online=target_user.is_online,
+            last_seen=target_user.last_seen.isoformat() if target_user.last_seen else None,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error updating user profile: %s", e, exc_info=True)
         await db.rollback()
@@ -1858,7 +1877,7 @@ async def chat_with_agent_endpoint(
     agent_msg = Message(
         sender_id=AGENT_USER_ID,
         receiver_id=current_user.id,
-        content=res.get("reply", "I am your personal AI assistant."),
+        content=(res.get("reply") or "I am your personal AI assistant.").strip(),
         reply_to=json.dumps({"metadata": reply_metadata}),
         timestamp=datetime.now(timezone.utc),
         status=MessageStatus.READ,

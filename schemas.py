@@ -50,6 +50,8 @@ class UpdateProfileRequest(BaseModel):
     avatar_color: Optional[str] = None
     quote: Optional[str] = None
     fcm_token: Optional[str] = None
+    user_id: Optional[str] = None
+    phone_number: Optional[str] = None
 
 
 class UpdateFcmTokenRequest(BaseModel):

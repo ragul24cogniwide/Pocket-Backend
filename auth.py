@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
@@ -70,9 +70,25 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user_id = payload["sub"]
-    result = await db.execute(select(User).where(User.id == user_id))
+    user_id = str(payload["sub"]).strip()
+    digits = "".join(filter(str.isdigit, user_id))
+    conditions = [User.id == user_id, User.phone_number == user_id]
+    if len(digits) >= 10:
+        last10 = digits[-10:]
+        conditions.append(User.phone_number.endswith(last10))
+        conditions.append(User.id.endswith(last10))
+
+    result = await db.execute(select(User).where(or_(*conditions)))
     user = result.scalar_one_or_none()
+
+    if not user and payload.get("phone_number"):
+        p = str(payload["phone_number"]).strip()
+        p_digits = "".join(filter(str.isdigit, p))
+        p_conditions = [User.id == p, User.phone_number == p]
+        if len(p_digits) >= 10:
+            p_conditions.append(User.phone_number.endswith(p_digits[-10:]))
+        p_result = await db.execute(select(User).where(or_(*p_conditions)))
+        user = p_result.scalar_one_or_none()
 
     if not user:
         raise HTTPException(
@@ -93,6 +109,25 @@ async def get_current_user_optional(
     payload = decode_access_token(auth.credentials)
     if not payload or "sub" not in payload:
         return None
-    user_id = payload["sub"]
-    result = await db.execute(select(User).where(User.id == user_id))
-    return result.scalar_one_or_none()
+
+    user_id = str(payload["sub"]).strip()
+    digits = "".join(filter(str.isdigit, user_id))
+    conditions = [User.id == user_id, User.phone_number == user_id]
+    if len(digits) >= 10:
+        last10 = digits[-10:]
+        conditions.append(User.phone_number.endswith(last10))
+        conditions.append(User.id.endswith(last10))
+
+    result = await db.execute(select(User).where(or_(*conditions)))
+    user = result.scalar_one_or_none()
+
+    if not user and payload.get("phone_number"):
+        p = str(payload["phone_number"]).strip()
+        p_digits = "".join(filter(str.isdigit, p))
+        p_conditions = [User.id == p, User.phone_number == p]
+        if len(p_digits) >= 10:
+            p_conditions.append(User.phone_number.endswith(p_digits[-10:]))
+        p_result = await db.execute(select(User).where(or_(*p_conditions)))
+        user = p_result.scalar_one_or_none()
+
+    return user
