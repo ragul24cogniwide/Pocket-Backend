@@ -296,6 +296,31 @@ async def trigger_init_db():
     }
 
 
+@app.get("/api/agent/status")
+async def get_agent_status():
+    """Checks whether Google Gemini LLM is active and ready."""
+    from ai_agent import get_gemini_api_key, HAS_GENAI
+    key = get_gemini_api_key()
+    has_key = bool(key and key != "your_gemini_api_key_here")
+    masked_key = f"{key[:6]}...{key[-4:]}" if (has_key and len(key) >= 10) else None
+    return {
+        "gemini_sdk_installed": HAS_GENAI,
+        "api_key_configured": has_key,
+        "masked_key": masked_key,
+        "status": "ready" if (HAS_GENAI and has_key) else "fallback_mode",
+    }
+
+
+@app.post("/api/admin/set-gemini-key")
+async def set_gemini_key_endpoint(payload: dict):
+    """Dynamically updates the Gemini API Key on the live running instance."""
+    new_key = payload.get("key", "").strip()
+    if new_key:
+        os.environ["GEMINI_API_KEY"] = new_key
+        return {"status": "success", "message": "Gemini API key updated successfully."}
+    return {"status": "error", "message": "No key provided."}
+
+
 from fastapi.staticfiles import StaticFiles
 import base64
 
