@@ -233,7 +233,11 @@ async def server_keep_alive_loop():
 async def lifespan(app: FastAPI):
     """Application startup and shutdown hooks."""
     logger.info("Initializing database tables...")
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        logger.error("Error during init_db: %s", e)
+
     async with async_session_factory() as session:
         try:
             await ensure_personal_agent_user(session)

@@ -78,34 +78,45 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
+    import asyncio
+    import logging
     from models import User, Meeting, OtpRecord, Message, Status
     from sqlalchemy import select
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Gentle column addition for PostgreSQL / SQLite if columns were added later
-        try:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;"))
-            await conn.execute(text("ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT;"))
-        except Exception:
-            pass
-        try:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS quote VARCHAR(255) DEFAULT 'Hey there! I am using Pocket.';"))
-        except Exception:
-            pass
-        try:
-            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;"))
-            await conn.execute(text("ALTER TABLE users ALTER COLUMN fcm_token TYPE TEXT;"))
-        except Exception:
-            pass
-        try:
-            await conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;"))
-        except Exception:
-            pass
+    db_logger = logging.getLogger("Database")
 
-    # Seed default mock/demo contacts so chatting with any ID (1, 2, 3, 4) never throws Foreign Key errors
+    # Neon PostgreSQL can pause/scale to zero; retry table creation up to 5 times
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                # Gentle column addition for PostgreSQL / SQLite if columns were added later
+                for ddl in [
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;",
+                    "ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT;",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS quote VARCHAR(255) DEFAULT 'Hey there! I am using Pocket.';",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;",
+                    "ALTER TABLE users ALTER COLUMN fcm_token TYPE TEXT;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;",
+                ]:
+                    try:
+                        await conn.execute(text(ddl))
+                    except Exception:
+                        pass
+            db_logger.info("Database schema initialized and verified successfully.")
+            break
+        except Exception as e:
+            db_logger.warning("DB init attempt %d/%d failed: %s. Retrying in 2s...", attempt, max_retries, e)
+            if attempt == max_retries:
+                db_logger.error("Failed to initialize database tables after %d attempts: %s", max_retries, e)
+                raise
+            await asyncio.sleep(2)
+
+    # Seed default mock/demo contacts so chatting with any ID never throws Foreign Key errors
     async with async_session_factory() as session:
         default_seed_users = [
+            {"id": "+918946014462", "phone_number": "+918946014462", "username": "Ragulvasanth Muthukumar", "avatar_color": "#10B981", "quote": "🚀 Building the future"},
             {"id": "1", "phone_number": "+919876543211", "username": "Rahul Sharma", "avatar_color": "#FFB800", "quote": "⚡ Always on the move!"},
             {"id": "2", "phone_number": "+919123456782", "username": "Priya Patel", "avatar_color": "#10B981", "quote": "✨ Living in the moment."},
             {"id": "3", "phone_number": "+919988776653", "username": "React Native Devs", "avatar_color": "#3B82F6", "quote": "🚀 Building awesome mobile apps with Pocket!"},
