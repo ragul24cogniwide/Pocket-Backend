@@ -9,7 +9,7 @@ async def run_seed():
         users = [
             {"id": "1", "phone": "+919876543211", "name": "Rahul Sharma", "color": "#FFB800", "quote": "⚡ Always on the move!"},
             {"id": "2", "phone": "+919123456782", "name": "Priya Patel", "color": "#10B981", "quote": "✨ Living in the moment."},
-            {"id": "3", "phone": "+919988776653", "name": "React Native Devs", "color": "#3B82F6", "quote": "🚀 Building mobile apps with Pocket!"},
+            {"id": "3", "phone": "+919988776653", "name": "React Native Devs", "color": "#3B82F6", "quote": "🚀 Building mobile apps with Flick!"},
             {"id": "4", "phone": "+919811223344", "name": "Alex Johnson", "color": "#8B5CF6", "quote": "🎧 In my zone."},
         ]
         for u in users:

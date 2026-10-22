@@ -122,7 +122,7 @@ async def dispatch_push_to_user(
                 sender_title = (
                     sender_user.username
                     if sender_user
-                    else f"User {sender_id[-4:]}" if len(sender_id) >= 4 else "Pocket"
+                    else f"User {sender_id[-4:]}" if len(sender_id) >= 4 else "Flick"
                 )
                 payload_dict = {
                     "sender_id": sender_id,
@@ -306,7 +306,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Pocket Real-Time Messaging API",
+    title="Flick Real-Time Messaging API",
     description="Production-grade messaging backend using FastAPI, Neon Postgres, Render Redis, and WebSockets.",
     version="1.0.0",
     lifespan=lifespan,
@@ -327,7 +327,7 @@ async def health_check():
     """Lightweight 0ms health check for keep-alive pings and uptime monitors."""
     return {
         "status": "active",
-        "service": "Pocket Messaging Backend",
+        "service": "Flick Messaging Backend",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -480,7 +480,7 @@ async def call_offer_endpoint(payload: CallOfferRequest):
     caller_color = payload.caller_color
 
     # Enrich caller profile details from DB if missing or default
-    if not caller_avatar_url or not caller_name or caller_name == "Pocket User":
+    if not caller_avatar_url or not caller_name or caller_name in ("Pocket User", "Flick User"):
         try:
             async with async_session_factory() as db:
                 c_stmt = select(User).where(or_(User.id == str(payload.caller_id), User.phone_number == str(payload.caller_id)))
@@ -502,8 +502,8 @@ async def call_offer_endpoint(payload: CallOfferRequest):
         "call_id": payload.call_id,
         "caller_id": payload.caller_id,
         "receiver_id": payload.receiver_id,
-        "caller_name": caller_name or "Pocket User",
-        "caller_avatar": caller_avatar or "PK",
+        "caller_name": caller_name or "Flick User",
+        "caller_avatar": caller_avatar or "FK",
         "caller_color": caller_color or "#FFB800",
         "caller_avatar_url": caller_avatar_url,
         "status": "ringing",
@@ -516,8 +516,8 @@ async def call_offer_endpoint(payload: CallOfferRequest):
         "caller_id": payload.caller_id,
         "receiver_id": payload.receiver_id,
         "sender_id": payload.caller_id,
-        "caller_name": caller_name or "Pocket User",
-        "caller_avatar": caller_avatar or "PK",
+        "caller_name": caller_name or "Flick User",
+        "caller_avatar": caller_avatar or "FK",
         "caller_avatar_url": caller_avatar_url,
         "caller_color": caller_color or "#FFB800",
     }
@@ -695,7 +695,7 @@ async def root():
         return FileResponse("test_client.html")
     elif os.path.exists("index.html"):
         return FileResponse("index.html")
-    return {"message": "Pocket Real-Time Messaging API is active"}
+    return {"message": "Flick Real-Time Messaging API is active"}
 
 
 # -----------------------------------------------------------------------------
@@ -793,7 +793,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
             phone_number=phone,
             username=username,
             avatar_color=avatar_color,
-            quote="Hey there! I am using Pocket.",
+            quote="Hey there! I am using Flick.",
             is_online=True,
             last_seen=now,
         )
@@ -821,7 +821,7 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
         username=current_user.username,
         avatar_color=current_user.avatar_color,
         avatar_url=current_user.avatar_url,
-        quote=current_user.quote or "Hey there! I am using Pocket.",
+        quote=current_user.quote or "Hey there! I am using Flick.",
         is_online=current_user.is_online,
         last_seen=current_user.last_seen.isoformat() if current_user.last_seen else None,
     )
@@ -862,7 +862,7 @@ async def update_user_profile(
         if payload.avatar_color is not None and payload.avatar_color.strip():
             target_user.avatar_color = payload.avatar_color.strip()
         if payload.quote is not None:
-            target_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Pocket."
+            target_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Flick."
 
         await db.commit()
         await db.refresh(target_user)
@@ -873,7 +873,7 @@ async def update_user_profile(
             username=target_user.username,
             avatar_color=target_user.avatar_color,
             avatar_url=target_user.avatar_url,
-            quote=target_user.quote or "Hey there! I am using Pocket.",
+            quote=target_user.quote or "Hey there! I am using Flick.",
             is_online=target_user.is_online,
             last_seen=target_user.last_seen.isoformat() if target_user.last_seen else None,
         )
@@ -989,8 +989,8 @@ async def get_status_feed(
                 contact_dict[cid] = {
                     "contactId": cid,
                     "phone_number": user_obj.phone_number if user_obj else cid,
-                    "userName": st_dict.get("userName") or (user_obj.username if user_obj else "Pocket User"),
-                    "avatar": st_dict.get("avatar") or "PK",
+                    "userName": st_dict.get("userName") or (user_obj.username if user_obj else "Flick User"),
+                    "avatar": st_dict.get("avatar") or "FK",
                     "avatarColor": st_dict.get("avatarColor") or "#FFB800",
                     "avatarUrl": st_dict.get("avatarUrl"),
                     "latestTime": st_dict.get("time") or "Just now",
@@ -1083,8 +1083,8 @@ async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_d
         "username": user.username,
         "avatar_url": user.avatar_url,
         "avatar_color": user.avatar_color or "#FFB800",
-        "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "PK",
-        "quote": user.quote or "Hey there! I am using Pocket.",
+        "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "FK",
+        "quote": user.quote or "Hey there! I am using Flick.",
         "is_online": is_online,
         "last_seen": user.last_seen.isoformat() if user.last_seen else None,
     }
@@ -1101,7 +1101,7 @@ async def resolve_user_context(user_opt: Optional[User], db: AsyncSession) -> Us
         u = User(
             id="+919876543210",
             phone_number="+919876543210",
-            username="Pocket User",
+            username="Flick User",
             avatar_color="#FFB800",
             is_online=True,
         )
@@ -1201,7 +1201,7 @@ async def list_available_contacts(
                     avatar=initials,
                     avatar_color=u.avatar_color,
                     avatar_url=u.avatar_url,
-                    quote=u.quote or "Hey there! I am using Pocket.",
+                    quote=u.quote or "Hey there! I am using Flick.",
                     online=is_online,
                     last_message=latest_msg.content if latest_msg else (u.quote or "Tap to start conversation"),
                     time=(
@@ -1266,7 +1266,7 @@ async def sync_device_contacts(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Matches device phone contacts against registered Pocket users.
+    Matches device phone contacts against registered Flick users.
     Returns only users who have registered and installed the app.
     """
     raw_numbers = payload.phone_numbers
@@ -1307,7 +1307,7 @@ async def sync_device_contacts(
         initials = (
             "".join([part[0] for part in u.username.split()[:2]]).upper()
             if u.username
-            else "PK"
+            else "FK"
         )
         registered_contacts.append(
             ChatContactItem(
@@ -1317,9 +1317,9 @@ async def sync_device_contacts(
                 avatar=initials,
                 avatar_color=u.avatar_color,
                 avatar_url=u.avatar_url,
-                quote=u.quote or "Hey there! I am using Pocket.",
+                quote=u.quote or "Hey there! I am using Flick.",
                 online=is_online,
-                last_message=u.quote or "Available on Pocket",
+                last_message=u.quote or "Available on Flick",
                 time="",
                 unread=0,
                 last_seen=u.last_seen.isoformat() if u.last_seen else None,
@@ -1476,7 +1476,7 @@ async def send_message_rest(
                 "type": "chat_message",
                 "message_id": message_dict["message_id"],
                 "sender_id": current_user.id,
-                "sender_name": current_user.username or "Pocket User",
+                "sender_name": current_user.username or "Flick User",
             },
         )
     )
@@ -1670,7 +1670,7 @@ async def handle_personal_agent_reply(user_id: str, content: str, client_metadat
                 current_user = User(
                     id=user_id,
                     phone_number=user_id,
-                    username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Pocket User",
+                    username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Flick User",
                     avatar_color="#FFB800",
                     is_online=True,
                 )
@@ -1794,7 +1794,7 @@ async def create_user_meeting(
     conflicts = await check_meeting_conflicts(db, current_user.id, payload.start_time, payload.end_time)
     has_conflict = len(conflicts) > 0
 
-    attendees_json = json.dumps(payload.attendees or [current_user.username or "Pocket User"])
+    attendees_json = json.dumps(payload.attendees or [current_user.username or "Flick User"])
 
     meeting = Meeting(
         user_id=current_user.id,
@@ -1804,7 +1804,7 @@ async def create_user_meeting(
         end_time=payload.end_time,
         timezone=payload.timezone or "UTC",
         location=payload.location or "",
-        meeting_link=payload.meeting_link or f"https://pocket.app/meet/{str(uuid.uuid4())[:8]}",
+        meeting_link=payload.meeting_link or f"https://flick.app/meet/{str(uuid.uuid4())[:8]}",
         attendees=attendees_json,
         status=payload.status or "SCHEDULED",
     )
@@ -1996,7 +1996,7 @@ async def chat_with_agent_endpoint(
 
 
 # -----------------------------------------------------------------------------
-# Simulated AI / Bot Auto-Responder (Takes Pocket to the Next Level 🚀)
+# Simulated AI / Bot Auto-Responder (Takes Flick to the Next Level 🚀)
 # -----------------------------------------------------------------------------
 async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: str) -> None:
     """Simulates smart interactive chat when messaging demo bot / contacts."""
@@ -2062,11 +2062,11 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
     elif "bye" in lowered or "byee" in lowered or "cya" in lowered:
         reply_text = f"Goodbye! Have an awesome day ahead! 🚀"
     elif "thanks" in lowered or "thank" in lowered:
-        reply_text = f"You're very welcome! Always happy to connect on Pocket. ✨"
+        reply_text = f"You're very welcome! Always happy to connect on Flick. ✨"
     elif "how are you" in lowered:
-        reply_text = f"I'm doing fantastic! Pocket's real-time messaging is super fast! ⚡"
+        reply_text = f"I'm doing fantastic! Flick's real-time messaging is super fast! ⚡"
     elif "react native" in lowered or "expo" in lowered or "flashlist" in lowered:
-        reply_text = f"FlashList v2 and React 19 in Pocket make 60fps scrolling effortless! 📱"
+        reply_text = f"FlashList v2 and React 19 in Flick make 60fps scrolling effortless! 📱"
     else:
         reply_text = f"Got your message: '{user_content}'. Everything is synced real-time with Neon DB & Redis! 👍"
 
@@ -2209,7 +2209,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         db.add(User(
                             id=user_id,
                             phone_number=user_id,
-                            username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Pocket User",
+                            username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Flick User",
                             avatar_color="#FFB800",
                             is_online=True,
                         ))
@@ -2399,9 +2399,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     caller_name = data.get("caller_name")
                     caller_avatar_url = data.get("caller_avatar_url")
                     caller_color = data.get("caller_color", "#FFB800")
-                    caller_avatar = data.get("caller_avatar", "PK")
+                    caller_avatar = data.get("caller_avatar", "FK")
 
-                    if not caller_avatar_url or not caller_name or caller_name == "Pocket User":
+                    if not caller_avatar_url or not caller_name or caller_name in ("Pocket User", "Flick User"):
                         try:
                             async with async_session_factory() as db:
                                 c_stmt = select(User).where(or_(User.id == caller_id_val, User.phone_number == caller_id_val))

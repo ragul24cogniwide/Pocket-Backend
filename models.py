@@ -1,5 +1,5 @@
 """
-SQLAlchemy 2.0 Async ORM Models for Pocket Messenger.
+SQLAlchemy 2.0 Async ORM Models for Flick Messenger.
 """
 
 from typing import Optional
@@ -30,7 +30,7 @@ class User(Base):
         String(50), unique=True, index=True, nullable=False
     )
     username: Mapped[str] = mapped_column(
-        String(100), default="Pocket User", nullable=False
+        String(100), default="Flick User", nullable=False
     )
     avatar_color: Mapped[str] = mapped_column(
         String(20), default="#FFB800", nullable=False
@@ -39,7 +39,7 @@ class User(Base):
         Text, nullable=True, default=None
     )
     quote: Mapped[Optional[str]] = mapped_column(
-        String(255), nullable=True, default="Hey there! I am using Pocket."
+        String(255), nullable=True, default="Hey there! I am using Flick."
     )
     fcm_token: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, default=None
@@ -79,7 +79,7 @@ class User(Base):
             "username": self.username,
             "avatar_color": self.avatar_color,
             "avatar_url": self.avatar_url,
-            "quote": self.quote or "Hey there! I am using Pocket.",
+            "quote": self.quote or "Hey there! I am using Flick.",
             "is_online": self.is_online,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -244,14 +244,14 @@ class Status(Base):
             except Exception:
                 parsed_viewers = []
 
-        user_name = "Pocket User"
-        avatar = "PK"
+        user_name = "Flick User"
+        avatar = "FK"
         avatar_color = "#FFB800"
         avatar_url = None
         try:
             if self.user:
-                user_name = self.user.username or "Pocket User"
-                avatar = self.user.username[:2].upper() if self.user.username else "PK"
+                user_name = self.user.username or "Flick User"
+                avatar = self.user.username[:2].upper() if self.user.username else "FK"
                 avatar_color = self.user.avatar_color or "#FFB800"
                 avatar_url = self.user.avatar_url
         except Exception:

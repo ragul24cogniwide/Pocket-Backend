@@ -23,7 +23,7 @@ class SendOtpResponse(BaseModel):
 class VerifyOtpRequest(BaseModel):
     phone_number: str
     otp_code: str
-    username: Optional[str] = "Pocket User"
+    username: Optional[str] = "Flick User"
 
 
 class AuthResponse(BaseModel):
@@ -39,7 +39,7 @@ class UserProfileResponse(BaseModel):
     username: str
     avatar_color: str
     avatar_url: Optional[str] = None
-    quote: Optional[str] = "Hey there! I am using Pocket."
+    quote: Optional[str] = "Hey there! I am using Flick."
     is_online: bool
     last_seen: Optional[str] = None
 
@@ -109,8 +109,8 @@ class CallOfferRequest(BaseModel):
     call_id: str
     caller_id: str
     receiver_id: str
-    caller_name: Optional[str] = "Pocket User"
-    caller_avatar: Optional[str] = "PK"
+    caller_name: Optional[str] = "Flick User"
+    caller_avatar: Optional[str] = "FK"
     caller_avatar_url: Optional[str] = None
     caller_color: Optional[str] = "#FFB800"
 

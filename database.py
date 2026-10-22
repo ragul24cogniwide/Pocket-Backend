@@ -105,7 +105,7 @@ async def init_db() -> None:
                 for ddl in [
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;",
                     "ALTER TABLE users ALTER COLUMN avatar_url TYPE TEXT;",
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS quote VARCHAR(255) DEFAULT 'Hey there! I am using Pocket.';",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS quote VARCHAR(255) DEFAULT 'Hey there! I am using Flick.';",
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;",
                     "ALTER TABLE users ALTER COLUMN fcm_token TYPE TEXT;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;",
@@ -132,7 +132,7 @@ async def init_db() -> None:
             {"id": "+918946014462", "phone_number": "+918946014462", "username": "Ragulvasanth Muthukumar", "avatar_color": "#10B981", "quote": "🚀 Building the future"},
             {"id": "1", "phone_number": "+919876543211", "username": "Rahul Sharma", "avatar_color": "#FFB800", "quote": "⚡ Always on the move!"},
             {"id": "2", "phone_number": "+919123456782", "username": "Priya Patel", "avatar_color": "#10B981", "quote": "✨ Living in the moment."},
-            {"id": "3", "phone_number": "+919988776653", "username": "React Native Devs", "avatar_color": "#3B82F6", "quote": "🚀 Building awesome mobile apps with Pocket!"},
+            {"id": "3", "phone_number": "+919988776653", "username": "React Native Devs", "avatar_color": "#3B82F6", "quote": "🚀 Building awesome mobile apps with Flick!"},
             {"id": "4", "phone_number": "+919811223344", "username": "Alex Johnson", "avatar_color": "#8B5CF6", "quote": "🎧 In my zone."},
         ]
 
