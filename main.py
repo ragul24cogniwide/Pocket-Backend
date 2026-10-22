@@ -1464,6 +1464,7 @@ async def edit_message(
         raise HTTPException(status_code=403, detail="You can only edit your own messages")
 
     msg.content = payload.content.strip()
+    msg.is_edited = True  # Persist edit flag to DB
     await db.commit()
     await db.refresh(msg)
 

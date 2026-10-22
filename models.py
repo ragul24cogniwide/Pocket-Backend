@@ -143,6 +143,9 @@ class Message(Base):
     reply_to: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, default=None
     )
+    is_edited: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
     delivered_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -185,6 +188,7 @@ class Message(Base):
             "metadata": parsed_metadata,
             "timestamp": self.timestamp.isoformat() if self.timestamp else datetime.now(timezone.utc).isoformat(),
             "status": self.status.value if hasattr(self.status, 'value') else str(self.status),
+            "is_edited": self.is_edited or False,
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "read_at": self.read_at.isoformat() if self.read_at else None,
         }
