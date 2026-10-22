@@ -243,6 +243,16 @@ class ConnectionManager:
         sockets = self._find_all_local_ws(user_id)
         return sockets[0] if sockets else None
 
+    def _remove_dead_socket(self, ws: WebSocket, reason: str = "") -> None:
+        """Removes a dead/stale WebSocket from active_connections and alias mappings."""
+        dead_keys = []
+        for k, v in list(self.active_connections.items()):
+            if v == ws:
+                self.active_connections.pop(k, None)
+                dead_keys.append(k)
+        if dead_keys:
+            logger.info("Cleaned up dead socket for %s (reason: %s)", dead_keys, reason or "send_failure")
+
     async def send_personal_message(self, user_id: str, message_payload: dict[str, Any]) -> bool:
         """
         Routes a payload directly to the user if on this local node,
@@ -261,10 +271,7 @@ class ConnectionManager:
                     delivered = True
                 except Exception as e:
                     logger.warning("Local send failed for socket (%s): %s", user_id, e)
-                    # Clean up dead socket reference
-                    for k, v in list(self.active_connections.items()):
-                        if v == ws:
-                            self.active_connections.pop(k, None)
+                    self._remove_dead_socket(ws, f"send_personal_message failure: {e}")
 
         # 2. Distributed Redis Pub/Sub routing (publish ONLY once to canonical channel)
         if self.redis:
@@ -309,8 +316,9 @@ class ConnectionManager:
                     for ws in target_sockets:
                         try:
                             await ws.send_text(payload_str)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("PubSub local delivery failed for %s: %s", user_id, e)
+                            self._remove_dead_socket(ws, f"pubsub delivery failure: {e}")
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -408,8 +416,8 @@ class ConnectionManager:
                 continue
             try:
                 await ws.send_text(payload)
-            except Exception:
-                pass
+            except Exception as e:
+                self._remove_dead_socket(ws, f"presence fanout failure: {e}")
 
     async def _listen_presence_channel(self) -> None:
         """Forwards presence events published by other cluster nodes."""

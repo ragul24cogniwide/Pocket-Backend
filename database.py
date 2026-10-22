@@ -72,10 +72,10 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception as exc:
             await session.rollback()
             err_str = str(exc)
-            if "does not exist" in err_str and ("relation" in err_str or "table" in err_str):
+            if "does not exist" in err_str and ("relation" in err_str or "table" in err_str or "column" in err_str):
                 import logging
                 logging.getLogger("Database").warning(
-                    "Missing relation detected (%s). Auto-healing database schema...", err_str
+                    "Missing schema element detected (%s). Auto-healing database schema...", err_str
                 )
                 try:
                     await init_db()
@@ -109,6 +109,9 @@ async def init_db() -> None:
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT;",
                     "ALTER TABLE users ALTER COLUMN fcm_token TYPE TEXT;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP WITH TIME ZONE;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP WITH TIME ZONE;",
                 ]:
                     try:
                         await conn.execute(text(ddl))

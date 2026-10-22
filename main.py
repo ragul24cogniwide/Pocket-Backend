@@ -141,9 +141,60 @@ async def dispatch_push_to_user(
         logger.warning("Error dispatching offline push to %s: %s", receiver_id, err)
 
 
-# In-memory active call sessions registry
+# In-memory + Redis active call sessions registry
 # call_id -> { "status": "ringing" | "answered" | "ended" | "rejected", "caller_id": ..., "receiver_id": ..., "created_at": ..., "updated_at": ... }
 active_call_sessions: dict[str, dict] = {}
+CALL_SESSION_TTL_SECONDS = 3600  # 1 hour TTL
+
+
+async def save_call_session(call_id: str, session: dict) -> None:
+    """Persists call session state to memory cache and distributed Redis cluster."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    session["updated_at_ts"] = now_ts
+    if "created_at_ts" not in session:
+        session["created_at_ts"] = now_ts
+    active_call_sessions[call_id] = session
+    if manager.redis:
+        try:
+            await manager.redis.set(f"call_session:{call_id}", json.dumps(session), ex=CALL_SESSION_TTL_SECONDS)
+        except Exception as e:
+            logger.debug("[CallSession] Redis set failed for %s: %s", call_id, e)
+
+
+async def get_call_session(call_id: str) -> dict:
+    """Retrieves call session state from memory or Redis cache."""
+    if call_id in active_call_sessions:
+        return active_call_sessions[call_id]
+    if manager.redis:
+        try:
+            raw = await manager.redis.get(f"call_session:{call_id}")
+            if raw:
+                session = json.loads(raw)
+                active_call_sessions[call_id] = session
+                return session
+        except Exception as e:
+            logger.debug("[CallSession] Redis get failed for %s: %s", call_id, e)
+    return {}
+
+
+async def cleanup_stale_call_sessions_loop() -> None:
+    """Periodic background task running every 5 minutes to sweep stale in-memory call sessions."""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            stale = [
+                cid for cid, s in list(active_call_sessions.items())
+                if now_ts - s.get("created_at_ts", s.get("updated_at_ts", now_ts)) > 1800
+            ]
+            for cid in stale:
+                active_call_sessions.pop(cid, None)
+            if stale:
+                logger.info("[CallSessions] Cleaned up %d stale in-memory call sessions", len(stale))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("[CallSessions] Sweeper error: %s", e)
 
 
 async def broadcast_call_frame(target_id: str, frame_type: str, data: dict, sender_id: Optional[str] = None) -> bool:
@@ -246,8 +297,10 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing connection manager & Redis Pub/Sub...")
     await manager.initialize()
     keep_alive_task = asyncio.create_task(server_keep_alive_loop())
+    call_cleanup_task = asyncio.create_task(cleanup_stale_call_sessions_loop())
     yield
     keep_alive_task.cancel()
+    call_cleanup_task.cancel()
     logger.info("Shutting down connection manager...")
     await manager.shutdown()
 
@@ -445,7 +498,7 @@ async def call_offer_endpoint(payload: CallOfferRequest):
         except Exception as e:
             logger.warning("[CallOffer] Caller enrichment error: %s", e)
 
-    active_call_sessions[payload.call_id] = {
+    await save_call_session(payload.call_id, {
         "call_id": payload.call_id,
         "caller_id": payload.caller_id,
         "receiver_id": payload.receiver_id,
@@ -456,7 +509,7 @@ async def call_offer_endpoint(payload: CallOfferRequest):
         "status": "ringing",
         "created_at": now_iso,
         "updated_at": now_iso,
-    }
+    })
 
     call_data = {
         "call_id": payload.call_id,
@@ -496,7 +549,7 @@ async def call_offer_endpoint(payload: CallOfferRequest):
 async def call_answer_endpoint(payload: CallAnswerRequest):
     """Answers an incoming call, sets session to 'answered', notifies caller immediately over WS and push."""
     now_iso = datetime.now(timezone.utc).isoformat()
-    session = active_call_sessions.get(payload.call_id, {})
+    session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
         "caller_id": payload.caller_id,
@@ -505,7 +558,7 @@ async def call_answer_endpoint(payload: CallAnswerRequest):
         "answered_at": now_iso,
         "updated_at": now_iso,
     })
-    active_call_sessions[payload.call_id] = session
+    await save_call_session(payload.call_id, session)
 
     call_data = {
         "call_id": payload.call_id,
@@ -538,14 +591,14 @@ async def call_answer_endpoint(payload: CallAnswerRequest):
 async def call_reject_endpoint(payload: CallRejectRequest):
     """Declines an incoming call and terminates for both sides."""
     now_iso = datetime.now(timezone.utc).isoformat()
-    session = active_call_sessions.get(payload.call_id, {})
+    session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
         "status": "rejected",
         "reason": payload.reason or "declined",
         "updated_at": now_iso,
     })
-    active_call_sessions[payload.call_id] = session
+    await save_call_session(payload.call_id, session)
 
     target = payload.caller_id or payload.receiver_id or payload.other_user_id
     call_data = {
@@ -576,14 +629,14 @@ async def call_reject_endpoint(payload: CallRejectRequest):
 async def call_end_endpoint(payload: CallEndRequest):
     """Ends an ongoing call and terminates for both sides immediately."""
     now_iso = datetime.now(timezone.utc).isoformat()
-    session = active_call_sessions.get(payload.call_id, {})
+    session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
         "status": "ended",
         "duration": payload.duration or 0,
         "updated_at": now_iso,
     })
-    active_call_sessions[payload.call_id] = session
+    await save_call_session(payload.call_id, session)
 
     targets = set()
     if payload.caller_id:
@@ -619,7 +672,7 @@ async def call_end_endpoint(payload: CallEndRequest):
 @app.get("/api/call/status/{call_id}")
 async def get_call_status(call_id: str):
     """Returns active call status ('ringing', 'answered', 'ended', 'rejected', 'unknown')."""
-    session = active_call_sessions.get(call_id)
+    session = await get_call_session(call_id)
     if not session:
         return {"call_id": call_id, "status": "unknown"}
     return {
@@ -1379,7 +1432,6 @@ async def send_message_rest(
         names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
         rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
         db.add(User(id=receiver_id, phone_number=receiver_id, username=rec_name, avatar_color="#3B82F6", is_online=False))
-        await db.commit()
 
     is_rec_online = await manager.is_user_online(receiver_id)
     initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
@@ -2147,10 +2199,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     continue
 
                 async with async_session_factory() as db:
-                    # Ensure sender and receiver exist in DB to prevent foreign key errors
-                    sender_stmt = select(User).where(User.id == user_id)
-                    sender_res = await db.execute(sender_stmt)
-                    if not sender_res.scalar_one_or_none():
+                    # Single round-trip batch check for sender & receiver
+                    users_res = await db.execute(
+                        select(User).where(User.id.in_([user_id, receiver_id]))
+                    )
+                    existing_users = {u.id: u for u in users_res.scalars().all()}
+
+                    if user_id not in existing_users:
                         db.add(User(
                             id=user_id,
                             phone_number=user_id,
@@ -2158,11 +2213,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             avatar_color="#FFB800",
                             is_online=True,
                         ))
-                        await db.commit()
-
-                    rec_stmt = select(User).where(User.id == receiver_id)
-                    rec_res = await db.execute(rec_stmt)
-                    if not rec_res.scalar_one_or_none():
+                    if receiver_id not in existing_users:
                         # Auto-seed receiver to avoid Foreign Key violations
                         names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
                         rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
@@ -2173,7 +2224,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             avatar_color="#3B82F6",
                             is_online=False,
                         ))
-                        await db.commit()
 
                     # Determine delivery state
                     is_rec_online = await manager.is_user_online(receiver_id)
@@ -2270,16 +2320,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if sender_id and message_id:
                     now = datetime.now(timezone.utc)
                     async with async_session_factory() as db:
-                        stmt = (
-                            update(Message)
-                            .where(
-                                Message.id == message_id,
-                                Message.status == "SENT",
-                            )
-                            .values(status="DELIVERED", delivered_at=now)
+                        check = await db.execute(
+                            select(Message.id, Message.status).where(Message.id == message_id)
                         )
-                        await db.execute(stmt)
-                        await db.commit()
+                        row = check.fetchone()
+                        if row and row.status != MessageStatus.READ:
+                            stmt = (
+                                update(Message)
+                                .where(
+                                    Message.id == message_id,
+                                    Message.status == MessageStatus.SENT,
+                                )
+                                .values(status=MessageStatus.DELIVERED, delivered_at=now)
+                            )
+                            await db.execute(stmt)
+                            await db.commit()
 
                     ack_del_frame = {
                         "type": "ack_delivered",
@@ -2369,7 +2424,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     data["caller_color"] = caller_color
                     data["caller_avatar"] = caller_avatar
 
-                    active_call_sessions[call_id] = {
+                    await save_call_session(call_id, {
                         "call_id": call_id,
                         "caller_id": user_id,
                         "receiver_id": target_id,
@@ -2380,34 +2435,34 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "status": "ringing",
                         "created_at": now_iso,
                         "updated_at": now_iso,
-                    }
+                    })
                 elif frame_type == "call_answer":
-                    session = active_call_sessions.get(call_id, {})
+                    session = await get_call_session(call_id)
                     session.update({
                         "call_id": call_id,
                         "status": "answered",
                         "answered_at": now_iso,
                         "updated_at": now_iso,
                     })
-                    active_call_sessions[call_id] = session
+                    await save_call_session(call_id, session)
                 elif frame_type == "call_reject":
-                    session = active_call_sessions.get(call_id, {})
+                    session = await get_call_session(call_id)
                     session.update({
                         "call_id": call_id,
                         "status": "rejected",
                         "reason": data.get("reason", "declined"),
                         "updated_at": now_iso,
                     })
-                    active_call_sessions[call_id] = session
+                    await save_call_session(call_id, session)
                 elif frame_type == "call_end":
-                    session = active_call_sessions.get(call_id, {})
+                    session = await get_call_session(call_id)
                     session.update({
                         "call_id": call_id,
                         "status": "ended",
                         "duration": data.get("duration", 0),
                         "updated_at": now_iso,
                     })
-                    active_call_sessions[call_id] = session
+                    await save_call_session(call_id, session)
 
                 def is_same_user_id(u1: str, u2: str) -> bool:
                     if not u1 or not u2:

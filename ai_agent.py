@@ -318,44 +318,61 @@ async def call_gemini_agent(
             logger.warning(f"Failed to configure legacy Gemini SDK: {e}")
 
     # 1. Fetch upcoming meetings for context
-    stmt_meetings = (
-        select(Meeting)
-        .where(
-            Meeting.user_id == current_user.id,
-            Meeting.status == "SCHEDULED",
-            Meeting.start_time >= (user_now - timedelta(days=1)),
+    meetings_ctx_str = "No upcoming meetings scheduled."
+    try:
+        stmt_meetings = (
+            select(Meeting)
+            .where(
+                Meeting.user_id == current_user.id,
+                Meeting.status == "SCHEDULED",
+                Meeting.start_time >= (user_now - timedelta(days=1)),
+            )
+            .order_by(Meeting.start_time.asc())
+            .limit(10)
         )
-        .order_by(Meeting.start_time.asc())
-        .limit(10)
-    )
-    m_res = await db.execute(stmt_meetings)
-    existing_meetings = list(m_res.scalars().all())
-
-    meetings_context = []
-    for m in existing_meetings:
-        meetings_context.append(
-            f"- ID: {m.id} | Title: '{m.title}' | Start: {m.start_time.isoformat()} ({m.start_time.strftime('%a %b %d, %I:%M %p')}) | Duration: {m.duration_minutes}m | Location: {m.location or 'Online'}"
-        )
-    meetings_ctx_str = "\n".join(meetings_context) if meetings_context else "No upcoming meetings scheduled."
+        m_res = await db.execute(stmt_meetings)
+        existing_meetings = list(m_res.scalars().all())
+        meetings_context = []
+        for m in existing_meetings:
+            meetings_context.append(
+                f"- ID: {m.id} | Title: '{m.title}' | Start: {m.start_time.isoformat()} ({m.start_time.strftime('%a %b %d, %I:%M %p')}) | Duration: {m.duration_minutes}m | Location: {m.location or 'Online'}"
+            )
+        if meetings_context:
+            meetings_ctx_str = "\n".join(meetings_context)
+    except Exception as e:
+        logger.warning("Could not fetch meetings context for Gemini: %s", e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     # 2. Fetch recent conversation messages for chat summarization context
-    stmt_msgs = (
-        select(Message)
-        .where(
-            or_(Message.sender_id == current_user.id, Message.receiver_id == current_user.id),
-            Message.sender_id != AGENT_USER_ID,
-            Message.receiver_id != AGENT_USER_ID,
+    msgs_ctx_str = "No recent conversations with team."
+    try:
+        stmt_msgs = (
+            select(Message)
+            .where(
+                or_(Message.sender_id == current_user.id, Message.receiver_id == current_user.id),
+                Message.sender_id != AGENT_USER_ID,
+                Message.receiver_id != AGENT_USER_ID,
+            )
+            .order_by(desc(Message.timestamp))
+            .limit(15)
         )
-        .order_by(desc(Message.timestamp))
-        .limit(15)
-    )
-    msg_res = await db.execute(stmt_msgs)
-    recent_msgs = list(reversed(msg_res.scalars().all()))
-    msgs_context = []
-    for rm in recent_msgs:
-        sender_lbl = "You" if rm.sender_id == current_user.id else f"Contact ({rm.sender_id[-4:] if len(rm.sender_id)>=4 else rm.sender_id})"
-        msgs_context.append(f"[{rm.timestamp.strftime('%I:%M %p')}] {sender_lbl}: {rm.content}")
-    msgs_ctx_str = "\n".join(msgs_context) if msgs_context else "No recent conversations with team."
+        msg_res = await db.execute(stmt_msgs)
+        recent_msgs = list(reversed(msg_res.scalars().all()))
+        msgs_context = []
+        for rm in recent_msgs:
+            sender_lbl = "You" if rm.sender_id == current_user.id else f"Contact ({rm.sender_id[-4:] if len(rm.sender_id)>=4 else rm.sender_id})"
+            msgs_context.append(f"[{rm.timestamp.strftime('%I:%M %p')}] {sender_lbl}: {rm.content}")
+        if msgs_context:
+            msgs_ctx_str = "\n".join(msgs_context)
+    except Exception as e:
+        logger.warning("Could not fetch messages context for Gemini: %s", e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     system_instruction = f"""You are Pocket AI, an intelligent, versatile, multipurpose personal AI assistant embedded in the Pocket collaboration platform.
 You are a full-featured, comprehensive AI assistant (similar to ChatGPT, Gemini, or Claude). You are NOT limited to meetings or calendar events. You are capable of assisting the user with virtually ANY question or task across all domains, while natively integrating with their Pocket calendar and chat when requested.
@@ -736,6 +753,10 @@ async def _process_personal_agent_message_raw(
                 return gemini_result
         except Exception as e:
             logger.warning(f"Gemini execution encountered error, falling back to local NLP: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # 2. Intent: View / List Meetings ("What meetings do I have today?", etc.)
