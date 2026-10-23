@@ -368,7 +368,7 @@ async def get_conversation_sync_page(
     if not logs:
         # No changes since last sync
         return {
-            "cursor": encode_cursor(cursor_version),
+            "cursor": cursor_str if cursor_str else encode_cursor(cursor_version),
             "has_more": False,
             "full_sync": False,
             "created": [],

@@ -788,6 +788,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     user_stmt = select(User).where(or_(User.id == phone, User.phone_number == phone))
     user_res = await db.execute(user_stmt)
     user = user_res.scalar_one_or_none()
+    is_new = user is None
 
     if not user:
         colors = ["#FFB800", "#10B981", "#3B82F6", "#8B5CF6", "#EC4899", "#F97316"]
@@ -813,6 +814,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
         access_token=token,
         token_type="bearer",
         user=user.to_dict(),
+        is_new_user=is_new,
     )
 
 

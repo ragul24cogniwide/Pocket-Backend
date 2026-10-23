@@ -30,6 +30,7 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: dict
+    is_new_user: bool = False
 
 
 # User Profile
