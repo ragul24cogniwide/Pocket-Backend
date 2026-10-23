@@ -7,7 +7,7 @@ import enum
 import json
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -368,5 +368,51 @@ class Meeting(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ConversationChangeLog(Base):
+    __tablename__ = "conversation_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    peer_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(20), nullable=False)  # 'created', 'updated', 'deleted'
+    payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON serialized conversation dict
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_conv_change_user_version", "user_id", "version"),
+        Index("ix_conv_change_user_peer", "user_id", "peer_id"),
+        Index("ix_conv_change_user_created", "user_id", "created_at"),
+    )
+
+    def to_dict(self) -> dict:
+        parsed_payload = None
+        if self.payload:
+            try:
+                parsed_payload = json.loads(self.payload)
+            except Exception:
+                parsed_payload = None
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "peer_id": self.peer_id,
+            "version": self.version,
+            "action": self.action,
+            "payload": parsed_payload,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class UserSyncSequence(Base):
+    __tablename__ = "user_sync_sequences"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    current_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 

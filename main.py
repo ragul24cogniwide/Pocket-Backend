@@ -53,6 +53,12 @@ from schemas import (
     CheckConflictRequest,
     AgentChatRequest,
     AgentChatResponse,
+    SyncConversationsResponse,
+)
+from sync_service import (
+    get_conversation_sync_page,
+    record_conversation_change,
+    record_profile_change_for_contacts,
 )
 from ai_agent import (
     process_personal_agent_message,
@@ -864,6 +870,12 @@ async def update_user_profile(
         if payload.quote is not None:
             target_user.quote = payload.quote.strip() if payload.quote else "Hey there! I am using Flick."
 
+        # Propagate profile updates to conversation changelog for delta sync
+        try:
+            await record_profile_change_for_contacts(db, target_user)
+        except Exception as sync_err:
+            logger.warning("Failed to record profile change for sync: %s", sync_err)
+
         await db.commit()
         await db.refresh(target_user)
 
@@ -1257,6 +1269,25 @@ async def list_available_contacts(
 
 
 # -----------------------------------------------------------------------------
+# Conversation Delta Sync
+# -----------------------------------------------------------------------------
+@app.get("/sync/conversations", response_model=SyncConversationsResponse)
+@app.get("/api/sync/conversations", response_model=SyncConversationsResponse)
+async def sync_conversations(
+    cursor: Optional[str] = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delta sync endpoint returning only created, updated, and deleted conversation
+    records since the provided opaque cursor.
+    """
+    res = await get_conversation_sync_page(db, current_user, cursor_str=cursor, limit=limit)
+    return SyncConversationsResponse(**res)
+
+
+# -----------------------------------------------------------------------------
 # Contact Sync (Matches Phone Contacts with Registered Users)
 # -----------------------------------------------------------------------------
 @app.post("/api/contacts/sync", response_model=SyncContactsResponse)
@@ -1457,6 +1488,14 @@ async def send_message_rest(
     await db.commit()
     await db.refresh(new_msg)
 
+    # Record conversation changes for delta sync
+    try:
+        await record_conversation_change(db, user_id=current_user.id, peer_id=receiver_id, action="updated")
+        await record_conversation_change(db, user_id=receiver_id, peer_id=current_user.id, action="updated")
+        await db.commit()
+    except Exception as sync_err:
+        logger.warning("Failed to record conversation change for REST send: %s", sync_err)
+
     message_dict = new_msg.to_dict()
 
     # Forward to Receiver via WebSocket
@@ -1520,6 +1559,13 @@ async def edit_message(
     await db.commit()
     await db.refresh(msg)
 
+    try:
+        await record_conversation_change(db, user_id=msg.sender_id, peer_id=msg.receiver_id, action="updated")
+        await record_conversation_change(db, user_id=msg.receiver_id, peer_id=msg.sender_id, action="updated")
+        await db.commit()
+    except Exception as sync_err:
+        logger.warning("Failed to record conversation change for edit: %s", sync_err)
+
     # Broadcast edit frame to receiver over WebSocket
     edit_frame = {
         "type": "message_edited",
@@ -1555,8 +1601,16 @@ async def delete_message(
 
     if for_everyone and msg.sender_id == current_user.id:
         receiver_id = msg.receiver_id
+        sender_id = msg.sender_id
         await db.delete(msg)
         await db.commit()
+
+        try:
+            await record_conversation_change(db, user_id=sender_id, peer_id=receiver_id, action="updated")
+            await record_conversation_change(db, user_id=receiver_id, peer_id=sender_id, action="updated")
+            await db.commit()
+        except Exception as sync_err:
+            logger.warning("Failed to record conversation change for delete: %s", sync_err)
 
         # Broadcast delete frame to receiver
         delete_frame = {
@@ -1570,8 +1624,14 @@ async def delete_message(
         await manager.send_personal_message(receiver_id, delete_frame)
     else:
         # Delete for self only
+        other_id = msg.receiver_id if msg.sender_id == current_user.id else msg.sender_id
         await db.delete(msg)
         await db.commit()
+        try:
+            await record_conversation_change(db, user_id=current_user.id, peer_id=other_id, action="updated")
+            await db.commit()
+        except Exception:
+            pass
 
     return {"status": "success", "message_id": message_id, "deleted": True}
 
@@ -1707,6 +1767,12 @@ async def handle_personal_agent_reply(user_id: str, content: str, client_metadat
             db.add(agent_msg)
             await db.commit()
             await db.refresh(agent_msg)
+
+            try:
+                await record_conversation_change(db, user_id=user_id, peer_id=AGENT_USER_ID, action="updated")
+                await db.commit()
+            except Exception:
+                pass
 
             msg_dict = agent_msg.to_dict()
 
@@ -1988,6 +2054,12 @@ async def chat_with_agent_endpoint(
     await db.refresh(user_msg)
     await db.refresh(agent_msg)
 
+    try:
+        await record_conversation_change(db, user_id=current_user.id, peer_id=AGENT_USER_ID, action="updated")
+        await db.commit()
+    except Exception:
+        pass
+
     res["user_message_id"] = user_msg.id
     res["message_id"] = agent_msg.id
     res["timestamp"] = agent_msg.timestamp.isoformat()
@@ -2251,6 +2323,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     await db.commit()
                     await db.refresh(new_msg)
 
+                    try:
+                        await record_conversation_change(db, user_id=user_id, peer_id=receiver_id, action="updated")
+                        await record_conversation_change(db, user_id=receiver_id, peer_id=user_id, action="updated")
+                        await db.commit()
+                    except Exception as sync_err:
+                        logger.warning("Failed to record conversation change for WS send: %s", sync_err)
+
                     message_dict = new_msg.to_dict()
 
                 # Acknowledge to Sender (SENT / DELIVERED)
@@ -2362,6 +2441,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         )
                         await db.execute(stmt)
                         await db.commit()
+
+                        try:
+                            await record_conversation_change(db, user_id=user_id, peer_id=sender_id, action="updated")
+                            await db.commit()
+                        except Exception as sync_err:
+                            logger.warning("Failed to record conversation change for mark_read: %s", sync_err)
 
                     ack_read_frame = {
                         "type": "ack_read",

@@ -69,11 +69,21 @@ class ChatContactItem(BaseModel):
     avatar_color: str
     avatar_url: Optional[str] = None
     quote: Optional[str] = None
-    online: bool
+    online: bool = False
     last_message: Optional[str] = None
     time: Optional[str] = None
     unread: int = 0
     last_seen: Optional[str] = None
+    version: Optional[int] = None
+
+
+class SyncConversationsResponse(BaseModel):
+    cursor: str
+    has_more: bool = False
+    full_sync: bool = False
+    created: List[ChatContactItem] = []
+    updated: List[ChatContactItem] = []
+    deleted: List[str] = []
 
 
 class SyncContactsRequest(BaseModel):
