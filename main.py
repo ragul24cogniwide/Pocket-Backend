@@ -12,7 +12,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Any, Dict
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+import hmac
+import time
+from collections import defaultdict, deque
+
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy import desc, func, or_, and_, select, update
@@ -24,6 +28,8 @@ from auth import (
     generate_otp_code,
     get_current_user,
     get_current_user_optional,
+    same_identity,
+    user_from_token,
 )
 from connection_manager import manager
 from database import async_session_factory, get_db, init_db
@@ -75,8 +81,57 @@ from ai_agent import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Main")
 
-DEV_MODE_EXPOSE_OTP = os.getenv("DEV_MODE_EXPOSE_OTP", "true").lower() == "true"
+# Returning the OTP in the API response (and accepting a fixed master code) lets anyone log in
+# as any phone number. Both are for local testing only and must stay off in production.
+DEV_MODE_EXPOSE_OTP = os.getenv("DEV_MODE_EXPOSE_OTP", "false").lower() == "true"
+ALLOW_MASTER_OTP = os.getenv("ALLOW_MASTER_OTP", "false").lower() == "true"
+MASTER_OTP_CODE = "123456"
 OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "5"))
+OTP_RESEND_COOLDOWN_SECONDS = 30
+OTP_MAX_SENDS_PER_HOUR = 5
+OTP_MAX_VERIFY_ATTEMPTS = 5
+
+# Admin endpoints are disabled unless ADMIN_API_KEY is set; callers send it as X-Admin-Key.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ALLOWED_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "heic"}
+
+if DEV_MODE_EXPOSE_OTP or ALLOW_MASTER_OTP:
+    logging.getLogger("Main").warning(
+        "INSECURE AUTH: DEV_MODE_EXPOSE_OTP=%s ALLOW_MASTER_OTP=%s. Anyone can log in as any number. "
+        "Turn both off and configure SMS delivery before going live.",
+        DEV_MODE_EXPOSE_OTP,
+        ALLOW_MASTER_OTP,
+    )
+
+# Per-phone OTP throttling. In-memory, so limits are per server instance (fine for a single Render instance).
+_otp_send_log: dict[str, deque] = defaultdict(deque)
+_otp_failed_attempts: dict[str, int] = defaultdict(int)
+
+
+def require_admin(x_admin_key: Optional[str] = Header(default=None)) -> None:
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def normalize_phone(raw: str) -> str:
+    phone = "".join(ch for ch in (raw or "").strip() if ch.isdigit() or ch == "+")
+    if not phone.startswith("+"):
+        phone = "+91" + phone if len(phone) == 10 else "+" + phone
+    return phone
+
+
+async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
+    """
+    Sends the OTP to the user's phone. Returns True when an SMS provider accepted it.
+
+    TODO: wire up an SMS provider here (Twilio Verify, MSG91, AWS SNS, ...). Until then,
+    the only way to read the code is DEV_MODE_EXPOSE_OTP, which is not safe in production.
+    """
+    return False
 
 
 async def dispatch_push_to_user(
@@ -338,7 +393,7 @@ async def health_check():
     }
 
 
-@app.api_route("/api/admin/init-db", methods=["GET", "POST"])
+@app.api_route("/api/admin/init-db", methods=["GET", "POST"], dependencies=[Depends(require_admin)])
 async def trigger_init_db():
     """Manual or automated hook to verify and recreate database tables and seeds."""
     logger.info("Manual init-db requested. Rebuilding database schema...")
@@ -370,7 +425,7 @@ async def get_agent_status():
     }
 
 
-@app.post("/api/admin/set-gemini-key")
+@app.post("/api/admin/set-gemini-key", dependencies=[Depends(require_admin)])
 async def set_gemini_key_endpoint(payload: dict):
     """Dynamically updates the Gemini API Key on the live running instance."""
     new_key = payload.get("key", "").strip()
@@ -394,13 +449,13 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # -----------------------------------------------------------------------------
 @app.post("/api/upload/image")
 @app.post("/api/upload/media")
-async def upload_image(payload: dict):
+async def upload_image(payload: dict, current_user: User = Depends(get_current_user)):
     """
     Saves image / photo (.jpg/.png) from base64 data to cloud server and returns streaming URL.
     """
     try:
         image_base64 = payload.get("image_base64") or payload.get("base64") or payload.get("media_base64")
-        file_ext = payload.get("ext", "jpg").replace(".", "")
+        file_ext = str(payload.get("ext") or "jpg").replace(".", "").lower()
 
         if not image_base64:
             raise HTTPException(status_code=400, detail="Image base64 data required")
@@ -410,12 +465,17 @@ async def upload_image(payload: dict):
             if "data:image/" in image_base64:
                 try:
                     header = image_base64.split(";")[0]
-                    file_ext = header.split("/")[1]
+                    file_ext = header.split("/")[1].lower()
                 except Exception:
                     pass
             image_base64 = image_base64.split(",", 1)[1]
 
+        if file_ext not in ALLOWED_IMAGE_EXTS:
+            raise HTTPException(status_code=400, detail="Unsupported image type")
+
         image_bytes = base64.b64decode(image_base64)
+        if len(image_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Image is too large (max 10 MB)")
         file_id = f"photo_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.{file_ext}"
         file_path = os.path.join("uploads", "images", file_id)
 
@@ -432,13 +492,15 @@ async def upload_image(payload: dict):
             "file_name": file_id,
             "size": len(image_bytes),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Image upload failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
 
 
 @app.post("/api/upload/audio")
-async def upload_audio(payload: dict):
+async def upload_audio(payload: dict, current_user: User = Depends(get_current_user)):
     """
     Saves recorded voice audio (.m4a AAC) to cloud server and returns streaming URL.
     """
@@ -453,6 +515,8 @@ async def upload_audio(payload: dict):
             audio_base64 = audio_base64.split(",", 1)[1]
 
         audio_bytes = base64.b64decode(audio_base64)
+        if len(audio_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Voice note is too large (max 10 MB)")
         file_id = f"voice_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.m4a"
         file_path = os.path.join("uploads", "audio", file_id)
 
@@ -470,15 +534,22 @@ async def upload_audio(payload: dict):
             "duration": duration,
             "file_name": file_id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Audio upload failed: %s", e)
+        raise HTTPException(status_code=500, detail="Audio upload failed")
+
+
 # -----------------------------------------------------------------------------
 # Voice Call Signaling Endpoints (Dual-Channel Handshake & REST Fallback)
 # -----------------------------------------------------------------------------
 @app.post("/api/call/offer")
-async def call_offer_endpoint(payload: CallOfferRequest):
+async def call_offer_endpoint(payload: CallOfferRequest, current_user: User = Depends(get_current_user)):
     """Initiates an outgoing call offer, updates active session, sends push notification, and broadcasts over WS."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    # The caller is always the authenticated user, whatever the body claims
+    payload.caller_id = current_user.id
 
     caller_name = payload.caller_name
     caller_avatar = payload.caller_avatar
@@ -552,9 +623,10 @@ async def call_offer_endpoint(payload: CallOfferRequest):
 
 
 @app.post("/api/call/answer")
-async def call_answer_endpoint(payload: CallAnswerRequest):
+async def call_answer_endpoint(payload: CallAnswerRequest, current_user: User = Depends(get_current_user)):
     """Answers an incoming call, sets session to 'answered', notifies caller immediately over WS and push."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    payload.receiver_id = current_user.id
     session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
@@ -593,10 +665,16 @@ async def call_answer_endpoint(payload: CallAnswerRequest):
     return {"status": "answered", "call_id": payload.call_id, "delivered": delivered}
 
 
+def ensure_call_participant(user: User, *ids: Optional[str]) -> None:
+    if not any(same_identity(user.id, i) or same_identity(user.phone_number, i) for i in ids):
+        raise HTTPException(status_code=403, detail="You are not part of this call")
+
+
 @app.post("/api/call/reject")
-async def call_reject_endpoint(payload: CallRejectRequest):
+async def call_reject_endpoint(payload: CallRejectRequest, current_user: User = Depends(get_current_user)):
     """Declines an incoming call and terminates for both sides."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    ensure_call_participant(current_user, payload.caller_id, payload.receiver_id)
     session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
@@ -632,9 +710,10 @@ async def call_reject_endpoint(payload: CallRejectRequest):
 
 
 @app.post("/api/call/end")
-async def call_end_endpoint(payload: CallEndRequest):
+async def call_end_endpoint(payload: CallEndRequest, current_user: User = Depends(get_current_user)):
     """Ends an ongoing call and terminates for both sides immediately."""
     now_iso = datetime.now(timezone.utc).isoformat()
+    ensure_call_participant(current_user, payload.caller_id, payload.receiver_id)
     session = await get_call_session(payload.call_id)
     session.update({
         "call_id": payload.call_id,
@@ -676,7 +755,7 @@ async def call_end_endpoint(payload: CallEndRequest):
 
 
 @app.get("/api/call/status/{call_id}")
-async def get_call_status(call_id: str):
+async def get_call_status(call_id: str, current_user: User = Depends(get_current_user)):
     """Returns active call status ('ringing', 'answered', 'ended', 'rejected', 'unknown')."""
     session = await get_call_session(call_id)
     if not session:
@@ -713,12 +792,21 @@ async def send_otp(payload: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     Generates a 6-digit OTP for the provided phone number.
     In testing/dev mode, returns the OTP in the response for easy instant login.
     """
-    phone = payload.phone_number.strip()
-    if not phone:
-        raise HTTPException(status_code=400, detail="Phone number is required.")
+    phone = normalize_phone(payload.phone_number)
+    digits = phone.lstrip("+")
+    if not digits.isdigit() or not (8 <= len(digits) <= 15):
+        raise HTTPException(status_code=400, detail="Enter a valid phone number.")
 
-    if not phone.startswith("+"):
-        phone = "+91" + phone if len(phone) == 10 else "+" + phone
+    # Throttle: one code per cooldown window and a cap per hour, per number
+    now_ts = time.monotonic()
+    sends = _otp_send_log[phone]
+    while sends and now_ts - sends[0] > 3600:
+        sends.popleft()
+    if sends and now_ts - sends[-1] < OTP_RESEND_COOLDOWN_SECONDS:
+        wait = int(OTP_RESEND_COOLDOWN_SECONDS - (now_ts - sends[-1])) + 1
+        raise HTTPException(status_code=429, detail=f"Please wait {wait}s before requesting another code.")
+    if len(sends) >= OTP_MAX_SENDS_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Too many codes requested. Try again in an hour.")
 
     otp_code = generate_otp_code(6)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES)
@@ -739,7 +827,21 @@ async def send_otp(payload: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     db.add(otp_record)
     await db.commit()
 
-    logger.info("Generated OTP for %s: %s (Expires in %d mins)", phone, otp_code, OTP_EXPIRY_MINUTES)
+    sends.append(now_ts)
+    _otp_failed_attempts.pop(phone, None)
+
+    sms_sent = await deliver_otp_sms(phone, otp_code)
+    if not sms_sent and not DEV_MODE_EXPOSE_OTP:
+        logger.error("OTP for %s could not be delivered: no SMS provider configured.", phone)
+        raise HTTPException(
+            status_code=503,
+            detail="We couldn't send a code right now. Please try again later.",
+        )
+
+    if DEV_MODE_EXPOSE_OTP:
+        logger.info("Generated OTP for %s: %s (dev mode, expires in %d mins)", phone, otp_code, OTP_EXPIRY_MINUTES)
+    else:
+        logger.info("Sent OTP to %s (expires in %d mins)", phone, OTP_EXPIRY_MINUTES)
 
     return SendOtpResponse(
         message="OTP sent successfully.",
@@ -755,9 +857,11 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     Verifies the OTP code for the phone number.
     If valid, logs in the existing user or creates a new user, returning a JWT token.
     """
-    phone = payload.phone_number.strip()
-    if not phone.startswith("+"):
-        phone = "+91" + phone if len(phone) == 10 else "+" + phone
+    phone = normalize_phone(payload.phone_number)
+    code = (payload.otp_code or "").strip()
+
+    if _otp_failed_attempts[phone] >= OTP_MAX_VERIFY_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts. Request a new code.")
 
     now = datetime.now(timezone.utc)
 
@@ -766,7 +870,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
         select(OtpRecord)
         .where(
             OtpRecord.phone_number == phone,
-            OtpRecord.otp_code == payload.otp_code.strip(),
+            OtpRecord.otp_code == code,
             OtpRecord.is_used == False,
             OtpRecord.expires_at > now,
         )
@@ -775,11 +879,20 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     result = await db.execute(stmt)
     otp_record = result.scalars().first()
 
-    if not otp_record:
-        # Check master testing OTP '123456' for convenience in dev
-        if payload.otp_code != "123456":
-            raise HTTPException(status_code=400, detail="Invalid or expired OTP code.")
+    if not otp_record and not (ALLOW_MASTER_OTP and code == MASTER_OTP_CODE):
+        _otp_failed_attempts[phone] += 1
+        if _otp_failed_attempts[phone] >= OTP_MAX_VERIFY_ATTEMPTS:
+            # Burn any outstanding code so it can't be brute-forced further
+            await db.execute(
+                update(OtpRecord)
+                .where(OtpRecord.phone_number == phone, OtpRecord.is_used == False)
+                .values(is_used=True)
+            )
+            await db.commit()
+            raise HTTPException(status_code=429, detail="Too many incorrect attempts. Request a new code.")
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP code.")
 
+    _otp_failed_attempts.pop(phone, None)
     if otp_record:
         otp_record.is_used = True
         await db.commit()
@@ -787,7 +900,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     # Find or Create User
     user_stmt = select(User).where(or_(User.id == phone, User.phone_number == phone))
     user_res = await db.execute(user_stmt)
-    user = user_res.scalar_one_or_none()
+    user = user_res.scalars().first()
     is_new = user is None
 
     if not user:
@@ -818,6 +931,50 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     )
 
 
+@app.post("/api/auth/logout")
+async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Detaches this device's push token so a logged-out phone stops receiving the user's notifications."""
+    current_user.fcm_token = None
+    current_user.is_online = False
+    current_user.last_seen = datetime.now(timezone.utc)
+    await db.commit()
+    return {"message": "Logged out"}
+
+
+@app.delete("/api/auth/me")
+async def delete_my_account(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Permanently deletes the authenticated account and everything it owns."""
+    from sqlalchemy import delete as sql_delete
+    from models import ConversationChangeLog, UserSyncSequence
+
+    me = current_user.id
+    peer_rows = await db.execute(
+        select(Message.sender_id, Message.receiver_id).where(
+            or_(Message.sender_id == me, Message.receiver_id == me)
+        )
+    )
+    peers = {p for row in peer_rows.all() for p in row if p and p != me}
+
+    await db.execute(sql_delete(Message).where(or_(Message.sender_id == me, Message.receiver_id == me)))
+    await db.execute(sql_delete(Status).where(Status.user_id == me))
+    await db.execute(sql_delete(Meeting).where(Meeting.user_id == me))
+    await db.execute(sql_delete(OtpRecord).where(OtpRecord.phone_number == current_user.phone_number))
+    await db.execute(sql_delete(ConversationChangeLog).where(ConversationChangeLog.user_id == me))
+    await db.execute(sql_delete(UserSyncSequence).where(UserSyncSequence.user_id == me))
+
+    # Tell everyone this user chatted with to drop the conversation on their next sync
+    for peer in peers:
+        try:
+            await record_conversation_change(db, user_id=peer, peer_id=me, action="deleted")
+        except Exception as sync_err:
+            logger.warning("Failed to record account deletion for %s: %s", peer, sync_err)
+
+    await db.delete(current_user)
+    await db.commit()
+    logger.info("Deleted account %s", me)
+    return {"message": "Account deleted"}
+
+
 @app.get("/api/auth/me", response_model=UserProfileResponse)
 @app.get("/api/users/profile/me", response_model=UserProfileResponse)
 @app.get("/api/users/me", response_model=UserProfileResponse)
@@ -843,25 +1000,13 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
 @app.post("/api/profile", response_model=UserProfileResponse)
 async def update_user_profile(
     payload: UpdateProfileRequest,
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Updates user profile details (username, avatar_url, avatar_color, quote)."""
+    """Updates the authenticated user's profile (username, avatar_url, avatar_color, quote)."""
     try:
+        # user_id / phone_number in the body are ignored: you can only edit your own profile
         target_user = current_user
-        if not target_user and (payload.user_id or payload.phone_number):
-            identifier = (payload.user_id or payload.phone_number or "").strip()
-            digits = "".join(filter(str.isdigit, identifier))
-            conditions = [User.id == identifier, User.phone_number == identifier]
-            if len(digits) >= 10:
-                last10 = digits[-10:]
-                conditions.append(User.phone_number.endswith(last10))
-                conditions.append(User.id.endswith(last10))
-            result = await db.execute(select(User).where(or_(*conditions)))
-            target_user = result.scalar_one_or_none()
-
-        if not target_user:
-            raise HTTPException(status_code=401, detail="User not identified or authenticated.")
 
         if payload.username is not None and payload.username.strip():
             target_user.username = payload.username.strip()
@@ -902,36 +1047,20 @@ async def update_user_profile(
 @app.post("/api/users/fcm-token")
 async def update_fcm_token(
     payload: UpdateFcmTokenRequest,
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Updates device FCM Push Token for background notifications."""
-    target_user = current_user
-    if not target_user and (payload.user_id or payload.phone_number):
-        identifier = (payload.user_id or payload.phone_number or "").strip()
-        digits = "".join(filter(str.isdigit, identifier))
-        stmt = (
-            select(User)
-            .where(
-                or_(
-                    User.id == identifier,
-                    User.phone_number == identifier,
-                    User.phone_number.endswith(digits) if len(digits) >= 8 else False,
-                    User.id.endswith(digits) if len(digits) >= 8 else False,
-                )
-            )
-            .order_by(desc(User.last_seen))
-        )
-        res = await db.execute(stmt)
-        target_user = res.scalars().first()
-
-    if target_user:
-        target_user.fcm_token = payload.fcm_token
-        await db.commit()
-        logger.info("Updated FCM token for user %s (%s)", target_user.id, target_user.username)
-        return {"message": "FCM token updated successfully", "fcm_token": payload.fcm_token}
-
-    return {"message": "FCM token received", "fcm_token": payload.fcm_token}
+    """Registers this device's FCM push token for the authenticated user."""
+    # A device token belongs to one account at a time: detach it from whoever had it before
+    await db.execute(
+        update(User)
+        .where(User.fcm_token == payload.fcm_token, User.id != current_user.id)
+        .values(fcm_token=None)
+    )
+    current_user.fcm_token = payload.fcm_token
+    await db.commit()
+    logger.info("Updated FCM token for user %s", current_user.id)
+    return {"message": "FCM token updated successfully"}
 
 
 
@@ -1069,7 +1198,11 @@ async def delete_status(
 # -----------------------------------------------------------------------------
 @app.get("/api/users/profile/{user_id}")
 @app.get("/api/users/{user_id}")
-async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_db)):
+async def get_user_public_profile(
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Returns a user's public profile information (username, avatar, avatar_color, online status)."""
     uid_str = str(user_id).strip()
     digits = "".join(filter(str.isdigit, uid_str))
@@ -1105,24 +1238,14 @@ async def get_user_public_profile(user_id: str, db: AsyncSession = Depends(get_d
 
 
 async def resolve_user_context(user_opt: Optional[User], db: AsyncSession) -> User:
-    """Resolves authenticated user from token, or falls back to primary user in dev/testing."""
+    """Returns the authenticated user. Unauthenticated callers are rejected rather than mapped to a shared demo account."""
     if user_opt:
         return user_opt
-    stmt = select(User).where(User.id == "+919876543210")
-    res = await db.execute(stmt)
-    u = res.scalars().first()
-    if not u:
-        u = User(
-            id="+919876543210",
-            phone_number="+919876543210",
-            username="Flick User",
-            avatar_color="#FFB800",
-            is_online=True,
-        )
-        db.add(u)
-        await db.commit()
-        await db.refresh(u)
-    return u
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired session. Please log in again.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @app.get("/api/users", response_model=List[ChatContactItem])
@@ -1872,7 +1995,7 @@ async def create_user_meeting(
         end_time=payload.end_time,
         timezone=payload.timezone or "UTC",
         location=payload.location or "",
-        meeting_link=payload.meeting_link or f"https://flick.app/meet/{str(uuid.uuid4())[:8]}",
+        meeting_link=payload.meeting_link or None,
         attendees=attendees_json,
         status=payload.status or "SCHEDULED",
     )
@@ -2202,6 +2325,9 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
 # -----------------------------------------------------------------------------
 # Real-Time WebSocket Gateway
 # -----------------------------------------------------------------------------
+WS_CLOSE_UNAUTHORIZED = 4401  # app-defined close code: the client should log the user out
+
+
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     """
@@ -2214,37 +2340,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     - Status receipts (SENT -> DELIVERED -> READ)
     - Heartbeat keep-alive
     """
-    user_id = user_id.strip()
-    await manager.connect(user_id, websocket)
-
-    # Ensure current user exists in database
+    # Authenticate before registering the socket: the token (?token=<jwt>) must belong to the user in the path.
+    # Without this, anyone could connect as any phone number and read or send that person's messages.
+    token = websocket.query_params.get("token")
     async with async_session_factory() as db:
-        digits = "".join(filter(str.isdigit, user_id))
-        user_stmt = select(User).where(
-            or_(
-                User.id == user_id,
-                User.phone_number == user_id,
-                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-            )
-        )
-        user_res = await db.execute(user_stmt)
-        user_obj = user_res.scalars().first()
-        if not user_obj:
-            user_obj = User(
-                id=user_id,
-                phone_number=user_id,
-                username=f"User {user_id[-4:]}" if len(user_id) >= 4 else f"User {user_id}",
-                avatar_color="#FFB800",
-                is_online=True,
-            )
-            db.add(user_obj)
-            await db.commit()
-        else:
-            user_obj.is_online = True
-            await db.commit()
-        manager.register_aliases(user_id, [user_obj.id, user_obj.phone_number])
-        await manager.refresh_presence(user_id)
+        user_obj = await user_from_token(token, db)
+        if not user_obj or not (
+            same_identity(user_obj.id, user_id) or same_identity(user_obj.phone_number, user_id)
+        ):
+            await websocket.accept()
+            await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Invalid or expired session")
+            return
+        user_id = user_obj.id
+        user_obj.is_online = True
+        await db.commit()
+        alias_ids = [user_obj.id, user_obj.phone_number]
+
+    await manager.connect(user_id, websocket)
+    manager.register_aliases(user_id, alias_ids)
+    await manager.refresh_presence(user_id)
 
     # Flush any unread messages stored while this user was offline
     asyncio.create_task(flush_offline_messages(user_id))
@@ -2464,6 +2578,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 4. REAL-TIME CALL AUDIO CHUNK FORWARDING (Zero-Latency Relay)
             # -----------------------------------------------------------------
             elif frame_type == "call_audio_chunk":
+                data["sender_id"] = user_id
                 target_id = data.get("receiver_id") or data.get("other_user_id") or data.get("caller_id")
                 if target_id and str(target_id) != str(user_id):
                     # Zero-overhead streaming to target user's active socket
@@ -2473,6 +2588,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 5. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
             # -----------------------------------------------------------------
             elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
+                # Frames always carry the socket's own identity, never one the client claims
+                data["sender_id"] = user_id
+                if frame_type == "call_offer":
+                    data["caller_id"] = user_id
+
                 # Determine target recipient for the call frame
                 target_id = data.get("receiver_id")
                 if (not target_id or str(target_id) == str(user_id)) and frame_type != "call_offer":
@@ -2482,7 +2602,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 now_iso = datetime.now(timezone.utc).isoformat()
 
                 if frame_type == "call_offer":
-                    caller_id_val = str(data.get("caller_id", user_id))
+                    caller_id_val = str(user_id)
                     caller_name = data.get("caller_name")
                     caller_avatar_url = data.get("caller_avatar_url")
                     caller_color = data.get("caller_color", "#FFB800")

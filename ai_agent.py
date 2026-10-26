@@ -550,7 +550,7 @@ Example JSON:
             end_time=parsed_end,
             timezone="UTC",
             location=m_info.get("location") or "Pocket Virtual Room",
-            meeting_link="https://pocket.app/meet/" + str(datetime.now().timestamp()).replace(".", "")[-6:],
+            meeting_link=None,
             attendees=json.dumps(m_info.get("attendees") or [current_user.username or "Pocket User"]),
             status="SCHEDULED",
         )
@@ -879,7 +879,7 @@ async def _process_personal_agent_message_raw(
             end_time=meeting_end,
             timezone="UTC",
             location="Pocket Virtual Room",
-            meeting_link="https://pocket.app/meet/" + str(datetime.now().timestamp()).replace(".", "")[-6:],
+            meeting_link=None,
             attendees=json.dumps([current_user.username or "Pocket User"]),
             status="SCHEDULED",
         )
@@ -897,10 +897,10 @@ async def _process_personal_agent_message_raw(
             f"📌 Title: {title}\n"
             f"📅 Date: {date_fmt}\n"
             f"⏰ Time: {start_fmt} - {end_fmt} ({duration_minutes} mins)\n"
-            f"📍 Location: {new_meeting.location}\n"
-            f"🔗 Link: {new_meeting.meeting_link}"
-            f"{conflict_warning}\n\n"
-            f"This meeting is now saved and visible in your Meetings calendar tab."
+            f"📍 Location: {new_meeting.location}"
+            + (f"\n🔗 Link: {new_meeting.meeting_link}" if new_meeting.meeting_link else "")
+            + f"{conflict_warning}\n\n"
+            "This meeting is now saved and visible in your Meetings calendar tab."
         )
 
         return {

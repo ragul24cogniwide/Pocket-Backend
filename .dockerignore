@@ -11,3 +11,11 @@ venv/
 .idea/
 *.log
 scratch/
+
+# Secrets and local data must never be baked into the image
+.env
+.env.*
+*firebase*.json
+*.db
+venv_windows/
+uploads/

@@ -4,8 +4,7 @@ Supports passwordless phone number OTP login and token verification.
 """
 
 import os
-import random
-import string
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import Depends, HTTPException, status
@@ -17,7 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import User
 
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "pocket_super_secret_production_key_2026_jwt_token")
+# The signing secret must come from the environment. A default baked into the
+# source would let anyone who can read the code mint tokens for any user.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "").strip()
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY is not set. Generate one with "
+        "`python -c \"import secrets; print(secrets.token_urlsafe(48))\"` "
+        "and add it to the environment (.env locally, the Render dashboard in production)."
+    )
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "30"))
 
@@ -25,8 +32,8 @@ security_bearer = HTTPBearer(auto_error=False)
 
 
 def generate_otp_code(length: int = 6) -> str:
-    """Generates a random 6-digit numeric OTP."""
-    return "".join(random.choices(string.digits, k=length))
+    """Generates a random numeric OTP using a cryptographically secure source."""
+    return "".join(secrets.choice("0123456789") for _ in range(length))
 
 
 def create_access_token(user_id: str, phone_number: str) -> str:
@@ -42,12 +49,49 @@ def create_access_token(user_id: str, phone_number: str) -> str:
 
 
 def decode_access_token(token: str) -> Optional[dict]:
-    """Decodes and validates a JWT access token."""
+    """Decodes and validates a JWT access token (signature and expiry)."""
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         return payload
     except JWTError:
         return None
+
+
+def same_identity(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two user ids / phone numbers refer to the same person (tolerates +91 vs bare digits)."""
+    if not a or not b:
+        return False
+    a, b = str(a).strip(), str(b).strip()
+    if a == b:
+        return True
+    da = "".join(filter(str.isdigit, a))
+    db_ = "".join(filter(str.isdigit, b))
+    return len(da) >= 10 and len(db_) >= 10 and da[-10:] == db_[-10:]
+
+
+async def _find_user(db: AsyncSession, identifier: str) -> Optional[User]:
+    identifier = str(identifier).strip()
+    digits = "".join(filter(str.isdigit, identifier))
+    conditions = [User.id == identifier, User.phone_number == identifier]
+    if len(digits) >= 10:
+        last10 = digits[-10:]
+        conditions.append(User.phone_number.endswith(last10))
+        conditions.append(User.id.endswith(last10))
+    result = await db.execute(select(User).where(or_(*conditions)))
+    return result.scalars().first()
+
+
+async def user_from_token(token: Optional[str], db: AsyncSession) -> Optional[User]:
+    """Resolves the user a bearer token belongs to, or None if the token is missing, invalid or expired."""
+    if not token:
+        return None
+    payload = decode_access_token(token)
+    if not payload or "sub" not in payload:
+        return None
+    user = await _find_user(db, payload["sub"])
+    if not user and payload.get("phone_number"):
+        user = await _find_user(db, payload["phone_number"])
+    return user
 
 
 async def get_current_user(
@@ -62,38 +106,13 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    payload = decode_access_token(auth.credentials)
-    if not payload or "sub" not in payload:
+    user = await user_from_token(auth.credentials, db)
+    if not user:
+        # 401 (not 404) so clients treat a deleted account the same as an expired session
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token.",
+            detail="Invalid or expired session. Please log in again.",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user_id = str(payload["sub"]).strip()
-    digits = "".join(filter(str.isdigit, user_id))
-    conditions = [User.id == user_id, User.phone_number == user_id]
-    if len(digits) >= 10:
-        last10 = digits[-10:]
-        conditions.append(User.phone_number.endswith(last10))
-        conditions.append(User.id.endswith(last10))
-
-    result = await db.execute(select(User).where(or_(*conditions)))
-    user = result.scalar_one_or_none()
-
-    if not user and payload.get("phone_number"):
-        p = str(payload["phone_number"]).strip()
-        p_digits = "".join(filter(str.isdigit, p))
-        p_conditions = [User.id == p, User.phone_number == p]
-        if len(p_digits) >= 10:
-            p_conditions.append(User.phone_number.endswith(p_digits[-10:]))
-        p_result = await db.execute(select(User).where(or_(*p_conditions)))
-        user = p_result.scalar_one_or_none()
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found in database.",
         )
 
     return user
@@ -103,31 +122,7 @@ async def get_current_user_optional(
     auth: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> Optional[User]:
-    """Optional FastAPI dependency for routes that can accept either JWT or body params."""
+    """Optional FastAPI dependency: returns the user when a valid token is sent, otherwise None."""
     if not auth or not auth.credentials:
         return None
-    payload = decode_access_token(auth.credentials)
-    if not payload or "sub" not in payload:
-        return None
-
-    user_id = str(payload["sub"]).strip()
-    digits = "".join(filter(str.isdigit, user_id))
-    conditions = [User.id == user_id, User.phone_number == user_id]
-    if len(digits) >= 10:
-        last10 = digits[-10:]
-        conditions.append(User.phone_number.endswith(last10))
-        conditions.append(User.id.endswith(last10))
-
-    result = await db.execute(select(User).where(or_(*conditions)))
-    user = result.scalar_one_or_none()
-
-    if not user and payload.get("phone_number"):
-        p = str(payload["phone_number"]).strip()
-        p_digits = "".join(filter(str.isdigit, p))
-        p_conditions = [User.id == p, User.phone_number == p]
-        if len(p_digits) >= 10:
-            p_conditions.append(User.phone_number.endswith(p_digits[-10:]))
-        p_result = await db.execute(select(User).where(or_(*p_conditions)))
-        user = p_result.scalar_one_or_none()
-
-    return user
+    return await user_from_token(auth.credentials, db)
