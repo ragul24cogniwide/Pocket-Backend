@@ -38,6 +38,9 @@ class ConnectionManager:
         self.active_connections: dict[str, WebSocket] = {}
         # Users (and their aliases) who chose "Last seen: Nobody"; presence frames omit their timestamp
         self.last_seen_hidden: set[str] = set()
+        # Users whose app went to the background: shown offline at once, although their socket
+        # stays open a few more seconds (calls, camera picker) before the app closes it
+        self.away: set[str] = set()
         # Background Redis Pub/Sub listener tasks: {user_id: asyncio.Task}
         self._pubsub_tasks: dict[str, asyncio.Task] = {}
         self._presence_listener_task: Optional[asyncio.Task] = None
@@ -143,6 +146,7 @@ class ConnectionManager:
 
         self.active_connections[user_id] = websocket
         aliases = self.register_aliases(user_id, [user_id])
+        self.mark_active(user_id)
 
         # Record presence in Redis and local node
         if self.redis:
@@ -195,6 +199,8 @@ class ConnectionManager:
             del self._pubsub_tasks[user_id]
 
         aliases = self._aliases_for(user_id)
+        self.away.difference_update(aliases or [user_id])
+        self.away.discard(user_id)
         self.user_aliases.pop(user_id, None)
         for alias in aliases:
             if self.id_aliases.get(alias) == user_id:
@@ -348,9 +354,35 @@ class ConnectionManager:
                 pass
         return list(ids)
 
+    @staticmethod
+    def _last10(value: str) -> str:
+        digits = "".join(filter(str.isdigit, str(value or "")))
+        return digits[-10:] if len(digits) >= 10 else ""
+
+    def mark_away(self, user_id: str) -> None:
+        self.away.update(self._aliases_for(user_id) or [user_id])
+        self.away.add(user_id)
+
+    def mark_active(self, user_id: str) -> None:
+        self.away.difference_update(self._aliases_for(user_id) or [user_id])
+        self.away.discard(user_id)
+
+    def is_away(self, *ids: Optional[str]) -> bool:
+        if not self.away:
+            return False
+        away_last10 = {self._last10(a) for a in self.away} - {""}
+        for i in ids:
+            if not i:
+                continue
+            if i in self.away or self.id_aliases.get(i) in self.away:
+                return True
+            if self._last10(i) and self._last10(i) in away_last10:
+                return True
+        return False
+
     async def refresh_presence(self, user_id: str) -> None:
         """Re-asserts Redis membership while a socket is still alive."""
-        if not self.redis or not user_id:
+        if not self.redis or not user_id or self.is_away(user_id):
             return
         aliases = self._aliases_for(user_id)
         try:
@@ -362,6 +394,8 @@ class ConnectionManager:
     async def is_user_online(self, user_id: str, phone_number: Optional[str] = None) -> bool:
         """Checks if a user is currently online on any node with phone digit matching."""
         if not user_id and not phone_number:
+            return False
+        if self.is_away(user_id, phone_number):
             return False
         if user_id and self._find_local_ws(user_id):
             return True

@@ -31,7 +31,7 @@ from auth import (
     same_identity,
     user_from_token,
 )
-from connection_manager import manager
+from connection_manager import manager, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
 from database import async_session_factory, get_db, init_db
 from models import Message, MessageStatus, OtpRecord, User, Status, Meeting
 from notifications import send_push_notification
@@ -2417,6 +2417,9 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
 # Real-Time WebSocket Gateway
 # -----------------------------------------------------------------------------
 WS_CLOSE_UNAUTHORIZED = 4401  # app-defined close code: the client should log the user out
+# The app pings every 10s. Silence this long means the phone is gone (lost signal, switched
+# networks) even if TCP hasn't noticed yet, so mark it offline now instead of minutes later.
+WS_IDLE_TIMEOUT_SECONDS = 25
 
 
 @app.websocket("/ws/{user_id}")
@@ -2463,7 +2466,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     try:
         while True:
-            raw_data = await websocket.receive_text()
+            try:
+                raw_data = await asyncio.wait_for(websocket.receive_text(), timeout=WS_IDLE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.info("No frames from %s for %ss, treating as disconnected", user_id, WS_IDLE_TIMEOUT_SECONDS)
+                try:
+                    await websocket.close(code=1001)
+                except Exception:
+                    pass
+                raise WebSocketDisconnect(code=1001)
             try:
                 payload = json.loads(raw_data)
             except json.JSONDecodeError:
@@ -2899,6 +2910,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         .values(is_online=True)
                     )
                     await db.commit()
+                manager.mark_active(user_id)
                 await manager.refresh_presence(user_id)
                 await manager.broadcast_presence(user_id, is_online=True)
 
@@ -2911,6 +2923,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         .values(is_online=False, last_seen=now_utc)
                     )
                     await db.commit()
+                manager.mark_away(user_id)
+                if manager.redis:
+                    try:
+                        await manager.redis.srem(REDIS_PRESENCE_KEY_FOR_AWAY, *[a for a in alias_ids if a])
+                    except Exception:
+                        pass
                 await manager.broadcast_presence(user_id, is_online=False, last_seen=now_utc.isoformat())
 
             elif frame_type == "query_presence":
