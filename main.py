@@ -2931,6 +2931,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         pass
                 await manager.broadcast_presence(user_id, is_online=False, last_seen=now_utc.isoformat())
 
+            elif frame_type == "query_online_snapshot":
+                # The chat list re-syncs all green dots at once (on open, and as a periodic safety net)
+                await manager.send_online_snapshot(websocket)
+
             elif frame_type == "query_presence":
                 target_id = data.get("user_id")
                 if target_id:

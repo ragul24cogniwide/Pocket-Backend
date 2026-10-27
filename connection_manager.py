@@ -352,7 +352,14 @@ class ConnectionManager:
                 ids.update(str(m) for m in members)
             except Exception:
                 pass
-        return list(ids)
+        # Backgrounded apps still have a socket for a few seconds but count as offline
+        return [i for i in ids if not self.is_away(i)]
+
+    async def send_online_snapshot(self, websocket: WebSocket) -> None:
+        await websocket.send_text(json.dumps({
+            "type": "online_users_snapshot",
+            "data": {"online_user_ids": await self.get_online_user_ids()},
+        }))
 
     @staticmethod
     def _last10(value: str) -> str:
