@@ -50,6 +50,7 @@ from schemas import (
     SyncContactsRequest,
     SyncContactsResponse,
     UpdateFcmTokenRequest,
+    UpdatePreferencesRequest,
     UpdateProfileRequest,
     UserProfileResponse,
     VerifyOtpRequest,
@@ -134,6 +135,16 @@ async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
     return False
 
 
+async def find_client_message(db: AsyncSession, sender_id: str, client_msg_id: Optional[str]) -> Optional[Message]:
+    """Message this sender already stored under the app-generated id, if any (a retried send)."""
+    if not client_msg_id:
+        return None
+    res = await db.execute(
+        select(Message).where(Message.sender_id == sender_id, Message.client_msg_id == client_msg_id)
+    )
+    return res.scalars().first()
+
+
 async def dispatch_push_to_user(
     sender_id: str,
     receiver_id: str,
@@ -180,6 +191,17 @@ async def dispatch_push_to_user(
             sender_user = s_res.scalars().first()
 
             if rec_user and rec_user.fcm_token:
+                prefs = rec_user.prefs()
+                is_call_push = (data_payload or {}).get("type") in (
+                    "incoming_call", "call_answered", "call_rejected", "call_ended",
+                )
+                # Calls always ring; message pushes follow the receiver's notification settings
+                if not is_call_push:
+                    if not prefs.get("msg_notifications", True):
+                        logger.info("[Push] Skipped for %s: message notifications are off", receiver_id)
+                        return
+                    if not prefs.get("preview", True):
+                        content = "New message"
                 sender_title = (
                     sender_user.username
                     if sender_user
@@ -195,6 +217,7 @@ async def dispatch_push_to_user(
                     sender_name=sender_title,
                     content=content,
                     data_payload=payload_dict,
+                    silent=not is_call_push and not prefs.get("sound", True),
                 )
             else:
                 logger.info("[Push] User %s has no active FCM token registered (rec_user=%s)", receiver_id, rec_user is not None)
@@ -1063,6 +1086,29 @@ async def update_fcm_token(
     return {"message": "FCM token updated successfully"}
 
 
+@app.put("/api/users/preferences")
+async def update_my_preferences(
+    payload: UpdatePreferencesRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Saves the privacy / notification settings the server enforces for other users."""
+    prefs = current_user.prefs()
+    updates = payload.model_dump(exclude_none=True)
+    if "last_seen" in updates and updates["last_seen"] not in ("everyone", "nobody"):
+        raise HTTPException(status_code=400, detail="last_seen must be 'everyone' or 'nobody'")
+    prefs.update(updates)
+    current_user.preferences = json.dumps(prefs)
+    await db.commit()
+
+    aliases = [a for a in (current_user.id, current_user.phone_number) if a]
+    if prefs["last_seen"] == "nobody":
+        manager.last_seen_hidden.update(aliases)
+    else:
+        manager.last_seen_hidden.difference_update(aliases)
+    return prefs
+
+
 
 # -----------------------------------------------------------------------------
 # Status & Stories Endpoints (24-Hour Ephemeral Status)
@@ -1233,7 +1279,7 @@ async def get_user_public_profile(
         "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "FK",
         "quote": user.quote or "Hey there! I am using Flick.",
         "is_online": is_online,
-        "last_seen": user.last_seen.isoformat() if user.last_seen else None,
+        "last_seen": user.visible_last_seen(),
     }
 
 
@@ -1273,8 +1319,8 @@ async def list_available_contacts(
     cur_ids = {str(x) for x in cur_ids if x}
 
     for u in users:
-        # Avoid duplicate contacts pointing to same user
-        norm_key = u.username.lower().strip()
+        # Avoid duplicate contacts pointing to the same account (two people can share a display name)
+        norm_key = str(u.id)
         if norm_key in seen_identifiers:
             continue
         seen_identifiers.add(norm_key)
@@ -1347,7 +1393,7 @@ async def list_available_contacts(
                         else ""
                     ),
                     unread=unread_count,
-                    last_seen=u.last_seen.isoformat() if u.last_seen else None,
+                    last_seen=u.visible_last_seen(),
                 )
             )
         )
@@ -1478,7 +1524,7 @@ async def sync_device_contacts(
                 last_message=u.quote or "Available on Flick",
                 time="",
                 unread=0,
-                last_seen=u.last_seen.isoformat() if u.last_seen else None,
+                last_seen=u.visible_last_seen(),
             )
         )
 
@@ -1568,7 +1614,13 @@ async def get_messages_with_user(
     result = await db.execute(stmt)
     messages = result.scalars().all()
     ordered_messages = list(reversed(messages))
-    return [msg.to_dict() for msg in ordered_messages]
+    out = [msg.to_dict() for msg in ordered_messages]
+    # If the other person turned read receipts off, my sent messages show as delivered, not read
+    if o_user is not None and not o_user.prefs().get("read_receipts", True):
+        for m in out:
+            if m.get("sender_id") in cur_ids and str(m.get("status", "")).upper() == "READ":
+                m["status"] = "DELIVERED"
+    return out
 
 
 @app.post("/api/messages/send")
@@ -1581,6 +1633,18 @@ async def send_message_rest(
     receiver_id = payload.receiver_id
     content = payload.content.strip()
     client_temp_id = payload.temp_msg_id or f"temp_{int(datetime.now().timestamp() * 1000)}"
+
+    # A retry of a send that already reached us (e.g. the response was lost on a slow network)
+    existing = await find_client_message(db, current_user.id, payload.temp_msg_id)
+    if existing is not None:
+        existing_dict = existing.to_dict()
+        return {
+            "status": "success",
+            "duplicate": True,
+            "temp_msg_id": client_temp_id,
+            "message_id": existing_dict["message_id"],
+            **existing_dict,
+        }
 
     rec_stmt = select(User).where(User.id == receiver_id)
     rec_res = await db.execute(rec_stmt)
@@ -1608,6 +1672,7 @@ async def send_message_rest(
         timestamp=now,
         status=initial_status,
         delivered_at=now if is_rec_online else None,
+        client_msg_id=payload.temp_msg_id,
     )
     db.add(new_msg)
     await db.commit()
@@ -2135,18 +2200,43 @@ async def chat_with_agent_endpoint(
     current_user = await resolve_user_context(user_opt, db)
     await ensure_personal_agent_user(db)
 
+    # A retried question we already answered: return the stored reply instead of
+    # asking the AI again (which could, for example, book the same meeting twice)
+    previous = await find_client_message(db, current_user.id, payload.client_msg_id)
+    if previous is not None:
+        answered = await find_client_message(db, AGENT_USER_ID, f"reply:{payload.client_msg_id}")
+        if answered is not None:
+            meta = (answered.to_dict().get("metadata") or {})
+            return {
+                "reply": answered.content,
+                "action": meta.get("action"),
+                "meeting": meta.get("meeting"),
+                "meetings": meta.get("meetings"),
+                "suggested_actions": meta.get("suggested_actions"),
+                "user_message_id": previous.id,
+                "message_id": answered.id,
+                "timestamp": answered.timestamp.isoformat() if answered.timestamp else None,
+            }
+
     # 1. Save user query message to persistent database
     now = datetime.now(timezone.utc)
-    user_msg = Message(
-        sender_id=current_user.id,
-        receiver_id=AGENT_USER_ID,
-        content=payload.content,
-        timestamp=now,
-        status=MessageStatus.READ,
-        delivered_at=now,
-        read_at=now,
-    )
-    db.add(user_msg)
+    if previous is not None:
+        user_msg = previous  # stored earlier but never answered: answer it now, don't duplicate it
+    else:
+        user_msg = Message(
+            sender_id=current_user.id,
+            receiver_id=AGENT_USER_ID,
+            content=payload.content,
+            timestamp=now,
+            status=MessageStatus.READ,
+            delivered_at=now,
+            read_at=now,
+            client_msg_id=payload.client_msg_id,
+        )
+        db.add(user_msg)
+        if payload.client_msg_id:
+            # Commit the question first so a retry that arrives mid-processing sees it
+            await db.commit()
 
     # 2. Process query via Personal AI Agent engine
     res = await process_personal_agent_message(
@@ -2173,6 +2263,7 @@ async def chat_with_agent_endpoint(
         status=MessageStatus.READ,
         delivered_at=now,
         read_at=now,
+        client_msg_id=f"reply:{payload.client_msg_id}" if payload.client_msg_id else None,
     )
     db.add(agent_msg)
     await db.commit()
@@ -2340,9 +2431,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     - Status receipts (SENT -> DELIVERED -> READ)
     - Heartbeat keep-alive
     """
-    # Authenticate before registering the socket: the token (?token=<jwt>) must belong to the user in the path.
+    # Authenticate before registering the socket: the token must belong to the user in the path.
     # Without this, anyone could connect as any phone number and read or send that person's messages.
-    token = websocket.query_params.get("token")
+    # The app sends it as "Authorization: Bearer <jwt>" so it never appears in URL access logs;
+    # ?token=<jwt> is accepted for clients that can't set headers (e.g. browsers).
+    auth_header = websocket.headers.get("authorization", "")
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else websocket.query_params.get("token")
     async with async_session_factory() as db:
         user_obj = await user_from_token(token, db)
         if not user_obj or not (
@@ -2355,6 +2449,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         user_obj.is_online = True
         await db.commit()
         alias_ids = [user_obj.id, user_obj.phone_number]
+        if user_obj.prefs().get("last_seen") == "nobody":
+            manager.last_seen_hidden.update(a for a in alias_ids if a)
+        else:
+            manager.last_seen_hidden.difference_update(alias_ids)
 
     await manager.connect(user_id, websocket)
     manager.register_aliases(user_id, alias_ids)
@@ -2381,9 +2479,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             if frame_type in ("send_message", "chat_message"):
                 receiver_id = data.get("receiver_id")
                 content = (data.get("content") or "").strip()
-                client_temp_id = data.get("temp_msg_id") or data.get("temp_id") or f"temp_{int(datetime.now(timezone.utc).timestamp()*1000)}"
+                client_msg_id = data.get("temp_msg_id") or data.get("temp_id")
+                client_temp_id = client_msg_id or f"temp_{int(datetime.now(timezone.utc).timestamp()*1000)}"
 
                 if not receiver_id or not content:
+                    continue
+
+                async with async_session_factory() as db:
+                    # The app re-sends queued messages after reconnecting; if this one already
+                    # arrived, just confirm it again instead of storing and forwarding a duplicate
+                    existing = await find_client_message(db, user_id, client_msg_id)
+                if existing is not None:
+                    dup = existing.to_dict()
+                    await websocket.send_text(json.dumps({
+                        "type": "ack_sent",
+                        "data": {
+                            "temp_id": client_temp_id,
+                            "temp_msg_id": client_temp_id,
+                            "message_id": dup["message_id"],
+                            "timestamp": dup["timestamp"],
+                            "status": dup["status"],
+                            "duplicate": True,
+                        },
+                    }))
                     continue
 
                 async with async_session_factory() as db:
@@ -2434,6 +2552,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         timestamp=now,
                         status=initial_status,
                         delivered_at=now if is_rec_online else None,
+                        client_msg_id=client_msg_id,
                     )
                     db.add(new_msg)
                     await db.commit()
@@ -2564,6 +2683,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         except Exception as sync_err:
                             logger.warning("Failed to record conversation change for mark_read: %s", sync_err)
 
+                        reader = await db.get(User, user_id)
+                        receipts_on = reader.prefs().get("read_receipts", True) if reader else True
+
+                    # Messages still count as read for me; the sender is only told if I share read receipts
+                    if not receipts_on:
+                        continue
                     ack_read_frame = {
                         "type": "ack_read",
                         "data": {
@@ -2807,8 +2932,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         target_user = t_res.scalars().first()
                         if target_user:
                             is_target_online = await manager.is_user_online(target_user.id, target_user.phone_number)
-                            if target_user.last_seen:
-                                target_last_seen = target_user.last_seen.isoformat()
+                            target_last_seen = target_user.visible_last_seen()
                         else:
                             is_target_online = await manager.is_user_online(target_id)
                     try:

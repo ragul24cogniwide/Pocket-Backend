@@ -36,6 +36,8 @@ class ConnectionManager:
         self.node_id = str(uuid.uuid4())
         # Local active connections on this server node: {user_id: WebSocket}
         self.active_connections: dict[str, WebSocket] = {}
+        # Users (and their aliases) who chose "Last seen: Nobody"; presence frames omit their timestamp
+        self.last_seen_hidden: set[str] = set()
         # Background Redis Pub/Sub listener tasks: {user_id: asyncio.Task}
         self._pubsub_tasks: dict[str, asyncio.Task] = {}
         self._presence_listener_task: Optional[asyncio.Task] = None
@@ -459,13 +461,14 @@ class ConnectionManager:
         """Notifies all connected clients about user presence change."""
         now_iso = datetime.now(timezone.utc).isoformat()
         alias_list = aliases or self._aliases_for(user_id)
+        hide_last_seen = user_id in self.last_seen_hidden or any(a in self.last_seen_hidden for a in alias_list or [])
         frame = {
             "type": "presence_update",
             "data": {
                 "user_id": user_id,
                 "aliases": alias_list,
                 "is_online": is_online,
-                "last_seen": last_seen or (now_iso if not is_online else None),
+                "last_seen": None if hide_last_seen else (last_seen or (now_iso if not is_online else None)),
                 "timestamp": now_iso,
             },
         }

@@ -23,7 +23,7 @@ class SendOtpResponse(BaseModel):
 class VerifyOtpRequest(BaseModel):
     phone_number: str
     otp_code: str
-    username: Optional[str] = "Flick User"
+    username: Optional[str] = None
 
 
 class AuthResponse(BaseModel):
@@ -53,6 +53,14 @@ class UpdateProfileRequest(BaseModel):
     fcm_token: Optional[str] = None
     user_id: Optional[str] = None
     phone_number: Optional[str] = None
+
+
+class UpdatePreferencesRequest(BaseModel):
+    last_seen: Optional[str] = None  # 'everyone' | 'nobody'
+    read_receipts: Optional[bool] = None
+    msg_notifications: Optional[bool] = None
+    preview: Optional[bool] = None
+    sound: Optional[bool] = None
 
 
 class UpdateFcmTokenRequest(BaseModel):
@@ -202,6 +210,7 @@ class CheckConflictRequest(BaseModel):
 class AgentChatRequest(BaseModel):
     content: str
     client_tz_offset_minutes: Optional[int] = 0
+    client_msg_id: Optional[str] = None  # retries with the same id return the original reply
     conversation_id: Optional[str] = None
 
 

@@ -20,6 +20,16 @@ class MessageStatus(str, enum.Enum):
     READ = "READ"
 
 
+# Settings other users are affected by, so the server has to enforce them
+DEFAULT_USER_PREFS = {
+    "last_seen": "everyone",  # 'everyone' | 'nobody'
+    "read_receipts": True,
+    "msg_notifications": True,
+    "preview": True,
+    "sound": True,
+}
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -42,6 +52,10 @@ class User(Base):
         String(255), nullable=True, default="Hey there! I am using Flick."
     )
     fcm_token: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None
+    )
+    # JSON privacy / notification settings (see privacy_prefs in main.py)
+    preferences: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, default=None
     )
     is_online: Mapped[bool] = mapped_column(
@@ -72,6 +86,20 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    def prefs(self) -> dict:
+        """Privacy / notification settings with defaults filled in."""
+        try:
+            saved = json.loads(self.preferences) if self.preferences else {}
+        except (TypeError, ValueError):
+            saved = {}
+        return {**DEFAULT_USER_PREFS, **(saved if isinstance(saved, dict) else {})}
+
+    def visible_last_seen(self) -> Optional[str]:
+        """Last-seen timestamp as other people may see it (None when the user hides it)."""
+        if self.prefs().get("last_seen") == "nobody" or not self.last_seen:
+            return None
+        return self.last_seen.isoformat()
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -81,7 +109,7 @@ class User(Base):
             "avatar_url": self.avatar_url,
             "quote": self.quote or "Hey there! I am using Flick.",
             "is_online": self.is_online,
-            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+            "last_seen": self.visible_last_seen(),
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -152,6 +180,10 @@ class Message(Base):
     read_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Id the app generated for this message; makes retries over a flaky network idempotent
+    client_msg_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
 
     # Relationships
     sender: Mapped["User"] = relationship(
@@ -191,6 +223,7 @@ class Message(Base):
             "is_edited": self.is_edited or False,
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "read_at": self.read_at.isoformat() if self.read_at else None,
+            "client_msg_id": self.client_msg_id,
         }
 
 

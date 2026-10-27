@@ -112,6 +112,9 @@ async def init_db() -> None:
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT FALSE;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP WITH TIME ZONE;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP WITH TIME ZONE;",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences TEXT;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(64);",
+                    "CREATE INDEX IF NOT EXISTS ix_messages_client_msg_id ON messages (client_msg_id);",
                 ]:
                     try:
                         await conn.execute(text(ddl))
@@ -125,6 +128,10 @@ async def init_db() -> None:
                 db_logger.error("Failed to initialize database tables after %d attempts: %s", max_retries, e)
                 raise
             await asyncio.sleep(2)
+
+    # Demo contacts are for local testing only: in production every real user would see them
+    if os.getenv("SEED_DEMO_USERS", "false").lower() != "true":
+        return
 
     # Seed default mock/demo contacts so chatting with any ID never throws Foreign Key errors
     async with async_session_factory() as session:

@@ -71,6 +71,7 @@ async def send_push_notification(
     sender_name: str,
     content: str,
     data_payload: Optional[dict] = None,
+    silent: bool = False,
 ) -> bool:
     """
     Sends a high-priority push notification to an offline user via FCM.
@@ -103,10 +104,10 @@ async def send_push_notification(
                 priority="high",
                 ttl=timedelta(seconds=60) if is_call else timedelta(days=1),
                 notification=messaging.AndroidNotification(
-                    sound="default",
+                    sound=None if silent else "default",
                     channel_id=channel_id,
                     priority="max" if is_call else "high",
-                    default_sound=True,
+                    default_sound=not silent,
                     default_vibrate_timings=True,
                     visibility="public" if is_call else "private",
                     sticky=True if is_call else False,
@@ -119,7 +120,7 @@ async def send_push_notification(
                 },
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
-                        sound="default",
+                        sound=None if silent else "default",
                         badge=1,
                         content_available=True,
                     )
