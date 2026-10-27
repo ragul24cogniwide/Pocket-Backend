@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, func, or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import ConversationChangeLog, Message, User, UserSyncSequence
+from models import ConversationChangeLog, Message, User, UserSyncSequence, iso_utc
 from schemas import ChatContactItem, SyncConversationsResponse
 
 logger = logging.getLogger("SyncService")
@@ -112,7 +112,7 @@ async def build_conversation_snapshot(
             "quote": AGENT_QUOTE,
             "online": False,  # Volatile presence is WebSocket-only
             "last_message": latest_agent_msg.content if latest_agent_msg else "Your personal AI agent is ready. Ask me anything!",
-            "time": latest_agent_msg.timestamp.strftime("%I:%M %p") if latest_agent_msg and latest_agent_msg.timestamp else "",
+            "time": iso_utc(latest_agent_msg.timestamp) if latest_agent_msg and latest_agent_msg.timestamp else "",
             "unread": 0,
             "last_seen": None,
             "version": version,
@@ -189,7 +189,7 @@ async def build_conversation_snapshot(
         "quote": peer.quote or "Hey there! I am using Flick.",
         "online": False,  # Client maintains in-memory presence over WebSocket
         "last_message": latest_msg.content if latest_msg else (peer.quote or "Tap to start conversation"),
-        "time": latest_msg.timestamp.strftime("%I:%M %p") if latest_msg and latest_msg.timestamp else "",
+        "time": iso_utc(latest_msg.timestamp) if latest_msg and latest_msg.timestamp else "",
         "unread": unread_count,
         "last_seen": None,
         "version": version,
@@ -259,19 +259,34 @@ async def record_profile_change_for_contacts(db: AsyncSession, updated_user: Use
 async def build_all_conversations_for_user(
     db: AsyncSession, current_user: User, base_version: int = 1
 ) -> List[dict]:
-    """Generates the full list of active conversations for current_user."""
-    stmt = select(User).where(User.id != current_user.id).order_by(User.username.asc())
-    result = await db.execute(stmt)
-    users = result.scalars().all()
+    """
+    Generates the full list of conversations for current_user: only people they have actually
+    exchanged messages with (like any chat app), not every registered user.
+    """
+    my_ids = {i for i in (current_user.id, current_user.phone_number) if i}
+    pair_rows = await db.execute(
+        select(Message.sender_id, Message.receiver_id).where(
+            or_(Message.sender_id.in_(my_ids), Message.receiver_id.in_(my_ids))
+        )
+    )
+    peer_ids = {p for row in pair_rows.all() for p in row if p and p not in my_ids and p != AGENT_USER_ID}
+    if not peer_ids:
+        users = []
+    else:
+        stmt = (
+            select(User)
+            .where(or_(User.id.in_(peer_ids), User.phone_number.in_(peer_ids)), User.id != current_user.id)
+            .order_by(User.username.asc())
+        )
+        users = (await db.execute(stmt)).scalars().all()
 
     conversations = []
     seen_identifiers = set()
 
     for u in users:
-        norm_key = u.username.lower().strip()
-        if norm_key in seen_identifiers:
+        if u.id in seen_identifiers:
             continue
-        seen_identifiers.add(norm_key)
+        seen_identifiers.add(u.id)
 
         snap = await build_conversation_snapshot(db, current_user.id, u.id, version=base_version)
         if snap:
@@ -298,6 +313,24 @@ async def get_conversation_sync_page(
     if cursor_version is None or cursor_version < 0:
         logger.info("Sync for %s: missing or invalid cursor -> full sync", current_user.id)
         curr_ver = await get_user_current_version(db, current_user.id)
+        all_convs = await build_all_conversations_for_user(db, current_user, base_version=curr_ver)
+        return {
+            "cursor": encode_cursor(curr_ver),
+            "has_more": False,
+            "full_sync": True,
+            "created": all_convs,
+            "updated": [],
+            "deleted": [],
+        }
+
+    # 1b. Cursor from a "future" the server doesn't know: the sync history was reset or wiped
+    #     (e.g. database restored or tables cleared). The client must replace its cache.
+    curr_ver = await get_user_current_version(db, current_user.id)
+    if cursor_version > curr_ver:
+        logger.info(
+            "Sync for %s: cursor v%s is ahead of server v%s (history reset) -> full sync",
+            current_user.id, cursor_version, curr_ver,
+        )
         all_convs = await build_all_conversations_for_user(db, current_user, base_version=curr_ver)
         return {
             "cursor": encode_cursor(curr_ver),

@@ -89,6 +89,22 @@ def get_user_current_time(tz_offset_minutes: int = 0) -> datetime:
     return utc_now + local_offset
 
 
+# Meetings are stored in UTC. Users speak and read in their own local time, so convert
+# at the edges. tz_offset_minutes is JavaScript's getTimezoneOffset() (UTC - local; IST = -330).
+def to_user_local(dt: Optional[datetime], tz_offset_minutes: int) -> Optional[datetime]:
+    """UTC datetime -> the user's local wall-clock time (for anything shown to the user)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone(timedelta(minutes=-tz_offset_minutes)))
+
+
+def local_to_utc(local_wall: datetime, tz_offset_minutes: int) -> datetime:
+    """A wall-clock time the user means in their timezone -> UTC (for storing/querying)."""
+    return (local_wall.replace(tzinfo=None) + timedelta(minutes=tz_offset_minutes)).replace(tzinfo=timezone.utc)
+
+
 def parse_date_string(text: str, user_now: datetime) -> Optional[date]:
     """Extracts target date from natural language relative terms or dates."""
     lowered = text.lower()
@@ -335,7 +351,7 @@ async def call_gemini_agent(
         meetings_context = []
         for m in existing_meetings:
             meetings_context.append(
-                f"- ID: {m.id} | Title: '{m.title}' | Start: {m.start_time.isoformat()} ({m.start_time.strftime('%a %b %d, %I:%M %p')}) | Duration: {m.duration_minutes}m | Location: {m.location or 'Online'}"
+                f"- ID: {m.id} | Title: '{m.title}' | Start: {to_user_local(m.start_time, tz_offset_minutes).isoformat()} ({to_user_local(m.start_time, tz_offset_minutes).strftime('%a %b %d, %I:%M %p')} local) | Duration: {m.duration_minutes}m | Location: {m.location or 'Online'}"
             )
         if meetings_context:
             meetings_ctx_str = "\n".join(meetings_context)
@@ -364,7 +380,7 @@ async def call_gemini_agent(
         msgs_context = []
         for rm in recent_msgs:
             sender_lbl = "You" if rm.sender_id == current_user.id else f"Contact ({rm.sender_id[-4:] if len(rm.sender_id)>=4 else rm.sender_id})"
-            msgs_context.append(f"[{rm.timestamp.strftime('%I:%M %p')}] {sender_lbl}: {rm.content}")
+            msgs_context.append(f"[{to_user_local(rm.timestamp, tz_offset_minutes).strftime('%I:%M %p')}] {sender_lbl}: {rm.content}")
         if msgs_context:
             msgs_ctx_str = "\n".join(msgs_context)
     except Exception as e:
@@ -780,8 +796,8 @@ async def _process_personal_agent_message_raw(
         day_label = "today" if is_today else ("tomorrow" if is_tomorrow else target_date.strftime("%A, %b %d"))
 
         # Query meetings for this user on target_date
-        day_start = datetime.combine(target_date, time.min).replace(tzinfo=timezone.utc)
-        day_end = datetime.combine(target_date, time.max).replace(tzinfo=timezone.utc)
+        day_start = local_to_utc(datetime.combine(target_date, time.min), tz_offset_minutes)
+        day_end = local_to_utc(datetime.combine(target_date, time.max), tz_offset_minutes)
 
         stmt = (
             select(Meeting)
@@ -807,8 +823,8 @@ async def _process_personal_agent_message_raw(
 
         lines = [f"📅 Here is your schedule for {day_label} ({len(meetings)} meeting{'s' if len(meetings) > 1 else ''}):\n"]
         for idx, m in enumerate(meetings, 1):
-            time_str = m.start_time.strftime("%I:%M %p")
-            end_time_str = m.end_time.strftime("%I:%M %p")
+            time_str = to_user_local(m.start_time, tz_offset_minutes).strftime("%I:%M %p")
+            end_time_str = to_user_local(m.end_time, tz_offset_minutes).strftime("%I:%M %p")
             lines.append(f"• {m.title}\n  ⏰ {time_str} - {end_time_str} ({m.duration_minutes}m)")
             if m.location:
                 lines.append(f"  📍 Location: {m.location}")
@@ -860,14 +876,14 @@ async def _process_personal_agent_message_raw(
         title = extract_meeting_title(raw_text)
 
         # Build start_time and end_time
-        meeting_start = datetime.combine(target_date, time(h, mn)).replace(tzinfo=timezone.utc)
+        meeting_start = local_to_utc(datetime.combine(target_date, time(h, mn)), tz_offset_minutes)
         meeting_end = meeting_start + timedelta(minutes=duration_minutes)
 
         # Check for conflicts
         conflicts = await check_meeting_conflicts(db, current_user.id, meeting_start, meeting_end)
         conflict_warning = ""
         if conflicts:
-            conflict_names = ", ".join(f"'{c.title}' ({c.start_time.strftime('%I:%M %p')})" for c in conflicts)
+            conflict_names = ", ".join(f"'{c.title}' ({to_user_local(c.start_time, tz_offset_minutes).strftime('%I:%M %p')})" for c in conflicts)
             conflict_warning = f"\n\n⚠️ Notice: You already have an overlapping meeting: {conflict_names}. I've saved this event, but please review your schedule!"
 
         # Create real Meeting record in database
@@ -888,8 +904,8 @@ async def _process_personal_agent_message_raw(
         await db.refresh(new_meeting)
 
         m_dict = new_meeting.to_dict()
-        start_fmt = meeting_start.strftime("%I:%M %p")
-        end_fmt = meeting_end.strftime("%I:%M %p")
+        start_fmt = to_user_local(meeting_start, tz_offset_minutes).strftime("%I:%M %p")
+        end_fmt = to_user_local(meeting_end, tz_offset_minutes).strftime("%I:%M %p")
         date_fmt = target_date.strftime("%A, %B %d, %Y")
 
         reply_msg = (
@@ -963,13 +979,14 @@ async def _process_personal_agent_message_raw(
                 break
 
         # Apply updates
-        target_dt = target_meeting.start_time
+        local_dt = to_user_local(target_meeting.start_time, tz_offset_minutes)
         duration = target_meeting.duration_minutes or 30
         if new_date:
-            target_dt = datetime.combine(new_date, target_dt.time()).replace(tzinfo=timezone.utc)
+            local_dt = datetime.combine(new_date, local_dt.time())
         if new_time_tuple:
             nh, nm = new_time_tuple
-            target_dt = datetime.combine(target_dt.date(), time(nh, nm)).replace(tzinfo=timezone.utc)
+            local_dt = datetime.combine(local_dt.date(), time(nh, nm))
+        target_dt = local_to_utc(local_dt, tz_offset_minutes)
 
         target_meeting.start_time = target_dt
         target_meeting.end_time = target_dt + timedelta(minutes=duration)
@@ -982,8 +999,8 @@ async def _process_personal_agent_message_raw(
             "reply": (
                 f"🔄 Meeting Rescheduled!\n\n"
                 f"📌 Title: {target_meeting.title}\n"
-                f"📅 New Date: {target_dt.strftime('%A, %b %d, %Y')}\n"
-                f"⏰ New Time: {target_meeting.start_time.strftime('%I:%M %p')} - {target_meeting.end_time.strftime('%I:%M %p')}\n\n"
+                f"📅 New Date: {to_user_local(target_dt, tz_offset_minutes).strftime('%A, %b %d, %Y')}\n"
+                f"⏰ New Time: {to_user_local(target_meeting.start_time, tz_offset_minutes).strftime('%I:%M %p')} - {to_user_local(target_meeting.end_time, tz_offset_minutes).strftime('%I:%M %p')}\n\n"
                 f"The update is confirmed and synced to your calendar."
             ),
             "action": "meeting_updated",
@@ -1034,7 +1051,7 @@ async def _process_personal_agent_message_raw(
         await db.commit()
 
         return {
-            "reply": f"🗑️ The meeting '{target_meeting.title}' scheduled for {target_meeting.start_time.strftime('%b %d at %I:%M %p')} has been cancelled.",
+            "reply": f"🗑️ The meeting '{target_meeting.title}' scheduled for {to_user_local(target_meeting.start_time, tz_offset_minutes).strftime('%b %d at %I:%M %p')} has been cancelled.",
             "action": "meeting_cancelled",
             "meeting": target_meeting.to_dict(),
             "meetings": [],
@@ -1093,8 +1110,8 @@ async def _process_personal_agent_message_raw(
     # -------------------------------------------------------------------------
     if "suitable time" in lowered or "free time" in lowered or "available slot" in lowered:
         target_date = parse_date_string(lowered, user_now) or user_now.date()
-        day_start = datetime.combine(target_date, time(9, 0)).replace(tzinfo=timezone.utc) # 9 AM
-        day_end = datetime.combine(target_date, time(18, 0)).replace(tzinfo=timezone.utc) # 6 PM
+        day_start = local_to_utc(datetime.combine(target_date, time(9, 0)), tz_offset_minutes)  # 9 AM local
+        day_end = local_to_utc(datetime.combine(target_date, time(18, 0)), tz_offset_minutes)  # 6 PM local
 
         stmt = (
             select(Meeting)
@@ -1110,7 +1127,7 @@ async def _process_personal_agent_message_raw(
         day_meetings = list(res.scalars().all())
 
         slots = ["10:00 AM", "02:00 PM", "04:00 PM", "05:00 PM"]
-        taken_hours = {m.start_time.hour for m in day_meetings}
+        taken_hours = {to_user_local(m.start_time, tz_offset_minutes).hour for m in day_meetings}
         available_slots = [s for s in slots if (10 if "10" in s else (14 if "02" in s else (16 if "04" in s else 17))) not in taken_hours]
 
         date_lbl = target_date.strftime("%A, %b %d")

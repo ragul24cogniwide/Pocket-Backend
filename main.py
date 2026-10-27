@@ -33,7 +33,7 @@ from auth import (
 )
 from connection_manager import manager, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
 from database import async_session_factory, get_db, init_db
-from models import Message, MessageStatus, OtpRecord, User, Status, Meeting
+from models import Message, MessageStatus, OtpRecord, User, Status, Meeting, iso_utc
 from notifications import send_push_notification
 from schemas import (
     AuthResponse,
@@ -1011,7 +1011,7 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
         avatar_url=current_user.avatar_url,
         quote=current_user.quote or "Hey there! I am using Flick.",
         is_online=current_user.is_online,
-        last_seen=current_user.last_seen.isoformat() if current_user.last_seen else None,
+        last_seen=iso_utc(current_user.last_seen),
     )
 
 
@@ -1057,7 +1057,7 @@ async def update_user_profile(
             avatar_url=target_user.avatar_url,
             quote=target_user.quote or "Hey there! I am using Flick.",
             is_online=target_user.is_online,
-            last_seen=target_user.last_seen.isoformat() if target_user.last_seen else None,
+            last_seen=iso_utc(target_user.last_seen),
         )
     except HTTPException:
         raise
@@ -1138,13 +1138,23 @@ async def create_status(
     new_status.user = current_user
     st_dict = new_status.to_dict()
 
-    # Real-time WebSocket broadcast to all connected contacts
-    asyncio.create_task(
-        manager.broadcast({
-            "type": "status_update",
-            "data": st_dict,
-        })
+    # Live update for the people this user chats with (the ones who can see it in Updates)
+    peer_rows = await db.execute(
+        select(Message.sender_id, Message.receiver_id).where(
+            or_(Message.sender_id == current_user.id, Message.receiver_id == current_user.id)
+        )
     )
+    peers = {p for row in peer_rows.all() for p in row if p and p != current_user.id}
+    frame = {"type": "status_update", "data": st_dict}
+
+    async def notify_peers():
+        for peer in peers:
+            try:
+                await manager.send_personal_message(peer, frame)
+            except Exception as e:
+                logger.debug("status_update to %s failed: %s", peer, e)
+
+    asyncio.create_task(notify_peers())
     return st_dict
 
 
@@ -1388,7 +1398,7 @@ async def list_available_contacts(
                     online=is_online,
                     last_message=latest_msg.content if latest_msg else (u.quote or "Tap to start conversation"),
                     time=(
-                        latest_msg.timestamp.strftime("%I:%M %p")
+                        iso_utc(latest_msg.timestamp)
                         if latest_msg and latest_msg.timestamp
                         else ""
                     ),
@@ -1428,7 +1438,7 @@ async def list_available_contacts(
         online=True,
         last_message=latest_agent_msg.content if latest_agent_msg else "Your personal AI agent is ready. Ask me anything!",
         time=(
-            latest_agent_msg.timestamp.strftime("%I:%M %p")
+            iso_utc(latest_agent_msg.timestamp)
             if latest_agent_msg and latest_agent_msg.timestamp
             else ""
         ),
@@ -1861,7 +1871,7 @@ async def flush_offline_messages(user_id: str) -> None:
                     "sender_id": msg.sender_id,
                     "receiver_id": msg.receiver_id,
                     "content": msg.content,
-                    "timestamp": msg.timestamp.isoformat(),
+                    "timestamp": iso_utc(msg.timestamp),
                     "status": "DELIVERED",
                     "is_offline_replay": True,
                 },
@@ -2215,7 +2225,7 @@ async def chat_with_agent_endpoint(
                 "suggested_actions": meta.get("suggested_actions"),
                 "user_message_id": previous.id,
                 "message_id": answered.id,
-                "timestamp": answered.timestamp.isoformat() if answered.timestamp else None,
+                "timestamp": iso_utc(answered.timestamp),
             }
 
     # 1. Save user query message to persistent database
@@ -2278,7 +2288,7 @@ async def chat_with_agent_endpoint(
 
     res["user_message_id"] = user_msg.id
     res["message_id"] = agent_msg.id
-    res["timestamp"] = agent_msg.timestamp.isoformat()
+    res["timestamp"] = iso_utc(agent_msg.timestamp)
 
     return res
 

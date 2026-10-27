@@ -20,6 +20,18 @@ class MessageStatus(str, enum.Enum):
     READ = "READ"
 
 
+def iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """
+    ISO-8601 in UTC with an explicit offset ("...+00:00"). Some databases hand back datetimes
+    without a timezone; sent as-is, phones would read them as local time and be hours off.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 # Settings other users are affected by, so the server has to enforce them
 DEFAULT_USER_PREFS = {
     "last_seen": "everyone",  # 'everyone' | 'nobody'
@@ -98,7 +110,7 @@ class User(Base):
         """Last-seen timestamp as other people may see it (None when the user hides it)."""
         if self.prefs().get("last_seen") == "nobody" or not self.last_seen:
             return None
-        return self.last_seen.isoformat()
+        return iso_utc(self.last_seen)
 
     def to_dict(self) -> dict:
         return {
@@ -110,7 +122,7 @@ class User(Base):
             "quote": self.quote or "Hey there! I am using Flick.",
             "is_online": self.is_online,
             "last_seen": self.visible_last_seen(),
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": iso_utc(self.created_at),
         }
 
 
@@ -218,11 +230,11 @@ class Message(Base):
             "content": self.content,
             "reply_to": parsed_reply,
             "metadata": parsed_metadata,
-            "timestamp": self.timestamp.isoformat() if self.timestamp else datetime.now(timezone.utc).isoformat(),
+            "timestamp": iso_utc(self.timestamp or datetime.now(timezone.utc)),
             "status": self.status.value if hasattr(self.status, 'value') else str(self.status),
             "is_edited": self.is_edited or False,
-            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
-            "read_at": self.read_at.isoformat() if self.read_at else None,
+            "delivered_at": iso_utc(self.delivered_at),
+            "read_at": iso_utc(self.read_at),
             "client_msg_id": self.client_msg_id,
         }
 
@@ -303,8 +315,8 @@ class Status(Base):
             "bgGradient": self.bg_gradient,
             "viewsCount": len(parsed_viewers),
             "viewers": parsed_viewers,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "time": self.created_at.strftime("%I:%M %p") if self.created_at else "Just now",
+            "created_at": iso_utc(self.created_at),
+            "time": iso_utc(self.created_at),
         }
 
 
@@ -390,16 +402,16 @@ class Meeting(Base):
             "user_id": self.user_id,
             "title": self.title,
             "description": self.description or "",
-            "start_time": self.start_time.isoformat() if self.start_time else None,
-            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "start_time": iso_utc(self.start_time),
+            "end_time": iso_utc(self.end_time),
             "duration_minutes": duration_mins,
             "timezone": self.timezone or "UTC",
             "location": self.location or "",
             "meeting_link": self.meeting_link or "",
             "attendees": parsed_attendees,
             "status": self.status,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": iso_utc(self.created_at),
+            "updated_at": iso_utc(self.updated_at),
         }
 
 
@@ -438,7 +450,7 @@ class ConversationChangeLog(Base):
             "version": self.version,
             "action": self.action,
             "payload": parsed_payload,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": iso_utc(self.created_at),
         }
 
 
