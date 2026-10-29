@@ -90,7 +90,7 @@ async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
     import asyncio
     import logging
-    from models import User, Meeting, OtpRecord, Message, Status, ConversationChangeLog, UserSyncSequence
+    from models import User, Meeting, OtpRecord, Message, Status, ConversationChangeLog, UserSyncSequence, Group, GroupMember, GroupMessage  # noqa: F401 (registers tables)
     from sqlalchemy import select
 
     db_logger = logging.getLogger("Database")
@@ -115,6 +115,9 @@ async def init_db() -> None:
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences TEXT;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(64);",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS receipt_hidden BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS hidden_for_sender BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS hidden_for_receiver BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 0;",
                     "CREATE INDEX IF NOT EXISTS ix_messages_client_msg_id ON messages (client_msg_id);",
                 ]:
                     try:

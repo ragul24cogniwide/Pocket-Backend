@@ -12,7 +12,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Any, Dict
 
+import hashlib
 import hmac
+import re
 import time
 from collections import defaultdict, deque
 
@@ -67,6 +69,8 @@ from sync_service import (
     record_conversation_change,
     record_profile_change_for_contacts,
 )
+import groups
+from groups import GroupError, is_group_id
 from ai_agent import (
     process_personal_agent_message,
     ensure_personal_agent_user,
@@ -133,6 +137,30 @@ async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
     the only way to read the code is DEV_MODE_EXPOSE_OTP, which is not safe in production.
     """
     return False
+
+
+MAX_MESSAGE_CHARS = 8000
+MAX_METADATA_CHARS = 20_000
+MAX_WS_FRAME_CHARS = 100_000
+MAX_CONTACT_LOOKUP = 500
+DEMO_BOTS_ENABLED = os.getenv("SEED_DEMO_USERS", "false").lower() == "true"
+
+
+async def chat_peer_ids(db: AsyncSession, user: User) -> set:
+    """Ids (and phone numbers) of everyone this user has exchanged messages with, plus the AI agent."""
+    mine = {i for i in (user.id, user.phone_number) if i}
+    rows = await db.execute(
+        select(Message.sender_id, Message.receiver_id).where(
+            or_(Message.sender_id.in_(mine), Message.receiver_id.in_(mine))
+        )
+    )
+    ids = {p for row in rows.all() for p in row if p and p not in mine}
+    if ids:
+        res = await db.execute(select(User.id, User.phone_number).where(or_(User.id.in_(ids), User.phone_number.in_(ids))))
+        for uid, phone in res.all():
+            ids.update(x for x in (uid, phone) if x)
+    ids.add(AGENT_USER_ID)
+    return ids
 
 
 def receipts_shared(*users: Optional[User]) -> bool:
@@ -408,6 +436,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(groups.router)
 
 
 @app.get("/api/health")
@@ -448,7 +477,7 @@ async def get_agent_status():
     return {
         "gemini_sdk_installed": HAS_GENAI,
         "api_key_configured": has_key,
-        "masked_key": masked_key,
+
         "status": "ready" if (HAS_GENAI and has_key) else "fallback_mode",
     }
 
@@ -524,7 +553,7 @@ async def upload_image(payload: dict, current_user: User = Depends(get_current_u
         raise
     except Exception as e:
         logger.error("Image upload failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Image upload failed")
 
 
 @app.post("/api/upload/audio")
@@ -570,232 +599,273 @@ async def upload_audio(payload: dict, current_user: User = Depends(get_current_u
 
 
 # -----------------------------------------------------------------------------
-# Voice Call Signaling Endpoints (Dual-Channel Handshake & REST Fallback)
+# Calls (voice & video): signaling only. Audio/video flows directly between the two
+# phones over WebRTC (DTLS-SRTP encrypted end to end); the server never sees the media.
+# Every signaling message is bound to the call's two participants, so nobody else can
+# answer, hang up, inject network candidates into, or listen in on someone's call.
 # -----------------------------------------------------------------------------
+CALL_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{6,80}$")
+MAX_SDP_CHARS = 30_000
+MAX_ICE_CHARS = 4_000
+MAX_AUDIO_CHUNK_CHARS = 64_000
+TURN_CREDENTIAL_TTL_SECONDS = 6 * 3600
+CALL_SIGNAL_TYPES = (
+    "call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end",
+    "call_media_state", "call_audio_chunk",
+)
+
+
+class CallError(Exception):
+    def __init__(self, reason: str, status_code: int = 403):
+        super().__init__(reason)
+        self.reason = reason
+        self.status_code = status_code
+
+
+def call_party(session: dict, user_id: str) -> Optional[str]:
+    """'caller' or 'receiver' when user_id takes part in this call, otherwise None."""
+    if same_identity(session.get("caller_id"), user_id):
+        return "caller"
+    if same_identity(session.get("receiver_id"), user_id):
+        return "receiver"
+    return None
+
+
+def caller_card(user: Optional[User], fallback_id: str) -> dict:
+    name = (user.username if user else None) or f"User {str(fallback_id)[-4:]}"
+    return {
+        "caller_name": name,
+        "caller_avatar": name[:2].upper(),
+        "caller_color": (user.avatar_color if user else None) or "#FFB800",
+        "caller_avatar_url": user.avatar_url if user else None,
+    }
+
+
+async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict:
+    """
+    Validates one call signaling message from `user_id`, updates the call session and forwards
+    it to the other participant only. Raises CallError when the message isn't allowed.
+    """
+    data = data if isinstance(data, dict) else {}
+    call_id = str(data.get("call_id") or "")
+    if not CALL_ID_RE.match(call_id):
+        raise CallError("Invalid call id", 400)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    session = await get_call_session(call_id)
+
+    sdp = data.get("sdp")
+    if sdp is not None and (not isinstance(sdp, str) or len(sdp) > MAX_SDP_CHARS):
+        raise CallError("Invalid session description", 400)
+
+    # ---- New call ----
+    if frame_type == "call_offer":
+        receiver_id = str(data.get("receiver_id") or "").strip()
+        if not receiver_id or same_identity(receiver_id, user_id):
+            raise CallError("Invalid receiver", 400)
+        if session:
+            # Re-sent offer from the same caller is fine; anyone else reusing the id is refused
+            if call_party(session, user_id) != "caller" or not same_identity(session.get("receiver_id"), receiver_id):
+                raise CallError("This call id is already in use", 409)
+            if session.get("status") in ("ended", "rejected"):
+                raise CallError("This call has already finished", 409)
+        async with async_session_factory() as db:
+            caller = (await db.execute(select(User).where(User.id == user_id))).scalars().first()
+        card = caller_card(caller, user_id)
+        first_offer = not session
+        session = {
+            **(session or {}),
+            "call_id": call_id,
+            "caller_id": user_id,
+            "receiver_id": receiver_id,
+            "video": bool(data.get("video") or (session or {}).get("video")),
+            "status": "ringing",
+            **card,
+            "created_at": (session or {}).get("created_at", now_iso),
+            "updated_at": now_iso,
+        }
+        if sdp:
+            session["offer_sdp"] = sdp
+        await save_call_session(call_id, session)
+
+        frame = {
+            "call_id": call_id,
+            "caller_id": user_id,
+            "sender_id": user_id,
+            "receiver_id": receiver_id,
+            "video": session["video"],
+            "sdp": session.get("offer_sdp"),
+            **card,
+        }
+        delivered = await broadcast_call_frame(receiver_id, "call_offer", frame, sender_id=user_id)
+        if first_offer:
+            kind = "video" if session["video"] else "voice"
+            asyncio.create_task(dispatch_push_to_user(
+                sender_id=user_id,
+                receiver_id=receiver_id,
+                content=f"{'📹' if session['video'] else '📞'} Incoming {kind} call from {card['caller_name']}",
+                data_payload={
+                    "type": "incoming_call",
+                    "call_id": call_id,
+                    "caller_id": str(user_id),
+                    "video": "1" if session["video"] else "0",
+                    **{k: (v or "") for k, v in card.items()},
+                },
+            ))
+        return {"status": "ringing", "call_id": call_id, "delivered": delivered}
+
+    # ---- Everything else needs an existing call this user is part of ----
+    if not session:
+        raise CallError("Unknown call", 404)
+    party = call_party(session, user_id)
+    if not party:
+        raise CallError("You are not part of this call", 403)
+    other = session["receiver_id"] if party == "caller" else session["caller_id"]
+    status = session.get("status")
+    finished = status in ("ended", "rejected")
+    out: dict = {}
+    push = None
+
+    if frame_type == "call_answer":
+        if party != "receiver":
+            raise CallError("Only the person being called can answer", 403)
+        if status != "ringing":
+            raise CallError("This call is no longer ringing", 409)
+        session.update({"status": "answered", "answered_at": now_iso})
+        if sdp:
+            session["answer_sdp"] = sdp  # lets the caller recover it via /api/call/status if the socket frame is missed
+        out = {"sdp": sdp, "video": session.get("video", False)}
+        push = ("Call answered", {"type": "call_answered"})
+    elif frame_type == "call_ice_candidate":
+        if finished:
+            return {"status": status, "call_id": call_id}
+        cand = data.get("candidate")
+        if len(json.dumps(cand or {})) > MAX_ICE_CHARS:
+            raise CallError("Invalid network candidate", 400)
+        out = {"candidate": cand}
+    elif frame_type == "call_media_state":
+        out = {"video_enabled": bool(data.get("video_enabled", True)), "audio_enabled": bool(data.get("audio_enabled", True))}
+    elif frame_type == "call_audio_chunk":  # legacy relay used by older app versions
+        chunk = data.get("chunk")
+        if status != "answered" or not isinstance(chunk, str) or len(chunk) > MAX_AUDIO_CHUNK_CHARS:
+            return {"status": status, "call_id": call_id}
+        out = {"chunk": chunk}
+    elif frame_type == "call_reject":
+        if finished:
+            return {"status": status, "call_id": call_id}
+        reason = str(data.get("reason") or "declined")[:32]
+        session.update({"status": "rejected", "reason": reason})
+        out = {"reason": reason}
+        push = ("Call declined", {"type": "call_rejected", "reason": reason})
+    elif frame_type == "call_end":
+        if finished:
+            return {"status": status, "call_id": call_id}
+        try:
+            duration = max(0, int(data.get("duration") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        session.update({"status": "ended", "duration": duration})
+        out = {"duration": duration}
+        push = ("Call ended", {"type": "call_ended"})
+    else:
+        raise CallError("Unsupported call message", 400)
+
+    if frame_type in ("call_answer", "call_reject", "call_end"):
+        session["updated_at"] = now_iso
+        await save_call_session(call_id, session)
+
+    out.update({
+        "call_id": call_id,
+        "sender_id": user_id,
+        "caller_id": session["caller_id"],
+        "receiver_id": session["receiver_id"],
+    })
+    delivered = await broadcast_call_frame(other, frame_type, out, sender_id=user_id)
+    if push:
+        asyncio.create_task(dispatch_push_to_user(
+            sender_id=user_id, receiver_id=other, content=push[0],
+            data_payload={**push[1], "call_id": call_id},
+        ))
+    return {"status": session.get("status"), "call_id": call_id, "delivered": delivered}
+
+
+async def _rest_call_signal(user: User, frame_type: str, data: dict) -> dict:
+    try:
+        return await process_call_signal(user.id, frame_type, data)
+    except CallError as ce:
+        raise HTTPException(status_code=ce.status_code, detail=ce.reason)
+
+
 @app.post("/api/call/offer")
 async def call_offer_endpoint(payload: CallOfferRequest, current_user: User = Depends(get_current_user)):
-    """Initiates an outgoing call offer, updates active session, sends push notification, and broadcasts over WS."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    # The caller is always the authenticated user, whatever the body claims
-    payload.caller_id = current_user.id
-
-    caller_name = payload.caller_name
-    caller_avatar = payload.caller_avatar
-    caller_avatar_url = payload.caller_avatar_url
-    caller_color = payload.caller_color
-
-    # Enrich caller profile details from DB if missing or default
-    if not caller_avatar_url or not caller_name or caller_name in ("Pocket User", "Flick User"):
-        try:
-            async with async_session_factory() as db:
-                c_stmt = select(User).where(or_(User.id == str(payload.caller_id), User.phone_number == str(payload.caller_id)))
-                c_res = await db.execute(c_stmt)
-                caller_user = c_res.scalars().first()
-                if caller_user:
-                    if caller_user.username:
-                        caller_name = caller_user.username
-                    if caller_user.avatar_url:
-                        caller_avatar_url = caller_user.avatar_url
-                    if caller_user.avatar_color:
-                        caller_color = caller_user.avatar_color
-                    if caller_user.username and len(caller_user.username) >= 2:
-                        caller_avatar = caller_user.username[:2].upper()
-        except Exception as e:
-            logger.warning("[CallOffer] Caller enrichment error: %s", e)
-
-    await save_call_session(payload.call_id, {
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.receiver_id,
-        "caller_name": caller_name or "Flick User",
-        "caller_avatar": caller_avatar or "FK",
-        "caller_color": caller_color or "#FFB800",
-        "caller_avatar_url": caller_avatar_url,
-        "status": "ringing",
-        "created_at": now_iso,
-        "updated_at": now_iso,
-    })
-
-    call_data = {
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.receiver_id,
-        "sender_id": payload.caller_id,
-        "caller_name": caller_name or "Flick User",
-        "caller_avatar": caller_avatar or "FK",
-        "caller_avatar_url": caller_avatar_url,
-        "caller_color": caller_color or "#FFB800",
-    }
-    delivered = await broadcast_call_frame(payload.receiver_id, "call_offer", call_data)
-
-    # Dispatch high-priority FCM wake-up call push
-    caller_title = caller_name or f"User {str(payload.caller_id)[-4:]}"
-    asyncio.create_task(
-        dispatch_push_to_user(
-            sender_id=payload.caller_id,
-            receiver_id=payload.receiver_id,
-            content=f"📞 Incoming voice call from {caller_title}...",
-            data_payload={
-                "type": "incoming_call",
-                "caller_id": str(payload.caller_id),
-                "caller_name": caller_title,
-                "caller_avatar": payload.caller_avatar or "PK",
-                "caller_color": payload.caller_color or "#FFB800",
-                "caller_avatar_url": payload.caller_avatar_url or "",
-                "call_id": payload.call_id,
-            },
-        )
-    )
-
-    return {"status": "ringing", "call_id": payload.call_id, "delivered": delivered}
+    """Starts a call (voice or video). The caller is always the signed-in user."""
+    return await _rest_call_signal(current_user, "call_offer", payload.model_dump())
 
 
 @app.post("/api/call/answer")
 async def call_answer_endpoint(payload: CallAnswerRequest, current_user: User = Depends(get_current_user)):
-    """Answers an incoming call, sets session to 'answered', notifies caller immediately over WS and push."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload.receiver_id = current_user.id
-    session = await get_call_session(payload.call_id)
-    session.update({
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.receiver_id,
-        "status": "answered",
-        "answered_at": now_iso,
-        "updated_at": now_iso,
-    })
-    await save_call_session(payload.call_id, session)
-
-    call_data = {
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.caller_id,
-        "sender_id": payload.receiver_id,
-        "sdp": payload.sdp,
-    }
-    delivered = await broadcast_call_frame(payload.caller_id, "call_answer", call_data)
-    logger.info("[VoiceCall REST] Call answered: %s (caller: %s, delivered: %s)", payload.call_id, payload.caller_id, delivered)
-
-    # Wake-up / answer push notification to caller
-    asyncio.create_task(
-        dispatch_push_to_user(
-            sender_id=payload.receiver_id,
-            receiver_id=payload.caller_id,
-            content="Call Answered",
-            data_payload={
-                "type": "call_answered",
-                "call_id": payload.call_id,
-                "receiver_id": str(payload.receiver_id),
-            },
-        )
-    )
-
-    return {"status": "answered", "call_id": payload.call_id, "delivered": delivered}
-
-
-def ensure_call_participant(user: User, *ids: Optional[str]) -> None:
-    if not any(same_identity(user.id, i) or same_identity(user.phone_number, i) for i in ids):
-        raise HTTPException(status_code=403, detail="You are not part of this call")
+    """Answers a ringing call; only the person being called can do this."""
+    return await _rest_call_signal(current_user, "call_answer", payload.model_dump())
 
 
 @app.post("/api/call/reject")
 async def call_reject_endpoint(payload: CallRejectRequest, current_user: User = Depends(get_current_user)):
-    """Declines an incoming call and terminates for both sides."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    ensure_call_participant(current_user, payload.caller_id, payload.receiver_id)
-    session = await get_call_session(payload.call_id)
-    session.update({
-        "call_id": payload.call_id,
-        "status": "rejected",
-        "reason": payload.reason or "declined",
-        "updated_at": now_iso,
-    })
-    await save_call_session(payload.call_id, session)
-
-    target = payload.caller_id or payload.receiver_id or payload.other_user_id
-    call_data = {
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.receiver_id,
-        "reason": payload.reason or "declined",
-    }
-    if target:
-        await broadcast_call_frame(target, "call_reject", call_data)
-        asyncio.create_task(
-            dispatch_push_to_user(
-                sender_id=str(payload.receiver_id or "system"),
-                receiver_id=str(target),
-                content="Call Declined",
-                data_payload={
-                    "type": "call_rejected",
-                    "call_id": payload.call_id,
-                    "reason": payload.reason or "declined",
-                },
-            )
-        )
-
-    return {"status": "rejected", "call_id": payload.call_id}
+    """Declines a call (either participant)."""
+    return await _rest_call_signal(current_user, "call_reject", payload.model_dump())
 
 
 @app.post("/api/call/end")
 async def call_end_endpoint(payload: CallEndRequest, current_user: User = Depends(get_current_user)):
-    """Ends an ongoing call and terminates for both sides immediately."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    ensure_call_participant(current_user, payload.caller_id, payload.receiver_id)
-    session = await get_call_session(payload.call_id)
-    session.update({
-        "call_id": payload.call_id,
-        "status": "ended",
-        "duration": payload.duration or 0,
-        "updated_at": now_iso,
-    })
-    await save_call_session(payload.call_id, session)
-
-    targets = set()
-    if payload.caller_id:
-        targets.add(payload.caller_id)
-    if payload.receiver_id:
-        targets.add(payload.receiver_id)
-    if payload.other_user_id:
-        targets.add(payload.other_user_id)
-
-    call_data = {
-        "call_id": payload.call_id,
-        "caller_id": payload.caller_id,
-        "receiver_id": payload.receiver_id,
-        "duration": payload.duration or 0,
-    }
-    for t in targets:
-        await broadcast_call_frame(t, "call_end", call_data)
-        asyncio.create_task(
-            dispatch_push_to_user(
-                sender_id="system",
-                receiver_id=str(t),
-                content="Call Ended",
-                data_payload={
-                    "type": "call_ended",
-                    "call_id": payload.call_id,
-                },
-            )
-        )
-
-    return {"status": "ended", "call_id": payload.call_id}
+    """Hangs up a call (either participant)."""
+    return await _rest_call_signal(current_user, "call_end", payload.model_dump())
 
 
 @app.get("/api/call/status/{call_id}")
 async def get_call_status(call_id: str, current_user: User = Depends(get_current_user)):
-    """Returns active call status ('ringing', 'answered', 'ended', 'rejected', 'unknown')."""
+    """Call state for its two participants only (the callee also gets the offer, e.g. after a push wake-up)."""
     session = await get_call_session(call_id)
-    if not session:
+    party = call_party(session, current_user.id) if session else None
+    if not party:
         return {"call_id": call_id, "status": "unknown"}
-    return {
+    out = {
         "call_id": call_id,
         "status": session.get("status", "unknown"),
+        "video": bool(session.get("video")),
         "caller_id": session.get("caller_id"),
         "receiver_id": session.get("receiver_id"),
         "created_at": session.get("created_at"),
         "answered_at": session.get("answered_at"),
+        **{k: session.get(k) for k in ("caller_name", "caller_avatar", "caller_color", "caller_avatar_url")},
     }
+    # Each side can fetch what it needs from the other: the callee the offer (e.g. after a
+    # push wake-up), the caller the answer (if the live socket message was missed)
+    if party == "receiver" and session.get("status") == "ringing":
+        out["sdp"] = session.get("offer_sdp")
+    elif party == "caller" and session.get("status") == "answered":
+        out["sdp"] = session.get("answer_sdp")
+    return out
+
+
+@app.get("/api/call/ice-servers")
+async def get_ice_servers(current_user: User = Depends(get_current_user)):
+    """
+    Servers the phones use to find a direct path to each other. STUN works on most networks;
+    a TURN relay (configure TURN_URLS plus TURN_SECRET, or TURN_USERNAME/TURN_PASSWORD) is
+    needed when both phones are behind strict mobile-carrier NATs. Media through TURN stays
+    end-to-end encrypted; the relay only forwards encrypted packets.
+    """
+    servers = [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]
+    turn_urls = [u.strip() for u in os.getenv("TURN_URLS", "").split(",") if u.strip()]
+    if turn_urls:
+        secret = os.getenv("TURN_SECRET", "").strip()
+        if secret:
+            # Time-limited credentials (coturn "use-auth-secret" / TURN REST API)
+            username = f"{int(time.time()) + TURN_CREDENTIAL_TTL_SECONDS}:{current_user.id}"
+            credential = base64.b64encode(hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()).decode()
+        else:
+            username, credential = os.getenv("TURN_USERNAME", ""), os.getenv("TURN_PASSWORD", "")
+        if username and credential:
+            servers.append({"urls": turn_urls, "username": username, "credential": credential})
+    return {"ice_servers": servers, "ttl": TURN_CREDENTIAL_TTL_SECONDS}
 
 
 # -----------------------------------------------------------------------------
@@ -804,10 +874,9 @@ async def get_call_status(call_id: str, current_user: User = Depends(get_current
 @app.get("/")
 async def root():
     """Serves the test interface for dual-user simulation."""
-    if os.path.exists("test_client.html"):
+    # The dual-user test page renders message text as HTML, so it's never served in production
+    if os.getenv("SERVE_TEST_CLIENT", "false").lower() == "true" and os.path.exists("test_client.html"):
         return FileResponse("test_client.html")
-    elif os.path.exists("index.html"):
-        return FileResponse("index.html")
     return {"message": "Flick Real-Time Messaging API is active"}
 
 
@@ -949,7 +1018,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
         await db.commit()
         await db.refresh(user)
 
-    token = create_access_token(user_id=user.id, phone_number=user.phone_number)
+    token = create_access_token(user_id=user.id, phone_number=user.phone_number, token_version=user.token_version or 0)
 
     return AuthResponse(
         access_token=token,
@@ -961,7 +1030,8 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
 
 @app.post("/api/auth/logout")
 async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Detaches this device's push token so a logged-out phone stops receiving the user's notifications."""
+    """Signs out: revokes this account's tokens and detaches the push token from the phone."""
+    current_user.token_version = (current_user.token_version or 0) + 1  # every older token stops working
     current_user.fcm_token = None
     current_user.is_online = False
     current_user.last_seen = datetime.now(timezone.utc)
@@ -989,6 +1059,7 @@ async def delete_my_account(current_user: User = Depends(get_current_user), db: 
     await db.execute(sql_delete(OtpRecord).where(OtpRecord.phone_number == current_user.phone_number))
     await db.execute(sql_delete(ConversationChangeLog).where(ConversationChangeLog.user_id == me))
     await db.execute(sql_delete(UserSyncSequence).where(UserSyncSequence.user_id == me))
+    await groups.remove_user_from_all_groups(db, current_user)
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:
@@ -1069,7 +1140,7 @@ async def update_user_profile(
     except Exception as e:
         logger.error("Error updating user profile: %s", e, exc_info=True)
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database update failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Couldn’t update your profile. Please try again.")
 
 
 @app.post("/api/users/fcm-token")
@@ -1178,6 +1249,7 @@ async def get_status_feed(
     )
     result = await db.execute(stmt)
     all_statuses = result.scalars().all()
+    peers = await chat_peer_ids(db, current_user)
 
     my_statuses = []
     contact_dict = {}
@@ -1186,7 +1258,8 @@ async def get_status_feed(
         st_dict = s.to_dict()
         if s.user_id == current_user.id or s.user_id == current_user.phone_number:
             my_statuses.append(st_dict)
-        else:
+        elif s.user_id in peers:
+            st_dict.pop("viewers", None)  # who viewed a story is only for its owner
             cid = s.user_id
             if cid not in contact_dict:
                 user_obj = s.user
@@ -1218,7 +1291,11 @@ async def mark_status_viewed(
     stmt = select(Status).where(Status.id == status_id)
     result = await db.execute(stmt)
     st = result.scalar_one_or_none()
-    if not st:
+    if not st or st.user_id in (current_user.id, current_user.phone_number):
+        if not st:
+            raise HTTPException(status_code=404, detail="Status not found")
+        return {"message": "Own status", "viewsCount": len(json.loads(st.viewers or "[]"))}
+    if st.user_id not in await chat_peer_ids(db, current_user):
         raise HTTPException(status_code=404, detail="Status not found")
 
     viewers = []
@@ -1317,7 +1394,13 @@ async def list_available_contacts(
     """Lists registered users excluding current user, with real-time online status."""
     current_user = await resolve_user_context(user_opt, db)
     await ensure_personal_agent_user(db)
-    stmt = select(User).where(User.id != current_user.id).order_by(User.username.asc())
+    # Only people you've chatted with: listing every user would let anyone harvest phone numbers
+    peers = await chat_peer_ids(db, current_user)
+    stmt = (
+        select(User)
+        .where(User.id != current_user.id, or_(User.id.in_(peers), User.phone_number.in_(peers)))
+        .order_by(User.username.asc())
+    )
     result = await db.execute(stmt)
     users = result.scalars().all()
 
@@ -1562,6 +1645,13 @@ async def get_messages_with_user(
 ):
     """Retrieves paginated message history (default: latest 50 messages) with phone tolerance."""
     other_user_id = other_user_id.strip()
+    if is_group_id(other_user_id):
+        try:
+            return await groups.group_history(current_user, other_user_id, limit, offset)
+        except GroupError as ge:
+            raise HTTPException(status_code=ge.status_code, detail=ge.reason)
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
 
     # 1. Collect all possible identifier aliases for current_user
     cur_ids = {current_user.id, current_user.phone_number}
@@ -1631,6 +1721,9 @@ async def get_messages_with_user(
     ordered_messages = list(reversed(messages))
     out = []
     for msg in ordered_messages:
+        # "Deleted for me" by this person: not shown to them
+        if (msg.sender_id in cur_ids and msg.hidden_for_sender) or (msg.receiver_id in cur_ids and msg.hidden_for_receiver):
+            continue
         m = msg.to_dict()
         # My message read while (or sent while) read receipts were off for either of us:
         # two grey ticks, permanently. Turning receipts on/off later doesn't change past ticks.
@@ -1651,6 +1744,15 @@ async def send_message_rest(
     content = payload.content.strip()
     client_temp_id = payload.temp_msg_id or f"temp_{int(datetime.now().timestamp() * 1000)}"
 
+    if is_group_id(receiver_id):
+        try:
+            sent = await groups.send_group_message(
+                current_user.id, receiver_id, content, payload.temp_msg_id, payload.reply_to, payload.metadata
+            )
+        except GroupError as ge:
+            raise HTTPException(status_code=ge.status_code, detail=ge.reason)
+        return {"status": "success", "temp_msg_id": client_temp_id, **sent}
+
     # A retry of a send that already reached us (e.g. the response was lost on a slow network)
     existing = await find_client_message(db, current_user.id, payload.temp_msg_id)
     if existing is not None:
@@ -1667,9 +1769,12 @@ async def send_message_rest(
     rec_res = await db.execute(rec_stmt)
     receiver_user = rec_res.scalar_one_or_none()
     if not receiver_user:
-        names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
-        rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
-        db.add(User(id=receiver_id, phone_number=receiver_id, username=rec_name, avatar_color="#3B82F6", is_online=False))
+        receiver_user = (await db.execute(select(User).where(User.phone_number == receiver_id))).scalars().first()
+        if receiver_user is None:
+            raise HTTPException(status_code=404, detail="This number isn’t on Flick")
+        receiver_id = receiver_user.id
+    if len(content) > MAX_MESSAGE_CHARS or len(json.dumps(payload.metadata or {})) > MAX_METADATA_CHARS:
+        raise HTTPException(status_code=413, detail="Message is too long")
 
     is_rec_online = await manager.is_user_online(receiver_id)
     initial_status = MessageStatus.DELIVERED if is_rec_online else MessageStatus.SENT
@@ -1733,7 +1838,8 @@ async def send_message_rest(
     if receiver_id == AGENT_USER_ID or receiver_id.startswith("agent_"):
         asyncio.create_task(handle_personal_agent_reply(current_user.id, content, payload.metadata))
     else:
-        asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
+        if DEMO_BOTS_ENABLED:
+            asyncio.create_task(handle_bot_auto_reply(current_user.id, receiver_id, content))
 
     return {
         "status": "success",
@@ -1758,6 +1864,12 @@ async def edit_message(
     msg = result.scalar_one_or_none()
 
     if not msg:
+        try:
+            edited = await groups.edit_group_message(current_user, message_id, payload.content)
+        except GroupError as ge:
+            raise HTTPException(status_code=ge.status_code, detail=ge.reason)
+        if edited is not None:
+            return edited
         raise HTTPException(status_code=404, detail="Message not found")
 
     if msg.sender_id != current_user.id:
@@ -1806,9 +1918,16 @@ async def delete_message(
     msg = result.scalar_one_or_none()
 
     if not msg:
+        await groups.delete_group_message(current_user, message_id, for_everyone)
         return {"status": "success", "message_id": message_id, "deleted": True}
 
-    if for_everyone and msg.sender_id == current_user.id:
+    mine = {current_user.id, current_user.phone_number}
+    is_sender, is_receiver = msg.sender_id in mine, msg.receiver_id in mine
+    if not (is_sender or is_receiver):
+        # Not your conversation: same answer as a missing message, nothing is touched
+        return {"status": "success", "message_id": message_id, "deleted": True}
+
+    if for_everyone and is_sender:
         receiver_id = msg.receiver_id
         sender_id = msg.sender_id
         await db.delete(msg)
@@ -1832,9 +1951,12 @@ async def delete_message(
         }
         await manager.send_personal_message(receiver_id, delete_frame)
     else:
-        # Delete for self only
-        other_id = msg.receiver_id if msg.sender_id == current_user.id else msg.sender_id
-        await db.delete(msg)
+        # Delete for me only: hide it for this person; the other person keeps their copy
+        other_id = msg.receiver_id if is_sender else msg.sender_id
+        if is_sender:
+            msg.hidden_for_sender = True
+        if is_receiver:
+            msg.hidden_for_receiver = True
         await db.commit()
         try:
             await record_conversation_change(db, user_id=current_user.id, peer_id=other_id, action="updated")
@@ -2464,9 +2586,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else websocket.query_params.get("token")
     async with async_session_factory() as db:
         user_obj = await user_from_token(token, db)
-        if not user_obj or not (
-            same_identity(user_obj.id, user_id) or same_identity(user_obj.phone_number, user_id)
-        ):
+        if not user_obj or user_id.strip() not in {user_obj.id, user_obj.phone_number}:
             await websocket.accept()
             await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Invalid or expired session")
             return
@@ -2482,9 +2602,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(user_id, websocket)
     manager.register_aliases(user_id, alias_ids)
     await manager.refresh_presence(user_id)
+    async with async_session_factory() as db:
+        me_obj = await db.get(User, user_id)
+        my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
+    try:
+        await manager.send_online_snapshot(websocket, my_peer_ids)
+    except Exception:
+        pass
 
     # Flush any unread messages stored while this user was offline
     asyncio.create_task(flush_offline_messages(user_id))
+    asyncio.create_task(groups.mark_delivered_on_connect(user_id))
 
     try:
         while True:
@@ -2497,6 +2625,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 except Exception:
                     pass
                 raise WebSocketDisconnect(code=1001)
+            if len(raw_data) > MAX_WS_FRAME_CHARS:
+                logger.warning("Dropped oversized frame (%d chars) from %s", len(raw_data), user_id)
+                continue
             try:
                 payload = json.loads(raw_data)
             except json.JSONDecodeError:
@@ -2516,6 +2647,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 client_temp_id = client_msg_id or f"temp_{int(datetime.now(timezone.utc).timestamp()*1000)}"
 
                 if not receiver_id or not content:
+                    continue
+                if is_group_id(receiver_id):
+                    try:
+                        sent = await groups.send_group_message(
+                            user_id, receiver_id, content, client_msg_id, data.get("reply_to"), data.get("metadata")
+                        )
+                    except GroupError as ge:
+                        await websocket.send_text(json.dumps({"type": "message_error", "data": {
+                            "temp_msg_id": client_msg_id, "reason": ge.reason}}))
+                        continue
+                    await websocket.send_text(json.dumps({"type": "ack_sent", "data": {
+                        "temp_id": client_temp_id,
+                        "temp_msg_id": client_temp_id,
+                        "message_id": sent["message_id"],
+                        "group_id": receiver_id,
+                        "timestamp": sent["timestamp"],
+                        "status": sent["status"],
+                        **({"duplicate": True} if sent.get("duplicate") else {}),
+                    }}))
+                    continue
+                if len(content) > MAX_MESSAGE_CHARS or len(json.dumps(data.get("metadata") or {})) > MAX_METADATA_CHARS:
+                    await websocket.send_text(json.dumps({"type": "message_error", "data": {
+                        "temp_msg_id": client_msg_id, "reason": "Message is too long"}}))
                     continue
 
                 async with async_session_factory() as db:
@@ -2544,25 +2698,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     )
                     existing_users = {u.id: u for u in users_res.scalars().all()}
 
-                    if user_id not in existing_users:
-                        db.add(User(
-                            id=user_id,
-                            phone_number=user_id,
-                            username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Flick User",
-                            avatar_color="#FFB800",
-                            is_online=True,
-                        ))
                     if receiver_id not in existing_users:
-                        # Auto-seed receiver to avoid Foreign Key violations
-                        names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
-                        rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
-                        db.add(User(
-                            id=receiver_id,
-                            phone_number=receiver_id,
-                            username=rec_name,
-                            avatar_color="#3B82F6",
-                            is_online=False,
-                        ))
+                        # Only real accounts can receive messages (no placeholder users for unknown ids)
+                        alt = (await db.execute(select(User).where(User.phone_number == receiver_id))).scalars().first()
+                        if alt is None:
+                            await websocket.send_text(json.dumps({"type": "message_error", "data": {
+                                "temp_msg_id": client_msg_id, "reason": "This number isn’t on Flick"}}))
+                            continue
+                        receiver_id = alt.id
+                        existing_users[receiver_id] = alt
 
                     # Determine delivery state
                     is_rec_online = await manager.is_user_online(receiver_id)
@@ -2644,14 +2788,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if receiver_id == AGENT_USER_ID or receiver_id.startswith("agent_"):
                     asyncio.create_task(handle_personal_agent_reply(user_id, content, metadata_raw))
                 else:
-                    asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
+                    if DEMO_BOTS_ENABLED:
+                        asyncio.create_task(handle_bot_auto_reply(user_id, receiver_id, content))
 
             # -----------------------------------------------------------------
             # 2. TYPING INDICATORS
             # -----------------------------------------------------------------
             elif frame_type in ("typing_start", "typing_stop"):
                 receiver_id = data.get("receiver_id")
-                if receiver_id:
+                if is_group_id(receiver_id):
+                    asyncio.create_task(groups.relay_typing(user_id, receiver_id, frame_type == "typing_start"))
+                elif receiver_id:
                     typing_frame = {
                         "type": frame_type,
                         "data": {
@@ -2671,10 +2818,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     now = datetime.now(timezone.utc)
                     async with async_session_factory() as db:
                         check = await db.execute(
-                            select(Message.id, Message.status).where(Message.id == message_id)
+                            select(Message.id, Message.status, Message.sender_id).where(
+                                Message.id == message_id, Message.receiver_id == user_id
+                            )
                         )
                         row = check.fetchone()
-                        if row and row.status != MessageStatus.READ:
+                        if row is None:
+                            continue  # not a message addressed to me: ignore (no fake receipts)
+                        sender_id = row.sender_id
+                        if row.status != MessageStatus.READ:
                             stmt = (
                                 update(Message)
                                 .where(
@@ -2698,7 +2850,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
             elif frame_type == "mark_read":
                 sender_id = data.get("sender_id")  # original sender of the messages being read
-                if sender_id:
+                if is_group_id(sender_id):
+                    asyncio.create_task(groups.mark_group_read(user_id, sender_id))
+                elif sender_id:
                     now = datetime.now(timezone.utc)
                     async with async_session_factory() as db:
                         reader = await db.get(User, user_id)
@@ -2756,187 +2910,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # -----------------------------------------------------------------
             # 4. REAL-TIME CALL AUDIO CHUNK FORWARDING (Zero-Latency Relay)
             # -----------------------------------------------------------------
-            elif frame_type == "call_audio_chunk":
-                data["sender_id"] = user_id
-                target_id = data.get("receiver_id") or data.get("other_user_id") or data.get("caller_id")
-                if target_id and str(target_id) != str(user_id):
-                    # Zero-overhead streaming to target user's active socket
-                    await manager.send_personal_message(str(target_id), payload)
-
-            # -----------------------------------------------------------------
-            # 5. VOICE CALL SIGNALING (Full-Duplex Audio Handshake)
-            # -----------------------------------------------------------------
-            elif frame_type in ("call_offer", "call_answer", "call_ice_candidate", "call_reject", "call_end"):
-                # Frames always carry the socket's own identity, never one the client claims
-                data["sender_id"] = user_id
-                if frame_type == "call_offer":
-                    data["caller_id"] = user_id
-
-                # Determine target recipient for the call frame
-                target_id = data.get("receiver_id")
-                if (not target_id or str(target_id) == str(user_id)) and frame_type != "call_offer":
-                    target_id = data.get("caller_id") or data.get("other_user_id")
-
-                call_id = data.get("call_id") or f"call_{int(datetime.now(timezone.utc).timestamp())}"
-                now_iso = datetime.now(timezone.utc).isoformat()
-
-                if frame_type == "call_offer":
-                    caller_id_val = str(user_id)
-                    caller_name = data.get("caller_name")
-                    caller_avatar_url = data.get("caller_avatar_url")
-                    caller_color = data.get("caller_color", "#FFB800")
-                    caller_avatar = data.get("caller_avatar", "FK")
-
-                    if not caller_avatar_url or not caller_name or caller_name in ("Pocket User", "Flick User"):
-                        try:
-                            async with async_session_factory() as db:
-                                c_stmt = select(User).where(or_(User.id == caller_id_val, User.phone_number == caller_id_val))
-                                c_res = await db.execute(c_stmt)
-                                caller_user = c_res.scalars().first()
-                                if caller_user:
-                                    if caller_user.username:
-                                        caller_name = caller_user.username
-                                    if caller_user.avatar_url:
-                                        caller_avatar_url = caller_user.avatar_url
-                                    if caller_user.avatar_color:
-                                        caller_color = caller_user.avatar_color
-                                    if caller_user.username and len(caller_user.username) >= 2:
-                                        caller_avatar = caller_user.username[:2].upper()
-                        except Exception:
-                            pass
-
-                    data["caller_name"] = caller_name or f"User {caller_id_val[-4:]}"
-                    data["caller_avatar_url"] = caller_avatar_url
-                    data["caller_color"] = caller_color
-                    data["caller_avatar"] = caller_avatar
-
-                    await save_call_session(call_id, {
-                        "call_id": call_id,
-                        "caller_id": user_id,
-                        "receiver_id": target_id,
-                        "caller_name": data["caller_name"],
-                        "caller_avatar": data["caller_avatar"],
-                        "caller_color": data["caller_color"],
-                        "caller_avatar_url": data["caller_avatar_url"],
-                        "status": "ringing",
-                        "created_at": now_iso,
-                        "updated_at": now_iso,
-                    })
-                elif frame_type == "call_answer":
-                    session = await get_call_session(call_id)
-                    session.update({
-                        "call_id": call_id,
-                        "status": "answered",
-                        "answered_at": now_iso,
-                        "updated_at": now_iso,
-                    })
-                    await save_call_session(call_id, session)
-                elif frame_type == "call_reject":
-                    session = await get_call_session(call_id)
-                    session.update({
-                        "call_id": call_id,
-                        "status": "rejected",
-                        "reason": data.get("reason", "declined"),
-                        "updated_at": now_iso,
-                    })
-                    await save_call_session(call_id, session)
-                elif frame_type == "call_end":
-                    session = await get_call_session(call_id)
-                    session.update({
-                        "call_id": call_id,
-                        "status": "ended",
-                        "duration": data.get("duration", 0),
-                        "updated_at": now_iso,
-                    })
-                    await save_call_session(call_id, session)
-
-                def is_same_user_id(u1: str, u2: str) -> bool:
-                    if not u1 or not u2:
-                        return False
-                    s1, s2 = str(u1).strip(), str(u2).strip()
-                    if s1 == s2:
-                        return True
-                    d1 = "".join(filter(str.isdigit, s1))
-                    d2 = "".join(filter(str.isdigit, s2))
-                    if d1 and d2:
-                        if d1 == d2:
-                            return True
-                        if len(d1) >= 7 and len(d2) >= 7:
-                            return d1.endswith(d2) or d2.endswith(d1)
-                    return False
-
-                if target_id and not is_same_user_id(target_id, user_id):
-                    call_data = {
-                        **data,
-                        "sender_id": user_id,
-                        "caller_id": data.get("caller_id", user_id),
-                        "receiver_id": target_id,
-                        "call_id": call_id,
-                    }
-                    delivered = await broadcast_call_frame(target_id, frame_type, call_data, sender_id=user_id)
-                    logger.info("[VoiceCall WS] Frame %s from %s to %s (delivered: %s)", frame_type, user_id, target_id, delivered)
-
-                    # For voice call offers, ALWAYS dispatch high-priority FCM push notification
-                    if frame_type == "call_offer":
-                        caller_name = data.get("caller_name") or f"User {str(user_id)[-4:]}"
-                        asyncio.create_task(
-                            dispatch_push_to_user(
-                                sender_id=user_id,
-                                receiver_id=target_id,
-                                content=f"📞 Incoming voice call from {caller_name}...",
-                                data_payload={
-                                    "type": "incoming_call",
-                                    "caller_id": str(user_id),
-                                    "caller_name": caller_name,
-                                    "caller_avatar": data.get("caller_avatar", "PK"),
-                                    "caller_color": data.get("caller_color", "#FFB800"),
-                                    "caller_avatar_url": data.get("caller_avatar_url", ""),
-                                    "call_id": call_id,
-                                },
-                            )
-                        )
-                    elif frame_type == "call_answer":
-                        asyncio.create_task(
-                            dispatch_push_to_user(
-                                sender_id=user_id,
-                                receiver_id=target_id,
-                                content="Call Answered",
-                                data_payload={
-                                    "type": "call_answered",
-                                    "call_id": call_id,
-                                    "receiver_id": str(user_id),
-                                },
-                            )
-                        )
-                    elif frame_type in ("call_end", "call_reject"):
-                        asyncio.create_task(
-                            dispatch_push_to_user(
-                                sender_id=user_id,
-                                receiver_id=target_id,
-                                content="Call Ended" if frame_type == "call_end" else "Call Declined",
-                                data_payload={
-                                    "type": "call_ended" if frame_type == "call_end" else "call_rejected",
-                                    "call_id": call_id,
-                                },
-                            )
-                        )
-
-                    # Demo contact simulation ONLY for mock bots (1, 2, 3, 4) when offline
-                    demo_mock_ids = ("1", "2", "3", "4")
-                    if frame_type == "call_offer" and str(target_id) in demo_mock_ids:
-                        is_target_online = await manager.is_user_online(target_id)
-                        if not is_target_online:
-                            async def simulate_demo_answer():
-                                await asyncio.sleep(2.0)
-                                ans_data = {
-                                    "call_id": call_id,
-                                    "caller_id": target_id,
-                                    "receiver_id": user_id,
-                                    "sender_id": target_id,
-                                }
-                                await broadcast_call_frame(user_id, "call_answer", ans_data)
-
-                            asyncio.create_task(simulate_demo_answer())
+            elif frame_type in CALL_SIGNAL_TYPES:
+                # Calls: only the two participants of a call can signal it (see process_call_signal)
+                try:
+                    await process_call_signal(user_id, frame_type, data)
+                except CallError as ce:
+                    await websocket.send_text(json.dumps({
+                        "type": "call_error",
+                        "data": {"call_id": (data or {}).get("call_id"), "frame": frame_type, "reason": ce.reason},
+                    }))
 
             # -----------------------------------------------------------------
             # 5. HEARTBEAT / PING & PRESENCE CONTROL
@@ -2976,7 +2958,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
             elif frame_type == "query_online_snapshot":
                 # The chat list re-syncs all green dots at once (on open, and as a periodic safety net)
-                await manager.send_online_snapshot(websocket)
+                async with async_session_factory() as db:
+                    me_obj = await db.get(User, user_id)
+                    my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
+                await manager.send_online_snapshot(websocket, my_peer_ids)
 
             elif frame_type == "query_presence":
                 target_id = data.get("user_id")

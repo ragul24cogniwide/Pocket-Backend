@@ -7,7 +7,7 @@ import enum
 import json
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -66,6 +66,8 @@ class User(Base):
     fcm_token: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, default=None
     )
+    # Incremented on logout; tokens carry it ("tv") so older tokens are rejected
+    token_version: Mapped[Optional[int]] = mapped_column(Integer, default=0, nullable=True)
     # JSON privacy / notification settings (see privacy_prefs in main.py)
     preferences: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True, default=None
@@ -205,6 +207,9 @@ class Message(Base):
     receipt_hidden: Mapped[Optional[bool]] = mapped_column(
         Boolean, default=False, nullable=True
     )
+    # "Delete for me": hidden only for that person, the other still has the message
+    hidden_for_sender: Mapped[Optional[bool]] = mapped_column(Boolean, default=False, nullable=True)
+    hidden_for_receiver: Mapped[Optional[bool]] = mapped_column(Boolean, default=False, nullable=True)
     # Id the app generated for this message; makes retries over a flaky network idempotent
     client_msg_id: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True, index=True
@@ -474,3 +479,109 @@ class UserSyncSequence(Base):
     current_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
+
+
+class Group(Base):
+    """A group chat. Ids look like "grp_" + 24 lowercase letters (no digits, so they can never
+    be mistaken for a phone number by the number-matching helpers)."""
+    __tablename__ = "chat_groups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    avatar_color: Mapped[str] = mapped_column(String(20), default="#3B82F6", nullable=False)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    created_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+
+class GroupMember(Base):
+    """
+    One person's membership of a group. A member who leaves or is removed keeps the row with
+    `left_at` set: they still see the history up to that moment, read-only (like WhatsApp).
+    """
+    __tablename__ = "group_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("chat_groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(10), default="member", nullable=False)  # 'admin' | 'member'
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    left_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Everything up to these times has reached / been read by this member (ticks + unread count)
+    last_delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_group_member"),
+    )
+
+    @property
+    def active(self) -> bool:
+        return self.left_at is None
+
+
+class GroupMessage(Base):
+    __tablename__ = "group_messages"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True
+    )
+    group_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("chat_groups.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sender_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(10), default="text", nullable=False)  # 'text' | 'system'
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # JSON {"reply_to": ..., "metadata": ...}, same as Message.reply_to
+    extra: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    is_edited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    client_msg_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    # JSON list of user ids who chose "delete for me"
+    hidden_for: Mapped[Optional[str]] = mapped_column(Text, nullable=True, default=None)
+
+    __table_args__ = (Index("ix_group_msg_group_ts", "group_id", "timestamp"),)
+
+    def hidden_ids(self) -> set:
+        try:
+            ids = json.loads(self.hidden_for) if self.hidden_for else []
+        except (TypeError, ValueError):
+            ids = []
+        return set(ids) if isinstance(ids, list) else set()
+
+    def to_dict(self, sender: Optional["User"] = None) -> dict:
+        reply_to = metadata = None
+        if self.extra:
+            try:
+                parsed = json.loads(self.extra)
+                if isinstance(parsed, dict):
+                    reply_to, metadata = parsed.get("reply_to"), parsed.get("metadata")
+            except (TypeError, ValueError):
+                pass
+        return {
+            "id": self.id,
+            "message_id": self.id,
+            "group_id": self.group_id,
+            "sender_id": self.sender_id,
+            "sender_name": (sender.username if sender else None) or ("" if self.kind == "system" else "Flick User"),
+            "sender_color": sender.avatar_color if sender else None,
+            "sender_avatar_url": sender.avatar_url if sender else None,
+            "kind": self.kind,
+            "content": self.content,
+            "reply_to": reply_to,
+            "metadata": metadata,
+            "timestamp": iso_utc(self.timestamp or datetime.now(timezone.utc)),
+            "is_edited": self.is_edited or False,
+            "client_msg_id": self.client_msg_id,
+        }

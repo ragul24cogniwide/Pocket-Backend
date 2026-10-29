@@ -72,7 +72,7 @@ class ConnectionManager:
         try:
             self.redis = aioredis.from_url(self.redis_url, **redis_kwargs)
             await self.redis.ping()
-            logger.info("Successfully connected to Redis at: %s", self.redis_url)
+            logger.info("Successfully connected to Redis at %s", self.redis_url.split("@")[-1])  # no password in logs
             self._presence_listener_task = asyncio.create_task(self._listen_presence_channel())
         except Exception as e:
             logger.warning(
@@ -165,17 +165,7 @@ class ConnectionManager:
         await self.broadcast_presence(user_id, is_online=True)
         logger.info("User connected: %s (Active local sockets: %d)", user_id, len(self.active_connections))
 
-        # Send current online users snapshot to this connecting user immediately
-        try:
-            online_users = await self.get_online_user_ids()
-            await websocket.send_text(json.dumps({
-                "type": "online_users_snapshot",
-                "data": {
-                    "online_user_ids": online_users
-                }
-            }))
-        except Exception:
-            pass
+        # (The "who's online" snapshot is sent by the gateway, limited to this user's contacts)
 
     async def disconnect(self, user_id: str, websocket: Optional[WebSocket] = None) -> None:
         """Removes local connection and cleans up Pub/Sub subscription.
@@ -355,10 +345,14 @@ class ConnectionManager:
         # Backgrounded apps still have a socket for a few seconds but count as offline
         return [i for i in ids if not self.is_away(i)]
 
-    async def send_online_snapshot(self, websocket: WebSocket) -> None:
+    async def send_online_snapshot(self, websocket: WebSocket, visible_ids: Optional[set] = None) -> None:
+        """Who's online, limited to `visible_ids` (the user's contacts) so nobody can harvest numbers."""
+        online = await self.get_online_user_ids()
+        if visible_ids is not None:
+            online = [i for i in online if i in visible_ids]
         await websocket.send_text(json.dumps({
             "type": "online_users_snapshot",
-            "data": {"online_user_ids": await self.get_online_user_ids()},
+            "data": {"online_user_ids": online},
         }))
 
     @staticmethod

@@ -36,12 +36,13 @@ def generate_otp_code(length: int = 6) -> str:
     return "".join(secrets.choice("0123456789") for _ in range(length))
 
 
-def create_access_token(user_id: str, phone_number: str) -> str:
+def create_access_token(user_id: str, phone_number: str, token_version: int = 0) -> str:
     """Generates a signed JWT access token for the authenticated user."""
     expire = datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": user_id,
         "phone_number": phone_number,
+        "tv": int(token_version or 0),  # bumped on logout: older tokens stop working
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
@@ -88,9 +89,16 @@ async def user_from_token(token: Optional[str], db: AsyncSession) -> Optional[Us
     payload = decode_access_token(token)
     if not payload or "sub" not in payload:
         return None
-    user = await _find_user(db, payload["sub"])
-    if not user and payload.get("phone_number"):
-        user = await _find_user(db, payload["phone_number"])
+    # Exact match only. Matching by "last 10 digits" could resolve a token to a different
+    # person whose number shares those digits (e.g. +1 917 555 0123 vs +91 91755 50123).
+    sub = str(payload["sub"]).strip()
+    result = await db.execute(select(User).where(or_(User.id == sub, User.phone_number == sub)))
+    user = result.scalars().first()
+    if user is None:
+        return None
+    # Logged out (or account deleted and re-created): tokens from before are revoked
+    if int(payload.get("tv") or 0) != int(getattr(user, "token_version", 0) or 0):
+        return None
     return user
 
 

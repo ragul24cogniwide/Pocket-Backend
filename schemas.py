@@ -84,6 +84,9 @@ class ChatContactItem(BaseModel):
     unread: int = 0
     last_seen: Optional[str] = None
     version: Optional[int] = None
+    is_group: bool = False
+    member_count: Optional[int] = None
+    is_member: Optional[bool] = None
 
 
 class SyncConversationsResponse(BaseModel):
@@ -96,7 +99,8 @@ class SyncConversationsResponse(BaseModel):
 
 
 class SyncContactsRequest(BaseModel):
-    phone_numbers: List[str]
+    # Capped so the lookup can't be used to scan huge ranges of numbers in one call
+    phone_numbers: List[str] = Field(default_factory=list, max_length=500)
 
 
 class SyncContactsResponse(BaseModel):
@@ -126,8 +130,10 @@ class EditMessageRequest(BaseModel):
 # Voice Calling Schemas
 class CallOfferRequest(BaseModel):
     call_id: str
-    caller_id: str
     receiver_id: str
+    caller_id: Optional[str] = None  # ignored: the caller is always the signed-in user
+    video: Optional[bool] = False
+    sdp: Optional[str] = None  # WebRTC offer
     caller_name: Optional[str] = "Flick User"
     caller_avatar: Optional[str] = "FK"
     caller_avatar_url: Optional[str] = None
@@ -136,9 +142,9 @@ class CallOfferRequest(BaseModel):
 
 class CallAnswerRequest(BaseModel):
     call_id: str
-    caller_id: str
-    receiver_id: str
-    sdp: Optional[str] = None
+    caller_id: Optional[str] = None  # ignored: taken from the call session
+    receiver_id: Optional[str] = None
+    sdp: Optional[str] = None  # WebRTC answer
 
 
 class CallRejectRequest(BaseModel):
@@ -226,3 +232,27 @@ class AgentChatResponse(BaseModel):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Group chats
+# ---------------------------------------------------------------------------
+class CreateGroupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    member_ids: List[str] = Field(default_factory=list, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=500)
+    avatar_color: Optional[str] = Field(default=None, max_length=20)
+
+
+class UpdateGroupRequest(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=60)
+    description: Optional[str] = Field(default=None, max_length=500)
+    avatar_color: Optional[str] = Field(default=None, max_length=20)
+
+
+class GroupMembersRequest(BaseModel):
+    member_ids: List[str] = Field(min_length=1, max_length=255)
+
+
+class GroupAdminRequest(BaseModel):
+    admin: bool = True

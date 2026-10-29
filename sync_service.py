@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, func, or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import ConversationChangeLog, Message, User, UserSyncSequence, iso_utc
+from models import ConversationChangeLog, Group, GroupMember, GroupMessage, Message, User, UserSyncSequence, iso_utc
 from schemas import ChatContactItem, SyncConversationsResponse
 
 logger = logging.getLogger("SyncService")
@@ -22,6 +22,21 @@ AGENT_NAME = "Flick AI Agent"
 AGENT_AVATAR = "AI"
 AGENT_AVATAR_COLOR = "#FFB800"
 AGENT_QUOTE = "Your Personal AI Collaboration Assistant ⚡"
+
+GROUP_ID_PREFIX = "grp_"
+
+
+def is_group_id(value) -> bool:
+    return isinstance(value, str) and value.startswith(GROUP_ID_PREFIX)
+
+
+def group_initials(name: str) -> str:
+    """Avatar letters of a group: the start of its name ("Office Team" -> "OT", "Family" -> "F")."""
+    parts = (name or "").split()
+    if not parts:
+        return "G"
+    return "".join(p[0] for p in parts[:2]).upper()
+
 
 # Retention period for change logs and tombstones (30 days minimum)
 CHANGE_LOG_RETENTION_DAYS = 30
@@ -87,6 +102,8 @@ async def build_conversation_snapshot(
     db: AsyncSession, user_id: str, peer_id: str, version: int = 0
 ) -> Optional[dict]:
     """Builds a conversation dictionary for user_id chatting with peer_id without volatile online state."""
+    if is_group_id(peer_id):
+        return await build_group_snapshot(db, user_id, peer_id, version=version)
     if peer_id == AGENT_USER_ID:
         agent_msg_stmt = (
             select(Message)
@@ -196,6 +213,80 @@ async def build_conversation_snapshot(
     }
 
 
+async def build_group_snapshot(db: AsyncSession, user_id: str, group_id: str, version: int = 0) -> Optional[dict]:
+    """
+    Chat-list row of a group for one member. None when they're not (and never were) in it, which
+    the sync turns into a "deleted" row. Former members keep the row, frozen at the time they left.
+    """
+    group = await db.get(Group, group_id)
+    if not group:
+        return None
+    member = (
+        await db.execute(
+            select(GroupMember).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    if not member:
+        return None
+
+    # Only what this member could see: from when they joined until they left
+    visible = [GroupMessage.group_id == group_id, GroupMessage.timestamp >= member.joined_at]
+    if member.left_at is not None:
+        visible.append(GroupMessage.timestamp <= member.left_at)
+
+    recent = (
+        await db.execute(select(GroupMessage).where(*visible).order_by(desc(GroupMessage.timestamp)).limit(20))
+    ).scalars().all()
+    latest = next((m for m in recent if user_id not in m.hidden_ids()), None)
+
+    preview = "Tap to start chatting"
+    if latest is not None:
+        if latest.kind == "system" or not latest.sender_id:
+            preview = latest.content
+        elif latest.sender_id == user_id:
+            preview = f"You: {latest.content}"
+        else:
+            sender = await db.get(User, latest.sender_id)
+            preview = f"{(sender.username if sender else None) or 'Someone'}: {latest.content}"
+
+    read_from = max(member.last_read_at or member.joined_at, member.joined_at)
+    unread = (
+        await db.execute(
+            select(func.count(GroupMessage.id)).where(
+                *visible,
+                GroupMessage.timestamp > read_from,
+                GroupMessage.kind == "text",
+                GroupMessage.sender_id != user_id,
+            )
+        )
+    ).scalar_one() or 0
+    member_count = (
+        await db.execute(
+            select(func.count(GroupMember.id)).where(GroupMember.group_id == group_id, GroupMember.left_at.is_(None))
+        )
+    ).scalar_one() or 0
+
+    when = latest.timestamp if latest is not None else group.created_at
+    return {
+        "id": group.id,
+        "phone_number": "",
+        "name": group.name,
+        "avatar": group_initials(group.name),
+        "avatar_color": group.avatar_color or "#3B82F6",
+        "avatar_url": group.avatar_url,
+        "quote": group.description or None,
+        "online": False,
+        "last_message": preview,
+        "time": iso_utc(when) if when else "",
+        "unread": unread,
+        "last_seen": None,
+        "version": version,
+        "is_group": True,
+        "member_count": member_count,
+        "is_member": member.left_at is None,
+    }
+
+
 async def record_conversation_change(
     db: AsyncSession, user_id: str, peer_id: str, action: str = "updated"
 ) -> int:
@@ -289,6 +380,15 @@ async def build_all_conversations_for_user(
         seen_identifiers.add(u.id)
 
         snap = await build_conversation_snapshot(db, current_user.id, u.id, version=base_version)
+        if snap:
+            conversations.append(snap)
+
+    # Groups this person is (or was) in
+    group_ids = (
+        await db.execute(select(GroupMember.group_id).where(GroupMember.user_id == current_user.id))
+    ).scalars().all()
+    for gid in set(group_ids):
+        snap = await build_group_snapshot(db, current_user.id, gid, version=base_version)
         if snap:
             conversations.append(snap)
 
