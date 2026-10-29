@@ -135,6 +135,11 @@ async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
     return False
 
 
+def receipts_shared(*users: Optional[User]) -> bool:
+    """Blue ticks only when everyone involved has read receipts on (like WhatsApp, it works both ways)."""
+    return all(u.prefs().get("read_receipts", True) for u in users if u is not None)
+
+
 async def find_client_message(db: AsyncSession, sender_id: str, client_msg_id: Optional[str]) -> Optional[Message]:
     """Message this sender already stored under the app-generated id, if any (a retried send)."""
     if not client_msg_id:
@@ -1289,7 +1294,7 @@ async def get_user_public_profile(
         "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "FK",
         "quote": user.quote or "Hey there! I am using Flick.",
         "is_online": is_online,
-        "last_seen": user.visible_last_seen(),
+        "last_seen": user.visible_last_seen(viewer=current_user),
     }
 
 
@@ -1403,7 +1408,7 @@ async def list_available_contacts(
                         else ""
                     ),
                     unread=unread_count,
-                    last_seen=u.visible_last_seen(),
+                    last_seen=u.visible_last_seen(viewer=current_user),
                 )
             )
         )
@@ -1534,7 +1539,7 @@ async def sync_device_contacts(
                 last_message=u.quote or "Available on Flick",
                 time="",
                 unread=0,
-                last_seen=u.visible_last_seen(),
+                last_seen=u.visible_last_seen(viewer=current_user),
             )
         )
 
@@ -1624,12 +1629,14 @@ async def get_messages_with_user(
     result = await db.execute(stmt)
     messages = result.scalars().all()
     ordered_messages = list(reversed(messages))
-    out = [msg.to_dict() for msg in ordered_messages]
-    # If the other person turned read receipts off, my sent messages show as delivered, not read
-    if o_user is not None and not o_user.prefs().get("read_receipts", True):
-        for m in out:
-            if m.get("sender_id") in cur_ids and str(m.get("status", "")).upper() == "READ":
-                m["status"] = "DELIVERED"
+    out = []
+    for msg in ordered_messages:
+        m = msg.to_dict()
+        # My message read while (or sent while) read receipts were off for either of us:
+        # two grey ticks, permanently. Turning receipts on/off later doesn't change past ticks.
+        if msg.receipt_hidden and m.get("sender_id") in cur_ids and str(m.get("status", "")).upper() == "READ":
+            m["status"] = "DELIVERED"
+        out.append(m)
     return out
 
 
@@ -1658,7 +1665,8 @@ async def send_message_rest(
 
     rec_stmt = select(User).where(User.id == receiver_id)
     rec_res = await db.execute(rec_stmt)
-    if not rec_res.scalar_one_or_none():
+    receiver_user = rec_res.scalar_one_or_none()
+    if not receiver_user:
         names = {"1": "Rahul Sharma", "2": "Priya Patel", "3": "React Native Devs", "4": "Alex Johnson"}
         rec_name = names.get(receiver_id, f"Contact {receiver_id[-4:]}" if len(receiver_id) >= 4 else f"Contact {receiver_id}")
         db.add(User(id=receiver_id, phone_number=receiver_id, username=rec_name, avatar_color="#3B82F6", is_online=False))
@@ -1683,6 +1691,7 @@ async def send_message_rest(
         status=initial_status,
         delivered_at=now if is_rec_online else None,
         client_msg_id=payload.temp_msg_id,
+        receipt_hidden=not receipts_shared(current_user, receiver_user),
     )
     db.add(new_msg)
     await db.commit()
@@ -2319,6 +2328,8 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
     now_read = datetime.now(timezone.utc)
     try:
         async with async_session_factory() as read_db:
+            sender_user = await read_db.get(User, sender_id)
+            hidden_now = not receipts_shared(sender_user)  # same rule as real users
             await read_db.execute(
                 update(Message)
                 .where(
@@ -2326,19 +2337,20 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
                     Message.receiver_id == receiver_id,
                     Message.status != "READ",
                 )
-                .values(status="READ", read_at=now_read)
+                .values(status="READ", read_at=now_read, **({"receipt_hidden": True} if hidden_now else {}))
             )
             await read_db.commit()
 
-        ack_read_frame = {
-            "type": "ack_read",
-            "data": {
-                "reader_id": receiver_id,
-                "sender_id": sender_id,
-                "read_at": now_read.isoformat(),
-            },
-        }
-        await manager.send_personal_message(sender_id, ack_read_frame)
+        if not hidden_now:  # read either way; blue ticks only if the sender shares receipts
+            ack_read_frame = {
+                "type": "ack_read",
+                "data": {
+                    "reader_id": receiver_id,
+                    "sender_id": sender_id,
+                    "read_at": now_read.isoformat(),
+                },
+            }
+            await manager.send_personal_message(sender_id, ack_read_frame)
     except Exception as read_err:
         logger.warning("Bot mark read error: %s", read_err)
 
@@ -2574,6 +2586,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         status=initial_status,
                         delivered_at=now if is_rec_online else None,
                         client_msg_id=client_msg_id,
+                        receipt_hidden=not receipts_shared(
+                            existing_users.get(user_id), existing_users.get(receiver_id)
+                        ),
                     )
                     db.add(new_msg)
                     await db.commit()
@@ -2686,35 +2701,53 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if sender_id:
                     now = datetime.now(timezone.utc)
                     async with async_session_factory() as db:
-                        stmt = (
-                            update(Message)
-                            .where(
+                        reader = await db.get(User, user_id)
+                        sender_res = await db.execute(
+                            select(User).where(or_(User.id == sender_id, User.phone_number == sender_id))
+                        )
+                        sender = sender_res.scalars().first()
+                        # Settings at the moment of reading decide; nothing read now can turn blue later
+                        hidden_now = not receipts_shared(reader, sender)
+
+                        unread_res = await db.execute(
+                            select(Message.id, Message.receipt_hidden).where(
                                 Message.sender_id == sender_id,
                                 Message.receiver_id == user_id,
                                 Message.status != "READ",
                             )
-                            .values(status="READ", read_at=now)
                         )
-                        await db.execute(stmt)
-                        await db.commit()
-
-                        try:
-                            await record_conversation_change(db, user_id=user_id, peer_id=sender_id, action="updated")
+                        unread_rows = unread_res.all()
+                        if unread_rows:
+                            await db.execute(
+                                update(Message)
+                                .where(Message.id.in_([r.id for r in unread_rows]))
+                                .values(status="READ", read_at=now)
+                            )
+                            if hidden_now:
+                                await db.execute(
+                                    update(Message)
+                                    .where(Message.id.in_([r.id for r in unread_rows]))
+                                    .values(receipt_hidden=True)
+                                )
                             await db.commit()
-                        except Exception as sync_err:
-                            logger.warning("Failed to record conversation change for mark_read: %s", sync_err)
 
-                        reader = await db.get(User, user_id)
-                        receipts_on = reader.prefs().get("read_receipts", True) if reader else True
+                            try:
+                                await record_conversation_change(db, user_id=user_id, peer_id=sender_id, action="updated")
+                                await db.commit()
+                            except Exception as sync_err:
+                                logger.warning("Failed to record conversation change for mark_read: %s", sync_err)
 
-                    # Messages still count as read for me; the sender is only told if I share read receipts
-                    if not receipts_on:
+                    # The reader's unread badge clears either way. The sender only gets blue ticks
+                    # for messages whose receipts are shareable (decided per message).
+                    visible_ids = [] if hidden_now else [r.id for r in unread_rows if not r.receipt_hidden]
+                    if not visible_ids:
                         continue
                     ack_read_frame = {
                         "type": "ack_read",
                         "data": {
                             "reader_id": user_id,
                             "sender_id": sender_id,
+                            "message_ids": visible_ids,
                             "read_at": now.isoformat(),
                         },
                     }
@@ -2964,7 +2997,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         target_user = t_res.scalars().first()
                         if target_user:
                             is_target_online = await manager.is_user_online(target_user.id, target_user.phone_number)
-                            target_last_seen = target_user.visible_last_seen()
+                            # Hidden if they chose "Nobody", or if I did (then I can't see anyone's)
+                            target_last_seen = (
+                                None if manager.is_last_seen_hidden(user_id) else target_user.visible_last_seen()
+                            )
                         else:
                             is_target_online = await manager.is_user_online(target_id)
                     try:

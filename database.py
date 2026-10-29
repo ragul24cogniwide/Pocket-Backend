@@ -114,6 +114,7 @@ async def init_db() -> None:
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMP WITH TIME ZONE;",
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences TEXT;",
                     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(64);",
+                    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS receipt_hidden BOOLEAN DEFAULT FALSE;",
                     "CREATE INDEX IF NOT EXISTS ix_messages_client_msg_id ON messages (client_msg_id);",
                 ]:
                     try:

@@ -448,8 +448,16 @@ class ConnectionManager:
                 pass
         return False
 
+    def is_last_seen_hidden(self, user_id: str) -> bool:
+        return user_id in self.last_seen_hidden or self.id_aliases.get(user_id) in self.last_seen_hidden
+
     async def _fanout_presence_local(self, frame: dict[str, Any], skip_user_id: Optional[str] = None) -> None:
         payload = json.dumps(frame)
+        # People who hide their own last seen can't see anyone else's either (online still shows)
+        data = frame.get("data") or {}
+        payload_no_last_seen = (
+            json.dumps({**frame, "data": {**data, "last_seen": None}}) if data.get("last_seen") else payload
+        )
         skip_ids = set()
         if skip_user_id:
             skip_ids.update(self._aliases_for(skip_user_id))
@@ -458,7 +466,7 @@ class ConnectionManager:
             if str(client_id) in skip_ids:
                 continue
             try:
-                await ws.send_text(payload)
+                await ws.send_text(payload_no_last_seen if self.is_last_seen_hidden(str(client_id)) else payload)
             except Exception as e:
                 self._remove_dead_socket(ws, f"presence fanout failure: {e}")
 

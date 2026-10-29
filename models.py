@@ -106,9 +106,16 @@ class User(Base):
             saved = {}
         return {**DEFAULT_USER_PREFS, **(saved if isinstance(saved, dict) else {})}
 
-    def visible_last_seen(self) -> Optional[str]:
-        """Last-seen timestamp as other people may see it (None when the user hides it)."""
-        if self.prefs().get("last_seen") == "nobody" or not self.last_seen:
+    def hides_last_seen(self) -> bool:
+        return self.prefs().get("last_seen") == "nobody"
+
+    def visible_last_seen(self, viewer: Optional["User"] = None) -> Optional[str]:
+        """
+        Last-seen time as `viewer` may see it. Works both ways (like WhatsApp): hidden when this
+        user chose "Nobody", and also when the viewer did (they can't see anyone's either).
+        Online status is separate and always visible.
+        """
+        if not self.last_seen or self.hides_last_seen() or (viewer is not None and viewer.hides_last_seen()):
             return None
         return iso_utc(self.last_seen)
 
@@ -191,6 +198,12 @@ class Message(Base):
     )
     read_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # True when this message must never show blue ticks to its sender: either person had read
+    # receipts off when it was sent or when it was read. Fixed at that moment, so changing the
+    # setting later doesn't rewrite past ticks (old blue stays blue, "off" messages stay grey).
+    receipt_hidden: Mapped[Optional[bool]] = mapped_column(
+        Boolean, default=False, nullable=True
     )
     # Id the app generated for this message; makes retries over a flaky network idempotent
     client_msg_id: Mapped[Optional[str]] = mapped_column(
