@@ -71,6 +71,7 @@ from sync_service import (
     record_conversation_change,
     record_profile_change_for_contacts,
 )
+import archive
 import groups
 import reactions
 import web_sessions
@@ -422,6 +423,7 @@ app.add_middleware(
 app.include_router(groups.router)
 app.include_router(web_sessions.router)
 app.include_router(reactions.router)
+app.include_router(archive.router)
 
 
 @app.get("/api/health")
@@ -1059,6 +1061,7 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
     await web_sessions.revoke_all_sessions(db, me)
     from models import MessageReaction
     await db.execute(sql_delete(MessageReaction).where(MessageReaction.user_id == me))
+    await archive.delete_archives_for(db, me)
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:

@@ -87,6 +87,7 @@ class ChatContactItem(BaseModel):
     is_group: bool = False
     member_count: Optional[int] = None
     is_member: Optional[bool] = None
+    archived: bool = False
 
 
 class SyncConversationsResponse(BaseModel):

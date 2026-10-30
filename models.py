@@ -632,3 +632,20 @@ class MessageReaction(Base):
     )
 
     __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_reaction_message_user"),)
+
+
+class ChatArchive(Base):
+    """A chat someone archived (hidden from their main chat list, on all their devices). It stays
+    archived when new messages arrive, like WhatsApp's "Keep chats archived"."""
+    __tablename__ = "chat_archives"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    peer_id: Mapped[str] = mapped_column(String(64), nullable=False)  # a user id or a group id
+    archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (UniqueConstraint("user_id", "peer_id", name="uq_chat_archive"),)

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, func, or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import ConversationChangeLog, Group, GroupMember, GroupMessage, Message, User, UserSyncSequence, iso_utc
+from models import ChatArchive, ConversationChangeLog, Group, GroupMember, GroupMessage, Message, User, UserSyncSequence, iso_utc
 from schemas import ChatContactItem, SyncConversationsResponse
 
 logger = logging.getLogger("SyncService")
@@ -101,7 +101,18 @@ async def get_next_sync_version(db: AsyncSession, user_id: str) -> int:
 async def build_conversation_snapshot(
     db: AsyncSession, user_id: str, peer_id: str, version: int = 0
 ) -> Optional[dict]:
-    """Builds a conversation dictionary for user_id chatting with peer_id without volatile online state."""
+    """A conversation as user_id sees it (no volatile online state), including whether they archived it."""
+    snap = await _build_snapshot(db, user_id, peer_id, version)
+    if snap is not None:
+        snap["archived"] = (
+            await db.execute(
+                select(ChatArchive.id).where(ChatArchive.user_id == user_id, ChatArchive.peer_id == snap["id"])
+            )
+        ).first() is not None
+    return snap
+
+
+async def _build_snapshot(db: AsyncSession, user_id: str, peer_id: str, version: int = 0) -> Optional[dict]:
     if is_group_id(peer_id):
         return await build_group_snapshot(db, user_id, peer_id, version=version)
     if peer_id == AGENT_USER_ID:
@@ -388,7 +399,7 @@ async def build_all_conversations_for_user(
         await db.execute(select(GroupMember.group_id).where(GroupMember.user_id == current_user.id))
     ).scalars().all()
     for gid in set(group_ids):
-        snap = await build_group_snapshot(db, current_user.id, gid, version=base_version)
+        snap = await build_conversation_snapshot(db, current_user.id, gid, version=base_version)
         if snap:
             conversations.append(snap)
 
