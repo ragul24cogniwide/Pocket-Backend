@@ -314,66 +314,45 @@ async def cleanup_stale_call_sessions_loop() -> None:
             logger.warning("[CallSessions] Sweeper error: %s", e)
 
 
+_call_target_cache: dict[str, str] = {}
+
+
+async def resolve_call_target(target_id: str) -> str:
+    """The account id behind a call participant id (cached: every candidate of a call uses it)."""
+    key = str(target_id or "").strip()
+    if key in _call_target_cache:
+        return _call_target_cache[key]
+    resolved = key
+    try:
+        async with async_session_factory() as call_db:
+            user_obj = (
+                await call_db.execute(select(User).where(or_(User.id == key, User.phone_number == key)))
+            ).scalars().first()
+            if user_obj is None:
+                digits = "".join(filter(str.isdigit, key))
+                if len(digits) >= 10:  # ids saved by older app versions without the country code
+                    user_obj = (
+                        await call_db.execute(select(User).where(User.phone_number.endswith(digits[-10:])))
+                    ).scalars().first()
+            if user_obj is not None:
+                resolved = user_obj.id
+    except Exception as e:
+        logger.warning("[CallRouting] lookup failed for %s: %s", key, e)
+    if len(_call_target_cache) > 5000:
+        _call_target_cache.clear()
+    _call_target_cache[key] = resolved
+    return resolved
+
+
 async def broadcast_call_frame(target_id: str, frame_type: str, data: dict, sender_id: Optional[str] = None) -> bool:
-    """Delivers call signaling frame across all known aliases of target_id with zero-latency Fast Path, excluding caller."""
-    delivered = False
-    call_frame = {"type": frame_type, "data": data}
-
-    target_str = str(target_id).strip()
-    targets = {target_str}
-    digits = "".join(filter(str.isdigit, target_str))
-    if len(digits) >= 8:
-        last10 = digits[-10:]
-        targets.add(last10)
-        targets.add(f"+91{last10}")
-        targets.add(digits)
-
-    # Exclude sender's own identifiers from targets so caller never receives their own call_offer
-    if sender_id:
-        sender_str = str(sender_id).strip()
-        sender_digits = "".join(filter(str.isdigit, sender_str))
-        sender_last10 = sender_digits[-10:] if len(sender_digits) >= 8 else sender_digits
-        targets = {
-            t for t in targets
-            if t != sender_str and (not sender_last10 or not "".join(filter(str.isdigit, t)).endswith(sender_last10))
-        }
-
-    # 1. FAST PATH: Deliver immediately to active socket connections (0ms overhead)
-    for t in list(targets):
-        if await manager.send_personal_message(t, call_frame):
-            delivered = True
-
-    # 2. If not yet delivered, check DB for mapped phone/id aliases as fallback
-    if not delivered:
-        try:
-            async with async_session_factory() as call_db:
-                stmt = (
-                    select(User)
-                    .where(
-                        or_(
-                            User.id == target_str,
-                            User.phone_number == target_str,
-                            User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                            User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                        )
-                    )
-                )
-                res = await call_db.execute(stmt)
-                user_obj = res.scalars().first()
-                if user_obj:
-                    extra_targets = set()
-                    if user_obj.id:
-                        extra_targets.add(str(user_obj.id))
-                    if user_obj.phone_number:
-                        extra_targets.add(str(user_obj.phone_number))
-                    for t in extra_targets:
-                        if t not in targets:
-                            if await manager.send_personal_message(t, call_frame):
-                                delivered = True
-        except Exception as e:
-            logger.warning("[CallRouting] DB alias lookup fallback error: %s", e)
-
-    return delivered
+    """
+    Delivers a call signaling frame to every open socket of the other participant, once.
+    (Sending it to each spelling of their number used to deliver every frame several times.)
+    """
+    target = await resolve_call_target(target_id)
+    if not target or (sender_id and same_identity(target, sender_id)):
+        return False
+    return await manager.send_personal_message(target, {"type": frame_type, "data": data})
 
 
 import httpx

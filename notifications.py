@@ -66,6 +66,33 @@ except Exception as e:
     logger.warning("Firebase Admin initialization skipped: %s", e)
 
 
+# FCM refuses messages over 4 KB in total. Pictures sent as data: URIs (profile photos) or long
+# texts must never be put in a push: they made every call alert fail with "Message is too large".
+MAX_PUSH_FIELD_CHARS = 512
+MAX_PUSH_DATA_CHARS = 2500
+MAX_PUSH_BODY_CHARS = 600
+MAX_PUSH_TITLE_CHARS = 120
+
+
+def fit_push_data(data_payload: Optional[dict]) -> dict:
+    """String-only push data that fits FCM's size limit: oversized fields are left out."""
+    data = {}
+    for key, value in (data_payload or {}).items():
+        if value is None:
+            continue
+        text = str(value)
+        if len(text) > MAX_PUSH_FIELD_CHARS or text.startswith("data:"):
+            logger.info("[Push] Left out oversized field %s (%d chars)", key, len(text))
+            continue
+        data[str(key)] = text
+    # Still too big in total: drop the longest fields first (ids and types are short and stay)
+    while data and sum(len(k) + len(v) for k, v in data.items()) > MAX_PUSH_DATA_CHARS:
+        longest = max(data, key=lambda k: len(data[k]))
+        logger.info("[Push] Left out field %s to fit the size limit", longest)
+        data.pop(longest)
+    return data
+
+
 async def send_push_notification(
     fcm_token: Optional[str],
     sender_name: str,
@@ -84,12 +111,15 @@ async def send_push_notification(
         return True
 
     try:
-        data_strings = {k: str(v) for k, v in (data_payload or {}).items()}
+        data_strings = fit_push_data(data_payload)
+        content = (content or "")[:MAX_PUSH_BODY_CHARS]
+        sender_name = (sender_name or "Flick")[:MAX_PUSH_TITLE_CHARS]
         is_call = data_strings.get("type") == "incoming_call"
         channel_id = "pocket_messages"
+        is_video_call = is_call and data_strings.get("video") == "1"
         display_title = (
-            f"📞 Incoming Call: {sender_name}"
-            if is_call and not sender_name.startswith("📞")
+            (f"📹 Incoming video call: {sender_name}" if is_video_call else f"📞 Incoming voice call: {sender_name}")
+            if is_call and not sender_name.startswith(("📞", "📹"))
             else sender_name
         )
 
