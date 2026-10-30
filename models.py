@@ -649,3 +649,28 @@ class ChatArchive(Base):
     )
 
     __table_args__ = (UniqueConstraint("user_id", "peer_id", name="uq_chat_archive"),)
+
+
+class CallRecord(Base):
+    """One voice / video call, for the call log of both people (phone and Flick Web).
+    status: ringing | completed | missed | declined | busy"""
+    __tablename__ = "call_records"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)  # the call id
+    caller_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    receiver_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="ringing", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    answered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # "Clear call log" hides it for that person only
+    hidden_for_caller: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    hidden_for_receiver: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

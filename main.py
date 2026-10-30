@@ -72,6 +72,7 @@ from sync_service import (
     record_profile_change_for_contacts,
 )
 import archive
+import calllog
 import groups
 import reactions
 import web_sessions
@@ -424,6 +425,7 @@ app.include_router(groups.router)
 app.include_router(web_sessions.router)
 app.include_router(reactions.router)
 app.include_router(archive.router)
+app.include_router(calllog.router)
 
 
 @app.get("/api/health")
@@ -685,6 +687,7 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
         }
         delivered = await broadcast_call_frame(receiver_id, "call_offer", frame, sender_id=user_id)
         if first_offer:
+            asyncio.create_task(calllog.record_offer(call_id, user_id, receiver_id, session["video"]))
             kind = "video" if session["video"] else "voice"
             asyncio.create_task(dispatch_push_to_user(
                 sender_id=user_id,
@@ -718,6 +721,7 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
         if status != "ringing":
             raise CallError("This call is no longer ringing", 409)
         session.update({"status": "answered", "answered_at": now_iso})
+        asyncio.create_task(calllog.record_answer(call_id))
         if sdp:
             session["answer_sdp"] = sdp  # lets the caller recover it via /api/call/status if the socket frame is missed
         out = {"sdp": sdp, "video": session.get("video", False)}
@@ -741,6 +745,7 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
             return {"status": status, "call_id": call_id}
         reason = str(data.get("reason") or "declined")[:32]
         session.update({"status": "rejected", "reason": reason})
+        asyncio.create_task(calllog.record_finish(call_id, "busy" if reason == "busy" else "declined"))
         out = {"reason": reason}
         push = ("Call declined", {"type": "call_rejected", "reason": reason})
     elif frame_type == "call_end":
@@ -751,6 +756,7 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
         except (TypeError, ValueError):
             duration = 0
         session.update({"status": "ended", "duration": duration})
+        asyncio.create_task(calllog.record_finish(call_id, None, duration))
         out = {"duration": duration}
         push = ("Call ended", {"type": "call_ended"})
     else:
@@ -1062,6 +1068,7 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
     from models import MessageReaction
     await db.execute(sql_delete(MessageReaction).where(MessageReaction.user_id == me))
     await archive.delete_archives_for(db, me)
+    await calllog.delete_calls_for(db, me)
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:
