@@ -1,10 +1,11 @@
 """
-Personal AI Agent Engine for Pocket Collaboration Platform.
+Personal AI Agent Engine for Flick.
 Provides personalized, user-isolated conversational intelligence,
 daily activity awareness, calendar event creation, conflict checking,
 and chat summarization.
 """
 
+import asyncio
 import os
 import re
 import json
@@ -37,7 +38,7 @@ HAS_GENAI = HAS_NEW_GENAI or HAS_LEGACY_GENAI
 logger = logging.getLogger("ai_agent")
 
 AGENT_USER_ID = "ai_assistant"
-AGENT_NAME = "Pocket AI Agent"
+AGENT_NAME = "Flick AI Agent"
 AGENT_AVATAR = "AI"
 AGENT_AVATAR_COLOR = "#FFB800"
 AGENT_QUOTE = "Your Multipurpose Personal AI Assistant ⚡"
@@ -279,6 +280,36 @@ async def check_meeting_conflicts(
     return list(res.scalars().all())
 
 
+GEMINI_TIMEOUT_SECONDS = 25
+
+
+def ai_unavailable_reply(reason: str, user_name: str = "") -> Dict[str, Any]:
+    """
+    Honest answer when Gemini can't be used: says so, and shows what still works offline
+    (the calendar), instead of a canned answer that pretends to be AI.
+    reason: 'not_configured' (no GEMINI_API_KEY on the server) or 'failed' (the AI service errored).
+    """
+    hello = f"Hi {user_name}! 👋 " if user_name else ""
+    if reason == "not_configured":
+        why = "my AI service isn't connected yet, so I can't answer general questions right now."
+    else:
+        why = "I couldn't reach my AI service just now. Please try again in a minute."
+    return {
+        "reply": (
+            f"{hello}Sorry, {why}\n\n"
+            "I can still help with your calendar:\n"
+            "• \"What meetings do I have today?\"\n"
+            "• \"Schedule a team sync tomorrow at 3 PM\"\n"
+            "• \"Move my 3 PM meeting to 4 PM\"\n"
+            "• \"When am I free on Friday?\""
+        ),
+        "action": "general_chat",
+        "meeting": None,
+        "meetings": None,
+        "suggested_actions": ["What meetings do I have today?", "Schedule a meeting tomorrow at 3 PM"],
+    }
+
+
 def get_gemini_api_key() -> str:
     """Reads GEMINI_API_KEY from the environment or the .env file ("" when not configured)."""
     key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -403,8 +434,8 @@ async def call_gemini_agent(
         except Exception:
             pass
 
-    system_instruction = f"""You are Pocket AI, an intelligent, versatile, multipurpose personal AI assistant embedded in the Pocket collaboration platform.
-You are a full-featured, comprehensive AI assistant (similar to ChatGPT, Gemini, or Claude). You are NOT limited to meetings or calendar events. You are capable of assisting the user with virtually ANY question or task across all domains, while natively integrating with their Pocket calendar and chat when requested.
+    system_instruction = f"""You are Flick AI, an intelligent, versatile, multipurpose personal AI assistant built into the Flick messaging app.
+You are a full-featured, comprehensive AI assistant (similar to ChatGPT, Gemini, or Claude). You are NOT limited to meetings or calendar events. You are capable of assisting the user with virtually ANY question or task across all domains, while natively integrating with their Flick calendar and chat when requested.
 
 MULTIPLE PURPOSE CAPABILITIES:
 1. `general_chat` (DEFAULT FOR GENERAL QUERIES):
@@ -440,7 +471,7 @@ MULTIPLE PURPOSE CAPABILITIES:
    - Reply asking for the missing details politely, and set suggested_actions to possible slots or times.
 
 CURRENT USER CONTEXT:
-- Name: {current_user.username or 'Pocket User'}
+- Name: {current_user.username or 'Flick User'}
 - User's current local date & time: {user_now.strftime('%A, %B %d, %Y at %I:%M %p')}
 - Timezone offset: {tz_offset_minutes} minutes from UTC
 
@@ -467,9 +498,15 @@ Example JSON:
 }}
 """
 
-    model_names = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-1.5-flash"]
+    # "gemini-flash-latest" always points at Google's current Flash model; the others are fallbacks
+    model_names = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
     response_text = None
     last_err = None
+
+    # The Gemini SDK calls block. Run them in a worker thread with a time limit, otherwise every
+    # chat and call on the server freezes while the model is thinking.
+    async def off_loop(fn, *args, **kwargs):
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=GEMINI_TIMEOUT_SECONDS)
 
     # Try new google.genai client first
     if HAS_NEW_GENAI and genai:
@@ -477,7 +514,8 @@ Example JSON:
             client = genai.Client(api_key=api_key)
             for m_name in model_names:
                 try:
-                    resp = client.models.generate_content(
+                    resp = await off_loop(
+                        client.models.generate_content,
                         model=m_name,
                         contents=content,
                         config=genai_types.GenerateContentConfig(
@@ -504,7 +542,7 @@ Example JSON:
                     system_instruction=system_instruction,
                     generation_config={"response_mime_type": "application/json"}
                 )
-                resp = model.generate_content(content)
+                resp = await off_loop(model.generate_content, content)
                 if resp and resp.text:
                     response_text = resp.text
                     break
@@ -513,7 +551,7 @@ Example JSON:
                 try:
                     model = legacy_genai.GenerativeModel(model_name=m_name)
                     combined_prompt = f"{system_instruction}\n\nUser request: {content}\n\nRespond strictly with JSON:"
-                    resp = model.generate_content(combined_prompt)
+                    resp = await off_loop(model.generate_content, combined_prompt)
                     if resp and resp.text:
                         response_text = resp.text
                         break
@@ -522,7 +560,7 @@ Example JSON:
                     continue
 
     if not response_text:
-        logger.warning(f"Could not get response from Gemini models: {last_err}")
+        logger.warning("Could not get a response from Gemini (%s): %s", type(last_err).__name__, last_err)
         return None
 
     try:
@@ -583,9 +621,9 @@ Example JSON:
             start_time=parsed_start,
             end_time=parsed_end,
             timezone="UTC",
-            location=m_info.get("location") or "Pocket Virtual Room",
+            location=m_info.get("location") or "Flick Virtual Room",
             meeting_link=None,
-            attendees=json.dumps(m_info.get("attendees") or [current_user.username or "Pocket User"]),
+            attendees=json.dumps(m_info.get("attendees") or [current_user.username or "Flick User"]),
             status="SCHEDULED",
         )
         db.add(new_meeting)
@@ -767,6 +805,7 @@ async def _process_personal_agent_message_raw(
     # 1. Powered by Google Gemini (if GEMINI_API_KEY is configured)
     # -------------------------------------------------------------------------
     gemini_key = get_gemini_api_key()
+    ai_state = "failed" if gemini_key else "not_configured"
     if gemini_key:
         try:
             gemini_result = await call_gemini_agent(
@@ -905,9 +944,9 @@ async def _process_personal_agent_message_raw(
             start_time=meeting_start,
             end_time=meeting_end,
             timezone="UTC",
-            location="Pocket Virtual Room",
+            location="Flick Virtual Room",
             meeting_link=None,
-            attendees=json.dumps([current_user.username or "Pocket User"]),
+            attendees=json.dumps([current_user.username or "Flick User"]),
             status="SCHEDULED",
         )
         db.add(new_meeting)
@@ -1157,118 +1196,10 @@ async def _process_personal_agent_message_raw(
         }
 
     # -------------------------------------------------------------------------
-    # 8. General Conversational Intelligence
+    # 8. Anything else needs the AI model. Without it, say so honestly (no canned "answers").
     # -------------------------------------------------------------------------
-    if any(w in lowered for w in ["hi", "hello", "hey", "good morning", "good evening", "who are you"]):
-        user_name = current_user.username or "there"
-        return {
-            "reply": (
-                f"Hello {user_name}! 👋 I'm Pocket AI, your multipurpose personal assistant.\n\n"
-                f"I'm here to assist you with virtually anything:\n"
-                f"• ✍️ Drafting & Writing: Compose professional emails, team updates, or quick messages\n"
-                f"• 💡 Brainstorming & Planning: Generate ideas, solve problems, or structure projects\n"
-                f"• 💻 Coding & Tech Support: Debug code, explain algorithms, and discuss architectures\n"
-                f"• 📅 Calendar & Meetings: Schedule events, check for conflicts, and organize agendas\n"
-                f"• 📝 Summarizing Chats: Extract key takeaways from your team conversations\n"
-                f"• 🔍 General Q&A: Ask questions about any topic\n\n"
-                f"How can I help you today?"
-            ),
-            "action": "general_chat",
-            "meeting": None,
-            "meetings": None,
-            "suggested_actions": ["Draft a message", "Brainstorm ideas", "What are my meetings today?", "Summarize recent chats"],
-        }
-
-    # 8b. Drafting & Writing requests (emails, letters, formal messages)
-    if any(kw in lowered for kw in ["write an email", "draft an email", "draft a message", "compose an email", "write a letter", "draft a response", "write a reply"]):
-        cleaned_prompt = raw_text
-        for p in ["please ", "can you ", "could you ", "write an email to ", "draft an email to ", "draft a message saying ", "write a message saying "]:
-            cleaned_prompt = cleaned_prompt.replace(p, "").strip()
-
-        draft_reply = (
-            f"Here is a well-crafted draft for you:\n\n"
-            f"---\n"
-            f"Subject: Update regarding {cleaned_prompt.capitalize() if len(cleaned_prompt) < 40 else 'our upcoming discussion'}\n\n"
-            f"Hi team / [Recipient Name],\n\n"
-            f"I hope you are having a productive week.\n\n"
-            f"I wanted to reach out regarding: {cleaned_prompt}.\n\n"
-            f"Please let me know your thoughts or availability at your earliest convenience.\n\n"
-            f"Best regards,\n"
-            f"{current_user.username or 'Pocket User'}\n"
-            f"---\n\n"
-            f"💡 Would you like me to refine this or adjust the tone (more formal, casual, or concise)?"
-        )
-        return {
-            "reply": draft_reply,
-            "action": "general_chat",
-            "meeting": None,
-            "meetings": None,
-            "suggested_actions": ["Make it more formal", "Make it more concise", "Schedule a follow-up meeting"],
-        }
-
-    # 8c. Brainstorming & Idea Generation
-    if any(kw in lowered for kw in ["brainstorm", "give me ideas", "suggest ideas", "give me some ideas", "business ideas", "ideas for", "features"]):
-        return {
-            "reply": (
-                f"Here are top creative ideas and strategies based on \"{raw_text}\":\n\n"
-                f"1. Core Focus & Quick Win: Start with high-impact, low-friction essentials to build immediate momentum.\n"
-                f"2. Smart Automation & AI: Streamline repetitive workflows with automated triggers and proactive suggestions.\n"
-                f"3. Seamless Collaboration: Enable cross-team visibility with shared calendar sync, activity awareness, and instant summaries.\n"
-                f"4. Delightful User Experience: Prioritize intuitive micro-interactions, responsive design, and quick action chips.\n"
-                f"5. Continuous Iteration: Gather user feedback rapidly to refine and scale.\n\n"
-                f"Let me know which direction you'd like to explore further!"
-            ),
-            "action": "general_chat",
-            "meeting": None,
-            "meetings": None,
-            "suggested_actions": ["Elaborate on point 1", "Draft an action plan", "Schedule a brainstorming sync"],
-        }
-
-    # 8d. Code & Tech Queries
-    if any(kw in lowered for kw in ["code", "python", "javascript", "react", "bug", "sql", "api", "function"]):
-        return {
-            "reply": (
-                f"Here is a technical overview regarding your query:\n\n"
-                f"```javascript\n"
-                f"// Clean modular pattern example\n"
-                f"async function handleTask(payload) {{\n"
-                f"  try {{\n"
-                f"    const result = await processRequest(payload);\n"
-                f"    return {{ success: true, data: result }};\n"
-                f"  }} catch (error) {{\n"
-                f"    console.error('Execution failed:', error);\n"
-                f"    return {{ success: false, error: error.message }};\n"
-                f"  }}\n"
-                f"}}\n"
-                f"```\n\n"
-                f"Key best practices:\n"
-                f"• Ensure async operations have robust try-catch error handling\n"
-                f"• Keep functions modular, single-responsibility, and testable\n"
-                f"• Cache frequent lookups locally for maximum UI speed"
-            ),
-            "action": "general_chat",
-            "meeting": None,
-            "meetings": None,
-            "suggested_actions": ["Explain line-by-line", "Show Python version", "How to write tests for this?"],
-        }
-
-    # 8e. General Multipurpose Conversational Response
-    return {
-        "reply": (
-            f"I received your request: \"{raw_text}\".\n\n"
-            f"As your Multipurpose Personal AI, I can assist you with:\n"
-            f"• ✍️ Writing, drafting messages, and editing text\n"
-            f"• 💡 Brainstorming solutions, research, and planning\n"
-            f"• 💻 Technical coding, debugging, and architecture\n"
-            f"• 📅 Scheduling, checking calendar events, and team syncs\n"
-            f"• 📝 Summarizing conversations and action items\n\n"
-            f"Feel free to ask me anything or tell me what you'd like to work on!"
-        ),
-        "action": "general_chat",
-        "meeting": None,
-        "meetings": None,
-        "suggested_actions": ["Draft a message", "Brainstorm ideas", "What are my meetings today?", "Summarize recent chats"],
-    }
+    is_greeting = re.search(r"^\s*(hi|hello|hey|hii+|good\s+(morning|afternoon|evening)|who\s+are\s+you)\b", lowered)
+    return ai_unavailable_reply(ai_state, (current_user.username or "").split(" ")[0] if is_greeting else "")
 
 
 async def process_personal_agent_message(
