@@ -613,3 +613,22 @@ class WebSession(Base):
             "last_active_at": iso_utc(self.last_active_at),
             "current": self.id == current_sid,
         }
+
+
+class MessageReaction(Base):
+    """An emoji reaction to a direct or group message. One per person per message (like
+    WhatsApp): reacting again replaces it, reacting with the same emoji removes it."""
+    __tablename__ = "message_reactions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    message_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    group_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    emoji: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_reaction_message_user"),)

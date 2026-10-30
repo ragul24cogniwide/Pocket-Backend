@@ -31,6 +31,7 @@ from connection_manager import manager
 from database import async_session_factory, get_db
 from models import Group, GroupMember, GroupMessage, User, iso_utc
 from notifications import send_push_notification
+from reactions import delete_reactions, reactions_for
 from schemas import CreateGroupRequest, GroupAdminRequest, GroupMembersRequest, UpdateGroupRequest
 from sync_service import AGENT_USER_ID, GROUP_ID_PREFIX, group_initials, is_group_id, record_conversation_change
 
@@ -452,6 +453,7 @@ async def group_history(user: User, group_id: str, limit: int = 50, offset: int 
         members = await active_members(db, group_id)
         marks = receipt_marks(members, user.id)
         senders = await users_by_id(db, [m.sender_id for m in rows])
+        reaction_map = await reactions_for(db, [m.id for m in rows])
 
     out = []
     for msg in reversed(rows):
@@ -459,6 +461,7 @@ async def group_history(user: User, group_id: str, limit: int = 50, offset: int 
             continue
         d = msg.to_dict(senders.get(msg.sender_id))
         d["status"] = tick_for(msg.timestamp, marks) if msg.sender_id == user.id and msg.kind == "text" else "READ"
+        d["reactions"] = reaction_map.get(msg.id, [])
         out.append(d)
     return out
 
@@ -503,6 +506,7 @@ async def delete_group_message(user: User, message_id: str, for_everyone: bool) 
             return True
         group_id = msg.group_id
         if for_everyone and msg.sender_id == user.id and member.left_at is None and msg.kind == "text":
+            await delete_reactions(db, message_id)
             await db.delete(msg)
             await db.commit()
             member_ids = [m.user_id for m in await active_members(db, group_id)]

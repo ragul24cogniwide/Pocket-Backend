@@ -72,6 +72,7 @@ from sync_service import (
     record_profile_change_for_contacts,
 )
 import groups
+import reactions
 import web_sessions
 from groups import GroupError, is_group_id
 from ai_agent import (
@@ -420,6 +421,7 @@ app.add_middleware(
 )
 app.include_router(groups.router)
 app.include_router(web_sessions.router)
+app.include_router(reactions.router)
 
 
 @app.get("/api/health")
@@ -1055,6 +1057,8 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
     await db.execute(sql_delete(UserSyncSequence).where(UserSyncSequence.user_id == me))
     await groups.remove_user_from_all_groups(db, current_user)
     await web_sessions.revoke_all_sessions(db, me)
+    from models import MessageReaction
+    await db.execute(sql_delete(MessageReaction).where(MessageReaction.user_id == me))
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:
@@ -1714,12 +1718,14 @@ async def get_messages_with_user(
     result = await db.execute(stmt)
     messages = result.scalars().all()
     ordered_messages = list(reversed(messages))
+    reaction_map = await reactions.reactions_for(db, [m.id for m in ordered_messages])
     out = []
     for msg in ordered_messages:
         # "Deleted for me" by this person: not shown to them
         if (msg.sender_id in cur_ids and msg.hidden_for_sender) or (msg.receiver_id in cur_ids and msg.hidden_for_receiver):
             continue
         m = msg.to_dict()
+        m["reactions"] = reaction_map.get(msg.id, [])
         # My message read while (or sent while) read receipts were off for either of us:
         # two grey ticks, permanently. Turning receipts on/off later doesn't change past ticks.
         if msg.receipt_hidden and m.get("sender_id") in cur_ids and str(m.get("status", "")).upper() == "READ":
@@ -1929,6 +1935,7 @@ async def delete_message(
     if for_everyone and is_sender:
         receiver_id = msg.receiver_id
         sender_id = msg.sender_id
+        await reactions.delete_reactions(db, message_id)
         await db.delete(msg)
         await db.commit()
 
