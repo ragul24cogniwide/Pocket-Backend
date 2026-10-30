@@ -7,7 +7,7 @@ import enum
 import json
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -674,3 +674,19 @@ class CallRecord(Base):
     # "Clear call log" hides it for that person only
     hidden_for_caller: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     hidden_for_receiver: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class MediaFile(Base):
+    """An uploaded photo / voice note. Kept in the database because the server's own disk is
+    wiped on every redeploy / restart (Render); the disk copy is only a cache."""
+    __tablename__ = "media_files"
+
+    name: Mapped[str] = mapped_column(String(120), primary_key=True)  # e.g. photo_<random>.jpg
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # images | audio
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    owner_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )

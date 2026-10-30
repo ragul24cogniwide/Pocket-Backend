@@ -481,13 +481,12 @@ async def set_gemini_key_endpoint(payload: dict):
     return {"status": "error", "message": "No key provided."}
 
 
-from fastapi.staticfiles import StaticFiles
 import base64
 
-os.makedirs("uploads/audio", exist_ok=True)
-os.makedirs("uploads/images", exist_ok=True)
+import media_store
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# Photos / voice notes: stored in the database, served from /uploads/... (see media_store.py)
+app.include_router(media_store.router)
 
 
 # -----------------------------------------------------------------------------
@@ -522,14 +521,9 @@ async def upload_image(payload: dict, current_user: User = Depends(get_current_u
         image_bytes = base64.b64decode(image_base64)
         if len(image_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="Image is too large (max 10 MB)")
-        file_id = f"photo_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.{file_ext}"
-        file_path = os.path.join("uploads", "images", file_id)
-
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
-
-        media_url = f"/uploads/images/{file_id}"
-        logger.info("Saved photo (%d bytes) to %s", len(image_bytes), file_path)
+        file_id = media_store.new_name("photo", file_ext)
+        media_url = await media_store.save_media("images", file_id, image_bytes, current_user.id)
+        logger.info("Saved photo (%d bytes) as %s", len(image_bytes), file_id)
 
         return {
             "status": "success",
@@ -563,15 +557,9 @@ async def upload_audio(payload: dict, current_user: User = Depends(get_current_u
         audio_bytes = base64.b64decode(audio_base64)
         if len(audio_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="Voice note is too large (max 10 MB)")
-        file_id = f"voice_{int(datetime.now(timezone.utc).timestamp())}_{uuid.uuid4().hex[:8]}.m4a"
-        file_path = os.path.join("uploads", "audio", file_id)
-
-        with open(file_path, "wb") as f:
-            f.write(audio_bytes)
-
-        # Public relative or absolute path
-        media_url = f"/uploads/audio/{file_id}"
-        logger.info("Saved voice note (%d bytes, %ds) to %s", len(audio_bytes), duration, file_path)
+        file_id = media_store.new_name("voice", "m4a")
+        media_url = await media_store.save_media("audio", file_id, audio_bytes, current_user.id)
+        logger.info("Saved voice note (%d bytes, %ss) as %s", len(audio_bytes), duration, file_id)
 
         return {
             "status": "success",
