@@ -28,6 +28,9 @@ DEFAULT_FIREBASE_CRED = {
 }
 
 try:
+    # FIREBASE_DISABLED=true (local test servers): never contact Firebase, log pushes instead
+    if os.getenv("FIREBASE_DISABLED", "").strip().lower() == "true":
+        raise RuntimeError("disabled by FIREBASE_DISABLED")
     import firebase_admin
     from firebase_admin import credentials, messaging
     import glob
