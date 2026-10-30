@@ -9,8 +9,12 @@ PUT /api/messages/{message_id}/reaction  {"emoji": null}  removes it
 - One reaction per person per message. The value must be an emoji (no text, no markup).
 - Everyone in the chat (all their devices: phone and Flick Web) gets a live `message_reaction`
   frame with the message's full reaction list, so clients just replace what they show.
+- The person who wrote the message also gets a push notification ("Bob reacted ❤️ to …"),
+  following their notification / preview / sound settings.
 """
 
+import asyncio
+import logging
 import unicodedata
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -22,12 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
 from connection_manager import manager
-from database import get_db
-from models import GroupMember, GroupMessage, Message, MessageReaction, User
+from database import async_session_factory, get_db
+from models import Group, GroupMember, GroupMessage, Message, MessageReaction, User
+from notifications import send_push_notification
+
+logger = logging.getLogger("Reactions")
 
 router = APIRouter(prefix="/api/messages", tags=["reactions"])
 
 MAX_EMOJI_CODEPOINTS = 12
+PUSH_PREVIEW_CHARS = 60
 
 
 class ReactionRequest(BaseModel):
@@ -138,10 +146,52 @@ async def set_reaction(
             "name": current_user.username or "Someone",
             "emoji": emoji,
             "reactions": reactions,
+            # for the chat list line "Bob reacted ❤️ to: “…”" (everyone here already has the message)
+            "message_preview": " ".join(str(msg.content or "").split())[:PUSH_PREVIEW_CHARS],
         },
     }
     for uid in dict.fromkeys(audience):
         if uid and uid != current_user.id:
             await manager.send_personal_message(uid, frame)
     await manager.send_to_my_devices(current_user.id, frame)  # my phone / other browsers
+    if emoji and msg.sender_id and msg.sender_id != current_user.id:
+        asyncio.create_task(push_reaction(
+            current_user.id, current_user.username or "Someone", msg.sender_id, message_id, msg.content, group_id, emoji,
+        ))
     return {"message_id": message_id, "emoji": emoji, "reactions": reactions}
+
+
+async def push_reaction(
+    reactor_id: str, reactor_name: str, author_id: str, message_id: str, content: str, group_id: Optional[str], emoji: str
+) -> None:
+    """Notification to the message's author: "❤️ Bob reacted to: “See you at 5”"."""
+    try:
+        async with async_session_factory() as db:
+            author = await db.get(User, author_id)
+            group = await db.get(Group, group_id) if group_id else None
+        if author is None or not author.fcm_token:
+            return
+        prefs = author.prefs()
+        if not prefs.get("msg_notifications", True):
+            return
+        if prefs.get("preview", True):
+            text = " ".join(str(content or "").split())
+            if len(text) > PUSH_PREVIEW_CHARS:
+                text = text[:PUSH_PREVIEW_CHARS].rstrip() + "…"
+            about = f": “{text}”" if text else " your message"
+        else:
+            about = " your message"
+        if group is not None:
+            title, body = group.name, f"{reactor_name} reacted {emoji} to{about}"
+            data = {"type": "reaction", "message_id": message_id, "group_id": group.id, "group_name": group.name,
+                    "group_avatar_color": group.avatar_color or ""}
+        else:
+            title, body = reactor_name, f"Reacted {emoji} to{about}"
+            # sender_id = the chat to open when the notification is tapped
+            data = {"type": "reaction", "message_id": message_id, "sender_id": reactor_id}
+        await send_push_notification(
+            fcm_token=author.fcm_token, sender_name=title, content=body, data_payload=data,
+            silent=not prefs.get("sound", True),
+        )
+    except Exception as e:  # a failed push never affects the reaction itself
+        logger.warning("Reaction push to %s failed: %s", author_id, e)
