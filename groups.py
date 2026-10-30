@@ -484,12 +484,10 @@ async def edit_group_message(user: User, message_id: str, content: str) -> Optio
         await db.commit()
         member_ids = [m.user_id for m in await active_members(db, msg.group_id)]
         data = msg.to_dict(user)
-    await fanout(
-        member_ids,
-        {"type": "message_edited", "data": {"message_id": message_id, "group_id": data["group_id"],
-                                            "sender_id": user.id, "content": content, "is_edited": True}},
-        exclude=user.id,
-    )
+    edit_frame = {"type": "message_edited", "data": {"message_id": message_id, "group_id": data["group_id"],
+                                                     "sender_id": user.id, "content": content, "is_edited": True}}
+    await fanout(member_ids, edit_frame, exclude=user.id)
+    await manager.send_to_my_devices(user.id, edit_frame)  # the editor's phone / browser
     _background(record_changes(data["group_id"], member_ids))
     return {"status": "success", "message": data, "is_edited": True}
 
@@ -508,11 +506,10 @@ async def delete_group_message(user: User, message_id: str, for_everyone: bool) 
             await db.delete(msg)
             await db.commit()
             member_ids = [m.user_id for m in await active_members(db, group_id)]
-            await fanout(
-                member_ids,
-                {"type": "message_deleted", "data": {"message_id": message_id, "group_id": group_id, "sender_id": user.id}},
-                exclude=user.id,
-            )
+            delete_frame = {"type": "message_deleted",
+                            "data": {"message_id": message_id, "group_id": group_id, "sender_id": user.id}}
+            await fanout(member_ids, delete_frame, exclude=user.id)
+            await manager.send_to_my_devices(user.id, delete_frame)
             _background(record_changes(group_id, member_ids))
         else:
             hidden = msg.hidden_ids()
@@ -520,6 +517,8 @@ async def delete_group_message(user: User, message_id: str, for_everyone: bool) 
             msg.hidden_for = json.dumps(sorted(hidden))
             await db.commit()
             _background(record_changes(group_id, [user.id]))
+            await manager.send_to_my_devices(user.id, {"type": "message_deleted", "data": {
+                "message_id": message_id, "group_id": group_id, "sender_id": msg.sender_id, "for_me": True}})
     return True
 
 

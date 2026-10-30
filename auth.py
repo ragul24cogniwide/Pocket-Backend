@@ -14,7 +14,7 @@ from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
-from models import User
+from models import User, WebSession
 
 # The signing secret must come from the environment. A default baked into the
 # source would let anyone who can read the code mint tokens for any user.
@@ -27,6 +27,11 @@ if not JWT_SECRET_KEY:
     )
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "30"))
+# Linked browsers (Flick Web): signed out after this many days without use, like WhatsApp Web
+WEB_SESSION_IDLE_DAYS = int(os.getenv("WEB_SESSION_IDLE_DAYS", "14"))
+WEB_TOKEN_EXPIRE_DAYS = 30
+# last_active_at is written at most this often, not on every request
+WEB_ACTIVITY_WRITE_SECONDS = 3600
 
 security_bearer = HTTPBearer(auto_error=False)
 
@@ -47,6 +52,33 @@ def create_access_token(user_id: str, phone_number: str, token_version: int = 0)
         "iat": datetime.now(timezone.utc),
     }
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def create_web_token(user_id: str, phone_number: str, token_version: int, session_id: str) -> str:
+    """Token for a linked browser. It names its web session ("sid"), so revoking the session
+    (or logging out on the phone, which bumps the token version) ends it at once."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "phone_number": phone_number,
+        "tv": int(token_version or 0),
+        "sid": session_id,
+        "typ": "web",
+        "exp": now + timedelta(days=WEB_TOKEN_EXPIRE_DAYS),
+        "iat": now,
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def web_session_id(user: Optional[User]) -> Optional[str]:
+    """The linked-browser session the current request came from, or None for the phone app."""
+    return getattr(user, "web_session_id", None) if user is not None else None
 
 
 def decode_access_token(token: str) -> Optional[dict]:
@@ -99,6 +131,20 @@ async def user_from_token(token: Optional[str], db: AsyncSession) -> Optional[Us
     # Logged out (or account deleted and re-created): tokens from before are revoked
     if int(payload.get("tv") or 0) != int(getattr(user, "token_version", 0) or 0):
         return None
+    sid = payload.get("sid")
+    if sid is not None:
+        # Linked browser: valid only while its session is live (not logged out, not idle too long)
+        session = await db.get(WebSession, str(sid))
+        now = datetime.now(timezone.utc)
+        if session is None or session.revoked_at is not None or session.user_id != user.id:
+            return None
+        last_active = _aware(session.last_active_at) or now
+        if now - last_active > timedelta(days=WEB_SESSION_IDLE_DAYS):
+            return None
+        if (now - last_active).total_seconds() > WEB_ACTIVITY_WRITE_SECONDS:
+            session.last_active_at = now
+            await db.commit()
+    user.web_session_id = str(sid) if sid is not None else None
     return user
 
 
@@ -123,6 +169,14 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    return user
+
+
+async def get_phone_user(user: User = Depends(get_current_user)) -> User:
+    """Like get_current_user, but refuses linked browsers: some actions (linking more devices,
+    deleting the account, push tokens) can only be done from the phone itself."""
+    if web_session_id(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Open Flick on your phone to do this.")
     return user
 
 

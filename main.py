@@ -30,8 +30,10 @@ from auth import (
     generate_otp_code,
     get_current_user,
     get_current_user_optional,
+    get_phone_user,
     same_identity,
     user_from_token,
+    web_session_id,
 )
 from connection_manager import manager, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
 from database import async_session_factory, get_db, init_db
@@ -70,6 +72,7 @@ from sync_service import (
     record_profile_change_for_contacts,
 )
 import groups
+import web_sessions
 from groups import GroupError, is_group_id
 from ai_agent import (
     process_personal_agent_message,
@@ -416,6 +419,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(groups.router)
+app.include_router(web_sessions.router)
 
 
 @app.get("/api/health")
@@ -751,6 +755,11 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
     if frame_type in ("call_answer", "call_reject", "call_end"):
         session["updated_at"] = now_iso
         await save_call_session(call_id, session)
+    if frame_type in ("call_answer", "call_reject") and party == "receiver":
+        # The callee may have the phone and Flick Web open: the device that didn't pick up stops ringing
+        await manager.send_to_my_devices(user_id, {"type": "call_claimed", "data": {
+            "call_id": call_id, "action": "answered" if frame_type == "call_answer" else "declined",
+        }})
 
     out.update({
         "call_id": call_id,
@@ -1010,6 +1019,12 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
 @app.post("/api/auth/logout")
 async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Signs out: revokes this account's tokens and detaches the push token from the phone."""
+    sid = web_session_id(current_user)
+    if sid:
+        # A linked browser signs out only itself; the phone stays logged in
+        await web_sessions.revoke_session(db, current_user.id, sid)
+        return {"message": "Logged out"}
+    await web_sessions.revoke_all_sessions(db, current_user.id)
     current_user.token_version = (current_user.token_version or 0) + 1  # every older token stops working
     current_user.fcm_token = None
     current_user.is_online = False
@@ -1019,7 +1034,7 @@ async def logout(current_user: User = Depends(get_current_user), db: AsyncSessio
 
 
 @app.delete("/api/auth/me")
-async def delete_my_account(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def delete_my_account(current_user: User = Depends(get_phone_user), db: AsyncSession = Depends(get_db)):
     """Permanently deletes the authenticated account and everything it owns."""
     from sqlalchemy import delete as sql_delete
     from models import ConversationChangeLog, UserSyncSequence
@@ -1039,6 +1054,7 @@ async def delete_my_account(current_user: User = Depends(get_current_user), db: 
     await db.execute(sql_delete(ConversationChangeLog).where(ConversationChangeLog.user_id == me))
     await db.execute(sql_delete(UserSyncSequence).where(UserSyncSequence.user_id == me))
     await groups.remove_user_from_all_groups(db, current_user)
+    await web_sessions.revoke_all_sessions(db, me)
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:
@@ -1125,7 +1141,7 @@ async def update_user_profile(
 @app.post("/api/users/fcm-token")
 async def update_fcm_token(
     payload: UpdateFcmTokenRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_phone_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Registers this device's FCM push token for the authenticated user."""
@@ -1730,6 +1746,8 @@ async def send_message_rest(
             )
         except GroupError as ge:
             raise HTTPException(status_code=ge.status_code, detail=ge.reason)
+        if not sent.get("duplicate"):
+            await manager.send_to_my_devices(current_user.id, {"type": "message_sent_sync", "data": sent})
         return {"status": "success", "temp_msg_id": client_temp_id, **sent}
 
     # A retry of a send that already reached us (e.g. the response was lost on a slow network)
@@ -1797,6 +1815,7 @@ async def send_message_rest(
         "data": message_dict,
     }
     await manager.send_personal_message(receiver_id, chat_frame)
+    await manager.send_to_my_devices(current_user.id, {"type": "message_sent_sync", "data": message_dict})
 
     # Dispatch FCM push notification to receiver for background/closed device alerts
     asyncio.create_task(
@@ -1878,6 +1897,7 @@ async def edit_message(
         },
     }
     await manager.send_personal_message(msg.receiver_id, edit_frame)
+    await manager.send_to_my_devices(current_user.id, edit_frame)
 
     return {"status": "success", "message": msg.to_dict(), "is_edited": True}
 
@@ -1929,6 +1949,7 @@ async def delete_message(
             },
         }
         await manager.send_personal_message(receiver_id, delete_frame)
+        await manager.send_to_my_devices(current_user.id, delete_frame)
     else:
         # Delete for me only: hide it for this person; the other person keeps their copy
         other_id = msg.receiver_id if is_sender else msg.sender_id
@@ -1942,6 +1963,9 @@ async def delete_message(
             await db.commit()
         except Exception:
             pass
+        await manager.send_to_my_devices(current_user.id, {"type": "message_deleted", "data": {
+            "message_id": message_id, "sender_id": msg.sender_id, "receiver_id": msg.receiver_id, "for_me": True,
+        }})
 
     return {"status": "success", "message_id": message_id, "deleted": True}
 
@@ -2543,6 +2567,7 @@ WS_CLOSE_UNAUTHORIZED = 4401  # app-defined close code: the client should log th
 # The app pings every 10s. Silence this long means the phone is gone (lost signal, switched
 # networks) even if TCP hasn't noticed yet, so mark it offline now instead of minutes later.
 WS_IDLE_TIMEOUT_SECONDS = 25
+WS_LINKED_IDLE_TIMEOUT_SECONDS = 90
 
 
 @app.websocket("/ws/{user_id}")
@@ -2563,8 +2588,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     # ?token=<jwt> is accepted for clients that can't set headers (e.g. browsers).
     auth_header = websocket.headers.get("authorization", "")
     token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else websocket.query_params.get("token")
+    ticket = websocket.query_params.get("ticket")
     async with async_session_factory() as db:
-        user_obj = await user_from_token(token, db)
+        # Flick Web opens its socket with a one-time ticket (see web_sessions.py)
+        if ticket:
+            user_obj, web_sid = await web_sessions.consume_ws_ticket(ticket, db)
+        else:
+            user_obj = await user_from_token(token, db)
+            web_sid = web_session_id(user_obj)
         if not user_obj or user_id.strip() not in {user_obj.id, user_obj.phone_number}:
             await websocket.accept()
             await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Invalid or expired session")
@@ -2578,8 +2609,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         else:
             manager.last_seen_hidden.difference_update(alias_ids)
 
-    await manager.connect(user_id, websocket)
-    manager.register_aliases(user_id, alias_ids)
+    if web_sid:
+        # A linked browser joins the phone's connection instead of replacing it
+        await manager.connect_linked(user_id, websocket, web_sid, alias_ids)
+    else:
+        await manager.connect(user_id, websocket)
+        manager.register_aliases(user_id, alias_ids)
+    # Browser tabs in the background may only get to ping about once a minute
+    idle_timeout = WS_LINKED_IDLE_TIMEOUT_SECONDS if web_sid else WS_IDLE_TIMEOUT_SECONDS
     await manager.refresh_presence(user_id)
     async with async_session_factory() as db:
         me_obj = await db.get(User, user_id)
@@ -2596,9 +2633,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     try:
         while True:
             try:
-                raw_data = await asyncio.wait_for(websocket.receive_text(), timeout=WS_IDLE_TIMEOUT_SECONDS)
+                raw_data = await asyncio.wait_for(websocket.receive_text(), timeout=idle_timeout)
             except asyncio.TimeoutError:
-                logger.info("No frames from %s for %ss, treating as disconnected", user_id, WS_IDLE_TIMEOUT_SECONDS)
+                logger.info("No frames from %s for %ss, treating as disconnected", user_id, idle_timeout)
                 try:
                     await websocket.close(code=1001)
                 except Exception:
@@ -2645,6 +2682,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "status": sent["status"],
                         **({"duplicate": True} if sent.get("duplicate") else {}),
                     }}))
+                    if not sent.get("duplicate"):
+                        await manager.send_to_my_devices(
+                            user_id, {"type": "message_sent_sync", "data": sent}, exclude=websocket
+                        )
                     continue
                 if len(content) > MAX_MESSAGE_CHARS or len(json.dumps(data.get("metadata") or {})) > MAX_METADATA_CHARS:
                     await websocket.send_text(json.dumps({"type": "message_error", "data": {
@@ -2748,6 +2789,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     "data": message_dict,
                 }
                 delivered = await manager.send_personal_message(receiver_id, chat_frame)
+                # The sender's other devices (phone / browsers) show it as sent too
+                await manager.send_to_my_devices(
+                    user_id, {"type": "message_sent_sync", "data": message_dict}, exclude=websocket
+                )
 
                 # Dispatch FCM Push Notification so background/closed devices receive tray alert
                 asyncio.create_task(
@@ -2829,6 +2874,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
             elif frame_type == "mark_read":
                 sender_id = data.get("sender_id")  # original sender of the messages being read
+                if sender_id:
+                    # Read on one device: the unread badge clears on the others too
+                    await manager.send_to_my_devices(
+                        user_id, {"type": "read_sync", "data": {"peer_id": sender_id}}, exclude=websocket
+                    )
                 if is_group_id(sender_id):
                     asyncio.create_task(groups.mark_group_read(user_id, sender_id))
                 elif sender_id:
@@ -2919,6 +2969,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 await manager.broadcast_presence(user_id, is_online=True)
 
             elif frame_type == "presence_offline":
+                if not web_sid and manager._linked_sockets(user_id):
+                    continue  # phone went to the background, but Flick Web is open: still online
                 now_utc = datetime.now(timezone.utc)
                 async with async_session_factory() as db:
                     await db.execute(
@@ -2986,7 +3038,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user %s", user_id)
-        await manager.disconnect(user_id, websocket)
+        if web_sid:
+            await manager.disconnect_linked(user_id, websocket)
+        else:
+            await manager.disconnect(user_id, websocket)
         if not await manager.is_user_online(user_id):
             now_utc = datetime.now(timezone.utc)
             async with async_session_factory() as db:
@@ -2998,7 +3053,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 await db.commit()
     except Exception as e:
         logger.error("WebSocket runtime error for %s: %s", user_id, e)
-        await manager.disconnect(user_id, websocket)
+        if web_sid:
+            await manager.disconnect_linked(user_id, websocket)
+        else:
+            await manager.disconnect(user_id, websocket)
         if not await manager.is_user_online(user_id):
             now_utc = datetime.now(timezone.utc)
             async with async_session_factory() as db:

@@ -90,7 +90,7 @@ async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
     import asyncio
     import logging
-    from models import User, Meeting, OtpRecord, Message, Status, ConversationChangeLog, UserSyncSequence, Group, GroupMember, GroupMessage  # noqa: F401 (registers tables)
+    from models import User, Meeting, OtpRecord, Message, Status, ConversationChangeLog, UserSyncSequence, Group, GroupMember, GroupMessage, WebSession  # noqa: F401 (registers tables)
     from sqlalchemy import select
 
     db_logger = logging.getLogger("Database")

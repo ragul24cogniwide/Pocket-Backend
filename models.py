@@ -585,3 +585,31 @@ class GroupMessage(Base):
             "is_edited": self.is_edited or False,
             "client_msg_id": self.client_msg_id,
         }
+
+
+class WebSession(Base):
+    """A browser linked to a phone account (Flick Web). The phone approves it with a one-time
+    code; logging out on the phone, or from Linked devices, revokes it."""
+    __tablename__ = "web_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    device_name: Mapped[str] = mapped_column(String(100), default="Browser", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    last_active_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self, current_sid: Optional[str] = None) -> dict:
+        return {
+            "id": self.id,
+            "device_name": self.device_name,
+            "created_at": iso_utc(self.created_at),
+            "last_active_at": iso_utc(self.last_active_at),
+            "current": self.id == current_sid,
+        }

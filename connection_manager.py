@@ -47,6 +47,10 @@ class ConnectionManager:
         # alias (phone / last-10 digits) -> primary socket user_id
         self.id_aliases: dict[str, str] = {}
         self.user_aliases: dict[str, set[str]] = {}
+        # Linked browsers (Flick Web), next to the phone's socket: {user_id: {WebSocket: session_id}}
+        self.linked: dict[str, dict[WebSocket, str]] = {}
+        # alias (id / phone / last-10 digits) -> user_id, for users with a linked browser open
+        self.linked_aliases: dict[str, str] = {}
 
     @staticmethod
     def _canonical_id(user_id: str) -> str:
@@ -92,6 +96,8 @@ class ConnectionManager:
         self.active_connections.clear()
         self.id_aliases.clear()
         self.user_aliases.clear()
+        self.linked.clear()
+        self.linked_aliases.clear()
 
     def register_aliases(self, primary_id: str, aliases: Optional[list[str]] = None) -> list[str]:
         """Maps phone numbers / digit forms to the connected socket id."""
@@ -189,12 +195,16 @@ class ConnectionManager:
             del self._pubsub_tasks[user_id]
 
         aliases = self._aliases_for(user_id)
-        self.away.difference_update(aliases or [user_id])
-        self.away.discard(user_id)
         self.user_aliases.pop(user_id, None)
         for alias in aliases:
             if self.id_aliases.get(alias) == user_id:
                 self.id_aliases.pop(alias, None)
+        if self._linked_sockets(user_id):
+            # Their browser is still open: they stay online
+            logger.info("Phone socket closed for %s; linked browser still connected", user_id)
+            return
+        self.away.difference_update(aliases or [user_id])
+        self.away.discard(user_id)
 
         if self.redis:
             try:
@@ -209,9 +219,113 @@ class ConnectionManager:
         logger.info("User disconnected: %s (Active local sockets: %d)", user_id, len(self.active_connections))
 
     # -------------------------------------------------------------------------
+    # Linked browsers (Flick Web)
+    # -------------------------------------------------------------------------
+    def _linked_owner(self, user_id: str) -> Optional[str]:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        if uid in self.linked:
+            return uid
+        for key in (uid, self._canonical_id(uid), self.id_aliases.get(uid)):
+            owner = self.linked_aliases.get(key) if key else None
+            if owner and owner in self.linked:
+                return owner
+        return None
+
+    def _linked_sockets(self, user_id: str) -> list[WebSocket]:
+        owner = self._linked_owner(user_id)
+        return list(self.linked.get(owner, {}).keys()) if owner else []
+
+    async def connect_linked(self, user_id: str, websocket: WebSocket, session_id: str, aliases: list[str]) -> None:
+        """Registers a linked browser's socket. Unlike the phone's, it doesn't replace other sockets."""
+        await websocket.accept()
+        was_online = bool(self._find_all_local_ws(user_id))
+        sockets = self.linked.setdefault(user_id, {})
+        sockets[websocket] = session_id
+        alias_set = set()
+        for alias in [user_id, *aliases]:
+            if alias:
+                alias_set.update({str(alias), self._canonical_id(str(alias))})
+        for alias in alias_set:
+            self.linked_aliases[alias] = user_id
+        self.mark_active(user_id)
+        if self.redis:
+            try:
+                await self.redis.sadd(REDIS_PRESENCE_KEY, *alias_set)
+                task_key = f"{user_id}#linked"
+                if task_key not in self._pubsub_tasks:
+                    self._pubsub_tasks[task_key] = asyncio.create_task(self._listen_user_channel(user_id, linked=True))
+            except Exception as e:
+                logger.error("Error registering linked browser presence: %s", e)
+        if not was_online:
+            await self.broadcast_presence(user_id, is_online=True, aliases=list(alias_set))
+        logger.info("Linked browser connected for %s (%d open)", user_id, len(sockets))
+
+    async def disconnect_linked(self, user_id: str, websocket: WebSocket) -> None:
+        sockets = self.linked.get(user_id)
+        if not sockets or websocket not in sockets:
+            return
+        sockets.pop(websocket, None)
+        if sockets:
+            return
+        self.linked.pop(user_id, None)
+        aliases = [a for a, owner in self.linked_aliases.items() if owner == user_id]
+        for alias in aliases:
+            self.linked_aliases.pop(alias, None)
+        task = self._pubsub_tasks.pop(f"{user_id}#linked", None)
+        if task:
+            task.cancel()
+        if self.active_connections.get(user_id) is not None:
+            return  # the phone is still connected
+        self.away.difference_update(aliases)
+        self.away.discard(user_id)
+        if self.redis:
+            try:
+                if aliases:
+                    await self.redis.srem(REDIS_PRESENCE_KEY, *aliases)
+            except Exception as e:
+                logger.error("Error clearing Redis presence for %s: %s", user_id, e)
+        await self.broadcast_presence(
+            user_id, is_online=False, last_seen=datetime.now(timezone.utc).isoformat(), aliases=aliases
+        )
+
+    async def close_linked_session(self, user_id: str, session_id: str, code: int = 4401) -> None:
+        """Closes the open socket(s) of a browser that was logged out."""
+        for ws, sid in list(self.linked.get(user_id, {}).items()):
+            if sid == session_id:
+                try:
+                    await ws.close(code=code, reason="Logged out")
+                except Exception:
+                    pass
+                await self.disconnect_linked(user_id, ws)
+
+    async def send_to_my_devices(
+        self, user_id: str, message_payload: dict[str, Any], exclude: Optional[WebSocket] = None
+    ) -> None:
+        """Sends a frame to the user's own other devices (phone and browsers), e.g. a message they
+        just sent from one of them, so every device shows the same conversation."""
+        payload_str = json.dumps(message_payload)
+        for ws in self._find_all_local_ws(user_id):
+            if ws is exclude:
+                continue
+            try:
+                await ws.send_text(payload_str)
+            except Exception as e:
+                self._remove_dead_socket(ws, f"own-device sync failure: {e}")
+        if self.redis:
+            try:
+                await self.redis.publish(
+                    f"user:{self._canonical_id(user_id)}",
+                    json.dumps({"origin_node": self.node_id, "payload": message_payload}),
+                )
+            except Exception as e:
+                logger.error("Redis publish error for %s: %s", user_id, e)
+
+    # -------------------------------------------------------------------------
     # Messaging & Routing
     # -------------------------------------------------------------------------
-    def _find_all_local_ws(self, user_id: str) -> list[WebSocket]:
+    def _find_all_local_ws(self, user_id: str, include_linked: bool = True) -> list[WebSocket]:
         """Finds all active local WebSocket connections matching exact ID or phone digits."""
         matched: list[WebSocket] = []
         uid_str = str(user_id).strip()
@@ -234,6 +348,8 @@ class ConnectionManager:
                     or (len(digits) >= 10 and len(conn_digits) >= 10 and digits[-10:] == conn_digits[-10:])
                 ):
                     matched.append(ws)
+        if include_linked:
+            matched.extend(ws for ws in self._linked_sockets(uid_str) if ws not in matched)
         return matched
 
     def _find_local_ws(self, user_id: str) -> Optional[WebSocket]:
@@ -248,6 +364,12 @@ class ConnectionManager:
             if v == ws:
                 self.active_connections.pop(k, None)
                 dead_keys.append(k)
+        for owner, sockets in list(self.linked.items()):
+            if ws in sockets:
+                sockets.pop(ws, None)
+                dead_keys.append(f"{owner}#linked")
+                if not sockets:
+                    self.linked.pop(owner, None)
         if dead_keys:
             logger.info("Cleaned up dead socket for %s (reason: %s)", dead_keys, reason or "send_failure")
 
@@ -287,7 +409,7 @@ class ConnectionManager:
 
         return delivered
 
-    async def _listen_user_channel(self, user_id: str) -> None:
+    async def _listen_user_channel(self, user_id: str, linked: bool = False) -> None:
         """Background task that reads messages published to `user:<canonical_user_id>` from peer nodes."""
         if not self.redis:
             return
@@ -310,7 +432,11 @@ class ConnectionManager:
                     except Exception:
                         payload_str = raw_data
 
-                    target_sockets = self._find_all_local_ws(user_id)
+                    # The phone's listener serves the phone socket, the browser listener the browsers
+                    target_sockets = (
+                        self._linked_sockets(user_id) if linked
+                        else self._find_all_local_ws(user_id, include_linked=False)
+                    )
                     for ws in target_sockets:
                         try:
                             await ws.send_text(payload_str)
@@ -336,6 +462,8 @@ class ConnectionManager:
         ids: set[str] = set(self.active_connections.keys())
         for alias_set in self.user_aliases.values():
             ids.update(alias_set)
+        ids.update(self.linked.keys())
+        ids.update(self.linked_aliases.keys())
         if self.redis:
             try:
                 members = await self.redis.smembers(REDIS_PRESENCE_KEY)
@@ -456,7 +584,9 @@ class ConnectionManager:
         if skip_user_id:
             skip_ids.update(self._aliases_for(skip_user_id))
             skip_ids.add(str(skip_user_id))
-        for client_id, ws in list(self.active_connections.items()):
+        targets = list(self.active_connections.items())
+        targets += [(owner, ws) for owner, sockets in list(self.linked.items()) for ws in list(sockets)]
+        for client_id, ws in targets:
             if str(client_id) in skip_ids:
                 continue
             try:
