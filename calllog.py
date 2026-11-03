@@ -179,6 +179,14 @@ async def remove_call(call_id: str, current_user: User = Depends(get_current_use
     return {"removed": call_id}
 
 
+async def has_called(db: AsyncSession, caller: str, receiver: str) -> bool:
+    """Whether `caller` has ever called `receiver` (so the receiver may call back)."""
+    res = await db.execute(
+        select(CallRecord.id).where(CallRecord.caller_id == caller, CallRecord.receiver_id == receiver).limit(1)
+    )
+    return res.first() is not None
+
+
 async def delete_calls_for(db: AsyncSession, user_id: str) -> None:
     """Account deletion."""
     await db.execute(delete(CallRecord).where(or_(CallRecord.caller_id == user_id, CallRecord.receiver_id == user_id)))

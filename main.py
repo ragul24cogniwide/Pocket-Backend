@@ -625,6 +625,47 @@ def caller_card(user: Optional[User], fallback_id: str) -> dict:
     }
 
 
+CALL_NOT_ALLOWED = "You can call people in your contacts, and anyone who has messaged or called you."
+
+
+async def find_user(db: AsyncSession, any_id: str) -> Optional[User]:
+    """A user by id or phone number (any common format of the same 10 digits)."""
+    uid = str(any_id or "").strip()
+    digits = "".join(filter(str.isdigit, uid))
+    res = await db.execute(
+        select(User).where(
+            or_(
+                User.id == uid,
+                User.phone_number == uid,
+                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
+                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
+            )
+        )
+    )
+    return res.scalars().first()
+
+
+async def may_call(db: AsyncSession, caller: User, receiver: User) -> bool:
+    """
+    Who can ring whom (so strangers can't ring a number they guessed): the caller has the
+    receiver in their phone contacts, or the receiver has reached out to the caller before
+    (messaged or called them), so you can always call back.
+    """
+    saved = await db.execute(
+        select(SavedContact.id).where(SavedContact.user_id == caller.id, SavedContact.contact_id == receiver.id).limit(1)
+    )
+    if saved.first():
+        return True
+    caller_ids = [i for i in (caller.id, caller.phone_number) if i]
+    receiver_ids = [i for i in (receiver.id, receiver.phone_number) if i]
+    messaged = await db.execute(
+        select(Message.id).where(Message.sender_id.in_(receiver_ids), Message.receiver_id.in_(caller_ids)).limit(1)
+    )
+    if messaged.first():
+        return True
+    return await calllog.has_called(db, caller=receiver.id, receiver=caller.id)
+
+
 async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict:
     """
     Validates one call signaling message from `user_id`, updates the call session and forwards
@@ -652,10 +693,16 @@ async def process_call_signal(user_id: str, frame_type: str, data: dict) -> dict
                 raise CallError("This call id is already in use", 409)
             if session.get("status") in ("ended", "rejected"):
                 raise CallError("This call has already finished", 409)
+        first_offer = not session
         async with async_session_factory() as db:
             caller = (await db.execute(select(User).where(User.id == user_id))).scalars().first()
+            if first_offer:  # a re-sent offer for an allowed call is fine
+                receiver = await find_user(db, receiver_id)
+                if not receiver:
+                    raise CallError("This number isn't on Flick.", 404)
+                if not caller or not await may_call(db, caller, receiver):
+                    raise CallError(CALL_NOT_ALLOWED, 403)
         card = caller_card(caller, user_id)
-        first_offer = not session
         session = {
             **(session or {}),
             "call_id": call_id,
