@@ -651,6 +651,26 @@ class ChatArchive(Base):
     __table_args__ = (UniqueConstraint("user_id", "peer_id", name="uq_chat_archive"),)
 
 
+class SavedContact(Base):
+    """A Flick user who is in someone's phone contacts, as last reported by their phone, so Flick
+    Web can list "Contacts on Flick" too. Only the account is kept, never the name saved on the
+    phone, and only for numbers that turned out to be on Flick."""
+    __tablename__ = "saved_contacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    contact_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (UniqueConstraint("user_id", "contact_id", name="uq_saved_contact"),)
+
+
 class CallRecord(Base):
     """One voice / video call, for the call log of both people (phone and Flick Web).
     status: ringing | completed | missed | declined | busy"""

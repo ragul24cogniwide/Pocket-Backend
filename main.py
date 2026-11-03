@@ -35,9 +35,9 @@ from auth import (
     user_from_token,
     web_session_id,
 )
-from connection_manager import manager, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
+from connection_manager import manager, PHONE_DEVICE, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
 from database import async_session_factory, get_db, init_db
-from models import Message, MessageStatus, OtpRecord, User, Status, Meeting, iso_utc
+from models import Message, MessageStatus, OtpRecord, SavedContact, User, Status, Meeting, iso_utc
 from notifications import send_push_notification
 from schemas import (
     AuthResponse,
@@ -51,6 +51,7 @@ from schemas import (
     SendMessageRequest,
     SendOtpRequest,
     SendOtpResponse,
+    SaveContactsRequest,
     SyncContactsRequest,
     SyncContactsResponse,
     UpdateFcmTokenRequest,
@@ -119,6 +120,12 @@ if DEV_MODE_EXPOSE_OTP or ALLOW_MASTER_OTP:
 # Per-phone OTP throttling. In-memory, so limits are per server instance (fine for a single Render instance).
 _otp_send_log: dict[str, deque] = defaultdict(deque)
 _otp_failed_attempts: dict[str, int] = defaultdict(int)
+
+# Contact checks answer "is this number on Flick?", so each account may check a limited number of
+# *different* numbers per day: enough for any address book, too few to scan number ranges.
+# Re-checking numbers already checked today is free, so reopening the contact screen never hits it.
+CONTACT_CHECK_MAX_NUMBERS_PER_DAY = 10_000
+_contact_check_log: dict[str, dict[str, float]] = defaultdict(dict)  # user id -> {number: first checked}
 
 
 def require_admin(x_admin_key: Optional[str] = Header(default=None)) -> None:
@@ -1057,6 +1064,9 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
     await db.execute(sql_delete(MessageReaction).where(MessageReaction.user_id == me))
     await archive.delete_archives_for(db, me)
     await calllog.delete_calls_for(db, me)
+    await db.execute(
+        sql_delete(SavedContact).where(or_(SavedContact.user_id == me, SavedContact.contact_id == me))
+    )
 
     # Tell everyone this user chatted with to drop the conversation on their next sync
     for peer in peers:
@@ -1556,6 +1566,72 @@ async def sync_conversations(
 # -----------------------------------------------------------------------------
 # Contact Sync (Matches Phone Contacts with Registered Users)
 # -----------------------------------------------------------------------------
+def _clean_contact_numbers(raw_numbers: List[str]) -> set[str]:
+    cleaned_numbers = set()
+    for num in raw_numbers:
+        clean = "".join(filter(lambda c: c.isdigit() or c == '+', num.strip()))
+        if clean:
+            if not clean.startswith("+") and len(clean) == 10:
+                cleaned_numbers.add("+91" + clean)
+            cleaned_numbers.add(clean)
+    return cleaned_numbers
+
+
+def _allow_contact_check(user_id: str, numbers: set[str]) -> None:
+    """Counts numbers this account hasn't checked today against its daily allowance (429 when over)."""
+    now_ts = time.monotonic()
+    checked = _contact_check_log[user_id]
+    for num, at in list(checked.items()):
+        if now_ts - at > 24 * 3600:
+            del checked[num]
+    new_numbers = numbers.difference(checked)
+    if len(checked) + len(new_numbers) > CONTACT_CHECK_MAX_NUMBERS_PER_DAY:
+        logger.warning("[Contacts] %s hit the daily contact-check limit", user_id)
+        raise HTTPException(status_code=429, detail="Too many contact checks today. Try again tomorrow.")
+    for num in new_numbers:
+        checked[num] = now_ts
+
+
+async def _users_with_numbers(db: AsyncSession, me: User, numbers: set[str]) -> list[User]:
+    stmt = (
+        select(User)
+        .where(
+            User.id != me.id,
+            or_(User.phone_number.in_(numbers), User.id.in_(numbers)),
+        )
+        .order_by(User.username.asc())
+    )
+    result = await db.execute(stmt)
+    seen, users = set(), []
+    for u in result.scalars().all():
+        if u.id not in seen:
+            seen.add(u.id)
+            users.append(u)
+    return users
+
+
+async def _contact_item(u: User, viewer: User) -> ChatContactItem:
+    initials = (
+        "".join([part[0] for part in u.username.split()[:2]]).upper()
+        if u.username
+        else "FK"
+    )
+    return ChatContactItem(
+        id=u.id,
+        phone_number=u.phone_number,
+        name=u.username,
+        avatar=initials,
+        avatar_color=u.avatar_color,
+        avatar_url=u.avatar_url,
+        quote=u.quote or "Hey there! I am using Flick.",
+        online=await manager.is_user_online(u.id),
+        last_message=u.quote or "Available on Flick",
+        time="",
+        unread=0,
+        last_seen=u.visible_last_seen(viewer=viewer),
+    )
+
+
 @app.post("/api/contacts/sync", response_model=SyncContactsResponse)
 async def sync_device_contacts(
     payload: SyncContactsRequest,
@@ -1566,67 +1642,56 @@ async def sync_device_contacts(
     Matches device phone contacts against registered Flick users.
     Returns only users who have registered and installed the app.
     """
-    raw_numbers = payload.phone_numbers
-    cleaned_numbers = set()
-
-    for num in raw_numbers:
-        clean = "".join(filter(lambda c: c.isdigit() or c == '+', num.strip()))
-        if clean:
-            if not clean.startswith("+") and len(clean) == 10:
-                cleaned_numbers.add("+91" + clean)
-            cleaned_numbers.add(clean)
-
+    cleaned_numbers = _clean_contact_numbers(payload.phone_numbers)
     if not cleaned_numbers:
         return SyncContactsResponse(registered_users=[], total_synced=0)
+    _allow_contact_check(current_user.id, cleaned_numbers)
 
-    stmt = (
-        select(User)
-        .where(
-            User.id != current_user.id,
-            or_(
-                User.phone_number.in_(cleaned_numbers),
-                User.id.in_(cleaned_numbers),
-            )
-        )
-        .order_by(User.username.asc())
-    )
-    result = await db.execute(stmt)
-    users = result.scalars().all()
-
-    registered_contacts = []
-    seen = set()
-    for u in users:
-        if u.id in seen:
-            continue
-        seen.add(u.id)
-
-        is_online = await manager.is_user_online(u.id)
-        initials = (
-            "".join([part[0] for part in u.username.split()[:2]]).upper()
-            if u.username
-            else "FK"
-        )
-        registered_contacts.append(
-            ChatContactItem(
-                id=u.id,
-                phone_number=u.phone_number,
-                name=u.username,
-                avatar=initials,
-                avatar_color=u.avatar_color,
-                avatar_url=u.avatar_url,
-                quote=u.quote or "Hey there! I am using Flick.",
-                online=is_online,
-                last_message=u.quote or "Available on Flick",
-                time="",
-                unread=0,
-                last_seen=u.visible_last_seen(viewer=current_user),
-            )
-        )
-
+    users = await _users_with_numbers(db, current_user, cleaned_numbers)
+    registered_contacts = [await _contact_item(u, current_user) for u in users]
     return SyncContactsResponse(
         registered_users=registered_contacts,
         total_synced=len(registered_contacts),
     )
+
+
+@app.put("/api/contacts/on-flick")
+async def save_contacts_on_flick(
+    payload: SaveContactsRequest,
+    current_user: User = Depends(get_phone_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The phone reports which of its contacts are on Flick (their numbers, after /api/contacts/sync),
+    replacing the previous list, so Flick Web can show them too. An empty list clears it (the
+    phone does that when contact access is turned off). Names are never sent.
+    """
+    from sqlalchemy import delete as sql_delete
+
+    numbers = _clean_contact_numbers(payload.phone_numbers)
+    if numbers:
+        _allow_contact_check(current_user.id, numbers)
+    users = await _users_with_numbers(db, current_user, numbers) if numbers else []
+    await db.execute(sql_delete(SavedContact).where(SavedContact.user_id == current_user.id))
+    for u in users:
+        db.add(SavedContact(user_id=current_user.id, contact_id=u.id))
+    await db.commit()
+    return {"saved": len(users)}
+
+
+@app.get("/api/contacts/on-flick", response_model=List[ChatContactItem])
+async def list_contacts_on_flick(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Your phone contacts who are on Flick, as last reported by your phone (for Flick Web)."""
+    result = await db.execute(
+        select(User)
+        .join(SavedContact, SavedContact.contact_id == User.id)
+        .where(SavedContact.user_id == current_user.id)
+        .order_by(User.username.asc())
+    )
+    return [await _contact_item(u, current_user) for u in result.scalars().all()]
 
 
 # -----------------------------------------------------------------------------
@@ -2962,6 +3027,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()}))
 
             elif frame_type == "presence_online":
+                # The phone app came to the foreground, or a Flick Web tab is being used
+                manager.set_device_active(user_id, web_sid or PHONE_DEVICE, True)
                 async with async_session_factory() as db:
                     await db.execute(
                         update(User)
@@ -2974,8 +3041,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 await manager.broadcast_presence(user_id, is_online=True)
 
             elif frame_type == "presence_offline":
-                if not web_sid and manager._linked_sockets(user_id):
-                    continue  # phone went to the background, but Flick Web is open: still online
+                # The phone app went to the background, or a Flick Web tab was hidden / left idle
+                if manager.set_device_active(user_id, web_sid or PHONE_DEVICE, False):
+                    continue  # still in use on another device: still online
                 now_utc = datetime.now(timezone.utc)
                 async with async_session_factory() as db:
                     await db.execute(

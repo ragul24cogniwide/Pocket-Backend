@@ -104,6 +104,11 @@ class SyncContactsRequest(BaseModel):
     phone_numbers: List[str] = Field(default_factory=list, max_length=500)
 
 
+class SaveContactsRequest(BaseModel):
+    # The numbers in your phone contacts that are on Flick (from /api/contacts/sync)
+    phone_numbers: List[str] = Field(default_factory=list, max_length=5000)
+
+
 class SyncContactsResponse(BaseModel):
     registered_users: List[ChatContactItem]
     total_synced: int

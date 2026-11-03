@@ -25,6 +25,7 @@ if REDIS_URL.startswith("redis-cli -u "):
     REDIS_URL = REDIS_URL.replace("redis-cli -u ", "", 1).strip()
 REDIS_PRESENCE_KEY = "global_online_users"
 REDIS_PRESENCE_CHANNEL = "presence:broadcast"
+PHONE_DEVICE = "phone"  # key for the phone app in ConnectionManager.active_devices
 
 
 class ConnectionManager:
@@ -41,6 +42,10 @@ class ConnectionManager:
         # Users whose app went to the background: shown offline at once, although their socket
         # stays open a few more seconds (calls, camera picker) before the app closes it
         self.away: set[str] = set()
+        # Which of a user's devices are in use right now: PHONE_DEVICE (app in the foreground) and/or
+        # the session ids of Flick Web tabs that are visible and being used. Online = at least one;
+        # an open tab nobody is looking at doesn't count.
+        self.active_devices: dict[str, set[str]] = {}
         # Background Redis Pub/Sub listener tasks: {user_id: asyncio.Task}
         self._pubsub_tasks: dict[str, asyncio.Task] = {}
         self._presence_listener_task: Optional[asyncio.Task] = None
@@ -153,6 +158,7 @@ class ConnectionManager:
         self.active_connections[user_id] = websocket
         aliases = self.register_aliases(user_id, [user_id])
         self.mark_active(user_id)
+        self.set_device_active(user_id, PHONE_DEVICE, True)
 
         # Record presence in Redis and local node
         if self.redis:
@@ -199,9 +205,12 @@ class ConnectionManager:
         for alias in aliases:
             if self.id_aliases.get(alias) == user_id:
                 self.id_aliases.pop(alias, None)
+        still_in_use = self.set_device_active(user_id, PHONE_DEVICE, False)
         if self._linked_sockets(user_id):
-            # Their browser is still open: they stay online
+            # Their browser is still open: online only if they're using it
             logger.info("Phone socket closed for %s; linked browser still connected", user_id)
+            if not still_in_use:
+                await self.show_idle(user_id, aliases)
             return
         self.away.difference_update(aliases or [user_id])
         self.away.discard(user_id)
@@ -240,7 +249,6 @@ class ConnectionManager:
     async def connect_linked(self, user_id: str, websocket: WebSocket, session_id: str, aliases: list[str]) -> None:
         """Registers a linked browser's socket. Unlike the phone's, it doesn't replace other sockets."""
         await websocket.accept()
-        was_online = bool(self._find_all_local_ws(user_id))
         sockets = self.linked.setdefault(user_id, {})
         sockets[websocket] = session_id
         alias_set = set()
@@ -249,7 +257,10 @@ class ConnectionManager:
                 alias_set.update({str(alias), self._canonical_id(str(alias))})
         for alias in alias_set:
             self.linked_aliases[alias] = user_id
-        self.mark_active(user_id)
+        # The tab reports right away whether it's in use (presence_online / presence_offline);
+        # until then an open tab alone doesn't make anyone look online
+        if not self.in_use(user_id):
+            self.mark_away(user_id)
         if self.redis:
             try:
                 await self.redis.sadd(REDIS_PRESENCE_KEY, *alias_set)
@@ -258,16 +269,17 @@ class ConnectionManager:
                     self._pubsub_tasks[task_key] = asyncio.create_task(self._listen_user_channel(user_id, linked=True))
             except Exception as e:
                 logger.error("Error registering linked browser presence: %s", e)
-        if not was_online:
-            await self.broadcast_presence(user_id, is_online=True, aliases=list(alias_set))
         logger.info("Linked browser connected for %s (%d open)", user_id, len(sockets))
 
     async def disconnect_linked(self, user_id: str, websocket: WebSocket) -> None:
         sockets = self.linked.get(user_id)
         if not sockets or websocket not in sockets:
             return
-        sockets.pop(websocket, None)
+        session_id = sockets.pop(websocket, None)
+        still_in_use = self.set_device_active(user_id, session_id, False) if session_id else self.in_use(user_id)
         if sockets:
+            if not still_in_use:
+                await self.show_idle(user_id)  # the tab they were using closed; the others are idle
             return
         self.linked.pop(user_id, None)
         aliases = [a for a, owner in self.linked_aliases.items() if owner == user_id]
@@ -277,7 +289,9 @@ class ConnectionManager:
         if task:
             task.cancel()
         if self.active_connections.get(user_id) is not None:
-            return  # the phone is still connected
+            if not still_in_use:
+                await self.show_idle(user_id, aliases)  # the phone is connected but in the background
+            return
         self.away.difference_update(aliases)
         self.away.discard(user_id)
         if self.redis:
@@ -495,6 +509,30 @@ class ConnectionManager:
     def mark_active(self, user_id: str) -> None:
         self.away.difference_update(self._aliases_for(user_id) or [user_id])
         self.away.discard(user_id)
+
+    def set_device_active(self, user_id: str, device: str, active: bool) -> bool:
+        """Records whether one of the user's devices is in use. Returns True if any of them still is."""
+        devices = self.active_devices.setdefault(user_id, set())
+        if active:
+            devices.add(device)
+        else:
+            devices.discard(device)
+        if not devices:
+            self.active_devices.pop(user_id, None)
+            return False
+        return True
+
+    def in_use(self, user_id: str) -> bool:
+        return bool(self.active_devices.get(user_id))
+
+    async def show_idle(self, user_id: str, aliases: Optional[list] = None) -> None:
+        """Devices still connected but none in use: show them offline (last seen now)."""
+        if self.is_away(user_id):
+            return
+        self.mark_away(user_id)
+        await self.broadcast_presence(
+            user_id, is_online=False, last_seen=datetime.now(timezone.utc).isoformat(), aliases=aliases
+        )
 
     def is_away(self, *ids: Optional[str]) -> bool:
         if not self.away:
