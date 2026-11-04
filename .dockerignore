@@ -4,18 +4,21 @@ __pycache__/
 *.pyd
 .Python
 venv/
-.env.local
+venv_windows/
 .git/
 .gitignore
 .vscode/
 .idea/
+.DS_Store
 *.log
 scratch/
+Dockerfile
+docker-compose.yml
 
 # Secrets and local data must never be baked into the image
 .env
 .env.*
 *firebase*.json
 *.db
-venv_windows/
+*.sqlite3
 uploads/
