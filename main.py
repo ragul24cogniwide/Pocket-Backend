@@ -35,7 +35,7 @@ from auth import (
     user_from_token,
     web_session_id,
 )
-from connection_manager import manager, PHONE_DEVICE, REDIS_PRESENCE_KEY as REDIS_PRESENCE_KEY_FOR_AWAY
+from connection_manager import manager, PHONE_DEVICE
 from database import async_session_factory, get_db, init_db
 from models import Message, MessageStatus, OtpRecord, SavedContact, User, Status, Meeting, iso_utc
 from notifications import send_push_notification
@@ -162,12 +162,10 @@ DEMO_BOTS_ENABLED = os.getenv("SEED_DEMO_USERS", "false").lower() == "true"
 async def chat_peer_ids(db: AsyncSession, user: User) -> set:
     """Ids (and phone numbers) of everyone this user has exchanged messages with, plus the AI agent."""
     mine = {i for i in (user.id, user.phone_number) if i}
-    rows = await db.execute(
-        select(Message.sender_id, Message.receiver_id).where(
-            or_(Message.sender_id.in_(mine), Message.receiver_id.in_(mine))
-        )
-    )
-    ids = {p for row in rows.all() for p in row if p and p not in mine}
+    # Each person once (DISTINCT), not one row per message: this runs every few seconds per user
+    sent_to = await db.execute(select(Message.receiver_id).where(Message.sender_id.in_(mine)).distinct())
+    got_from = await db.execute(select(Message.sender_id).where(Message.receiver_id.in_(mine)).distinct())
+    ids = {p for (p,) in [*sent_to.all(), *got_from.all()] if p and p not in mine}
     if ids:
         res = await db.execute(select(User.id, User.phone_number).where(or_(User.id.in_(ids), User.phone_number.in_(ids))))
         for uid, phone in res.all():
@@ -2738,6 +2736,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     async with async_session_factory() as db:
         me_obj = await db.get(User, user_id)
         my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
+    # Presence changes reach this user only for the people they chat with (like WhatsApp)
+    manager.watch_presence(user_id, my_peer_ids)
     try:
         await manager.send_online_snapshot(websocket, my_peer_ids)
     except Exception:
@@ -3100,11 +3100,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     )
                     await db.commit()
                 manager.mark_away(user_id)
-                if manager.redis:
-                    try:
-                        await manager.redis.srem(REDIS_PRESENCE_KEY_FOR_AWAY, *[a for a in alias_ids if a])
-                    except Exception:
-                        pass
+                await manager.presence_remove(manager._aliases_for(user_id) + alias_ids, user_id=user_id)
                 await manager.broadcast_presence(user_id, is_online=False, last_seen=now_utc.isoformat())
 
             elif frame_type == "query_online_snapshot":
@@ -3112,6 +3108,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 async with async_session_factory() as db:
                     me_obj = await db.get(User, user_id)
                     my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
+                manager.watch_presence(user_id, my_peer_ids)  # new chats since the last refresh
                 await manager.send_online_snapshot(websocket, my_peer_ids)
 
             elif frame_type == "query_presence":
@@ -3143,6 +3140,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         aliases = [target_id]
                         if target_user:
                             aliases.extend([target_user.id, target_user.phone_number])
+                        # They opened this chat: keep them posted when this person comes and goes
+                        manager.watch_presence(user_id, aliases)
                         await websocket.send_text(json.dumps({
                             "type": "presence_update",
                             "data": {

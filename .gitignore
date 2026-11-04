@@ -24,3 +24,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.log
+
+# Local data: the SQLite dev database and user uploads must never be pushed
+*.db
+*.sqlite3
+uploads/
+venv_windows/
