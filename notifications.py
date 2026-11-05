@@ -31,8 +31,50 @@ def _credential_files() -> list:
     return list(dict.fromkeys(paths))
 
 
+def _fix_private_key(info: dict) -> dict:
+    """Dashboards often turn the key's "\\n" into literal backslash-n (or real newlines); PEM needs real ones."""
+    key = info.get("private_key")
+    if isinstance(key, str):
+        info["private_key"] = key.strip().strip("\"'").replace("\\n", "\n")
+    return info
+
+
+def _credentials_from_env() -> Optional[dict]:
+    """The service account from environment variables, or None when none are set.
+
+    Accepts the whole JSON in FIREBASE_CREDENTIALS_JSON (pasted as-is, with line breaks, wrapped in
+    quotes, or base64-encoded), or the fields as separate variables:
+    FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.
+    """
+    raw = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
+    if raw:
+        if raw[0] in "\"'" and raw[-1] == raw[0]:
+            raw = raw[1:-1].strip()
+        if not raw.startswith("{"):
+            import base64
+            raw = base64.b64decode(raw).decode("utf-8")
+        # strict=False: a pasted key may contain real line breaks inside the JSON string
+        return _fix_private_key(json.loads(raw, strict=False))
+
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+    client_email = os.getenv("FIREBASE_CLIENT_EMAIL", "").strip()
+    private_key = os.getenv("FIREBASE_PRIVATE_KEY", "")
+    if project_id and client_email and private_key.strip():
+        return _fix_private_key({
+            "type": "service_account",
+            "project_id": project_id,
+            "client_email": client_email,
+            "private_key": private_key,
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", "").strip(),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID", "").strip(),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+    return None
+
+
 # The service-account key is never written in the source code. It is loaded, in this order, from:
-#   1. FIREBASE_CREDENTIALS_JSON   the whole JSON file as one env var (Render: Environment)
+#   1. environment: FIREBASE_CREDENTIALS_JSON (the whole JSON file as one variable), or the separate
+#      FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY variables (Render: Environment)
 #   2. a file: FIREBASE_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS, a Render Secret File in
 #      /etc/secrets, or the *firebase-adminsdk*.json next to this file (local development)
 #   3. Application Default Credentials (Google Cloud hosting)
@@ -43,14 +85,17 @@ try:
     import firebase_admin
     from firebase_admin import credentials, messaging
 
-    cred_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
-    if cred_json_str:
-        try:
-            firebase_admin.initialize_app(credentials.Certificate(json.loads(cred_json_str)))
+    try:
+        env_info = _credentials_from_env()
+        if env_info:
+            firebase_admin.initialize_app(credentials.Certificate(env_info))
             firebase_initialized = True
-            logger.info("Firebase Admin SDK initialized from FIREBASE_CREDENTIALS_JSON")
-        except Exception as e:
-            logger.warning("FIREBASE_CREDENTIALS_JSON is set but could not be used: %s", e)
+            logger.info("Firebase Admin SDK initialized from environment variables (project %s)",
+                        env_info.get("project_id"))
+    except Exception as e:
+        # The error type only: the message could quote part of the key
+        logger.error("Firebase credentials in the environment could not be used (%s). Check that "
+                     "FIREBASE_CREDENTIALS_JSON holds the complete JSON file.", type(e).__name__)
 
     if not firebase_initialized:
         for cred_path in _credential_files():
