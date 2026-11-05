@@ -1039,8 +1039,10 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     is_new = user is None
 
     if not user:
-        colors = ["#FFB800", "#10B981", "#3B82F6", "#8B5CF6", "#EC4899", "#F97316"]
-        avatar_color = colors[len(phone) % len(colors)]
+        colors = ["#FFB800", "#10B981", "#3B82F6", "#8B5CF6", "#EC4899", "#F97316", "#14B8A6", "#EF4444"]
+        # From the digits themselves: the length is the same for every number in a country, which
+        # used to give everyone in India the same green
+        avatar_color = colors[sum(int(d) for d in phone if d.isdigit()) % len(colors)]
         username = payload.username or f"User {phone[-4:]}"
 
         user = User(
