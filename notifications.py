@@ -81,6 +81,10 @@ except Exception as e:
 # FCM refuses messages over 4 KB in total. Pictures sent as data: URIs (profile photos) or long
 # texts must never be put in a push: they made every call alert fail with "Message is too large".
 MAX_PUSH_FIELD_CHARS = 512
+# Fields allowed to be longer than MAX_PUSH_FIELD_CHARS: a chat message's metadata (JSON, e.g. a
+# photo's URL and size) so the phone can show photo messages from the push; main.py only
+# includes it when it's under 1500 characters
+PUSH_FIELD_LIMITS = {"metadata": 1500}
 MAX_PUSH_DATA_CHARS = 2500
 MAX_PUSH_BODY_CHARS = 600
 MAX_PUSH_TITLE_CHARS = 120
@@ -93,7 +97,7 @@ def fit_push_data(data_payload: Optional[dict]) -> dict:
         if value is None:
             continue
         text = str(value)
-        if len(text) > MAX_PUSH_FIELD_CHARS or text.startswith("data:"):
+        if len(text) > PUSH_FIELD_LIMITS.get(str(key), MAX_PUSH_FIELD_CHARS) or text.startswith("data:"):
             logger.info("[Push] Left out oversized field %s (%d chars)", key, len(text))
             continue
         data[str(key)] = text

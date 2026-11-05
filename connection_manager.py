@@ -47,6 +47,8 @@ REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "8"))
 # How long the pub/sub listener waits for a frame before checking again (keeps the connection healthy)
 PUBSUB_POLL_SECONDS = 5.0
 PHONE_DEVICE = "phone"  # key for the phone app in ConnectionManager.active_devices
+# Internal cluster frame: "close this user's sockets" (logout / account deletion on another server)
+CLOSE_SOCKETS_FRAME = "_close_sockets"
 
 
 class ConnectionManager:
@@ -405,6 +407,23 @@ class ConnectionManager:
                     pass
                 await self.disconnect_linked(user_id, ws)
 
+    async def close_user_sockets(self, user_id: str, code: int = 4401, reason: str = "Logged out") -> None:
+        """
+        Closes every open socket of this user (the phone and any linked browsers) on every server,
+        e.g. after logout or account deletion, so a revoked session stops receiving messages.
+        Each socket's gateway loop then sees the close and does the usual offline cleanup.
+        """
+        await self._close_local_sockets(user_id, code, reason)
+        # Other servers close the sockets they hold (an internal frame, never sent to an app)
+        await self._publish_to_user(user_id, {"type": CLOSE_SOCKETS_FRAME, "data": {"code": code, "reason": reason}})
+
+    async def _close_local_sockets(self, user_id: str, code: int, reason: str) -> None:
+        for ws in self._find_all_local_ws(user_id):
+            try:
+                await ws.close(code=code, reason=reason)
+            except Exception:
+                pass
+
     async def send_to_my_devices(
         self, user_id: str, message_payload: dict[str, Any], exclude: Optional[WebSocket] = None
     ) -> None:
@@ -418,11 +437,10 @@ class ConnectionManager:
                 await ws.send_text(payload_str)
             except Exception as e:
                 self._remove_dead_socket(ws, f"own-device sync failure: {e}")
-        if message_payload.get("type") == "message_sent_sync":
-            # They wrote to someone (maybe a new chat): they see that person's online status from now on
-            receiver = (message_payload.get("data") or {}).get("receiver_id")
-            if receiver:
-                self.watch_presence(user_id, [receiver])
+        # Writing to someone does NOT subscribe the sender to that person's presence any more:
+        # otherwise a stranger could send "hi" and then watch someone come and go. Presence
+        # follows the other person's actions (they write back: see send_personal_message, or
+        # they saved the sender as a contact: see visible_owner_ids in main.py).
         await self._publish_to_user(user_id, message_payload)
 
     # -------------------------------------------------------------------------
@@ -561,6 +579,10 @@ class ConnectionManager:
             payload_str = json.dumps(payload_data)
         except Exception:
             payload_data, payload_str = None, raw_data
+        if isinstance(payload_data, dict) and payload_data.get("type") == CLOSE_SOCKETS_FRAME:
+            close = payload_data.get("data") or {}
+            await self._close_local_sockets(target, int(close.get("code") or 4401), str(close.get("reason") or ""))
+            return
         sockets = self._find_all_local_ws(target)
         for ws in sockets:
             try:

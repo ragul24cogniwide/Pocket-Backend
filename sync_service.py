@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, func, or_, select, delete
+from sqlalchemy import and_, desc, func, or_, select, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import ChatArchive, ConversationChangeLog, Group, GroupMember, GroupMessage, Message, User, UserSyncSequence, iso_utc
@@ -78,24 +78,59 @@ async def get_user_current_version(db: AsyncSession, user_id: str) -> int:
     return int(val) if val is not None else 0
 
 
+async def _bump_sync_version(db: AsyncSession, user_id: str) -> Optional[int]:
+    """UPDATE ... SET current_version = current_version + 1 RETURNING current_version (None if no row)."""
+    res = await db.execute(
+        update(UserSyncSequence)
+        .where(UserSyncSequence.user_id == user_id)
+        .values(current_version=UserSyncSequence.current_version + 1)
+        .returning(UserSyncSequence.current_version)
+        .execution_options(synchronize_session=False)
+    )
+    row = res.first()
+    return int(row[0]) if row is not None else None
+
+
 async def get_next_sync_version(db: AsyncSession, user_id: str) -> int:
-    """Atomically increments and returns the monotonically increasing version for a user."""
-    stmt = select(UserSyncSequence).where(UserSyncSequence.user_id == user_id)
-    res = await db.execute(stmt)
-    seq = res.scalar_one_or_none()
-    if not seq:
-        # Check max existing version in change log
-        max_stmt = select(func.max(ConversationChangeLog.version)).where(ConversationChangeLog.user_id == user_id)
-        max_res = await db.execute(max_stmt)
-        curr = max_res.scalar_one() or 0
-        seq = UserSyncSequence(user_id=user_id, current_version=curr + 1)
-        db.add(seq)
-        await db.flush()
-        return seq.current_version
+    """
+    Atomically increments and returns the monotonically increasing version for a user.
+
+    The increment happens in the database (one UPDATE ... RETURNING), not read-then-write in
+    Python: two messages sent at the same moment used to read the same value and both record
+    the same version, so a delta sync could skip one of them. On Postgres the UPDATE locks the
+    row until commit, so parallel bumps queue up and each gets its own number.
+    """
+    version = await _bump_sync_version(db, user_id)
+    if version is not None:
+        return version
+
+    # First change for this user: create the row (starting after any versions already in the
+    # change log), "insert or ignore" so two first changes at once don't collide, then bump.
+    max_res = await db.execute(
+        select(func.max(ConversationChangeLog.version)).where(ConversationChangeLog.user_id == user_id)
+    )
+    start = int(max_res.scalar_one() or 0)
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
     else:
-        seq.current_version += 1
+        dialect_insert = None
+    if dialect_insert is not None:
+        await db.execute(
+            dialect_insert(UserSyncSequence)
+            .values(user_id=user_id, current_version=start)
+            .on_conflict_do_nothing(index_elements=["user_id"])
+        )
+    else:  # other databases: plain insert (not used in production)
+        db.add(UserSyncSequence(user_id=user_id, current_version=start))
         await db.flush()
-        return seq.current_version
+
+    version = await _bump_sync_version(db, user_id)
+    if version is None:  # can't happen (the row exists now), but never hand out a bogus version
+        raise RuntimeError(f"Could not allocate a sync version for {user_id}")
+    return version
 
 
 async def build_conversation_snapshot(

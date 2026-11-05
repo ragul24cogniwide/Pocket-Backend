@@ -6,10 +6,25 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+# Input size limits (longer values are rejected with 422 before reaching the database).
+# Kept at or below the database column sizes, and well above what the apps send.
+MAX_MESSAGE_CHARS = 8000          # message text (send and edit)
+MAX_ID_CHARS = 64                 # user ids / app-generated message ids (VARCHAR(64) columns)
+MAX_PHONE_CHARS = 32
+MAX_USERNAME_CHARS = 60           # the phone app allows 30
+MAX_ABOUT_CHARS = 200             # "about" / quote; the phone app allows 60 (column is 255)
+# Avatars can be a base64 data: URI (the phone's profile screen sends a 256x256 JPEG that way,
+# typically 10-60 KB), so this is generous: ~1.5 MB of image
+MAX_AVATAR_URL_CHARS = 2_000_000
+MAX_MEDIA_URL_CHARS = 2_000_000   # status media (an uploaded URL normally)
+MAX_FCM_TOKEN_CHARS = 4096
+MAX_CAPTION_CHARS = 1000          # status caption; the phone app allows 200
+MAX_MEETING_DESCRIPTION_CHARS = 5000
+
 
 # Auth & OTP Schemas
 class SendOtpRequest(BaseModel):
-    phone_number: str = Field(..., description="Phone number with country code, e.g. +919876543210")
+    phone_number: str = Field(..., max_length=MAX_PHONE_CHARS, description="Phone number with country code, e.g. +919876543210")
 
 
 class SendOtpResponse(BaseModel):
@@ -21,9 +36,9 @@ class SendOtpResponse(BaseModel):
 
 
 class VerifyOtpRequest(BaseModel):
-    phone_number: str
-    otp_code: str
-    username: Optional[str] = None
+    phone_number: str = Field(..., max_length=MAX_PHONE_CHARS)
+    otp_code: str = Field(..., max_length=12)
+    username: Optional[str] = Field(default=None, max_length=MAX_USERNAME_CHARS)
 
 
 class AuthResponse(BaseModel):
@@ -46,17 +61,17 @@ class UserProfileResponse(BaseModel):
 
 
 class UpdateProfileRequest(BaseModel):
-    username: Optional[str] = None
-    avatar_url: Optional[str] = None
-    avatar_color: Optional[str] = None
-    quote: Optional[str] = None
-    fcm_token: Optional[str] = None
-    user_id: Optional[str] = None
-    phone_number: Optional[str] = None
+    username: Optional[str] = Field(default=None, max_length=MAX_USERNAME_CHARS)
+    avatar_url: Optional[str] = Field(default=None, max_length=MAX_AVATAR_URL_CHARS)
+    avatar_color: Optional[str] = Field(default=None, max_length=20)
+    quote: Optional[str] = Field(default=None, max_length=MAX_ABOUT_CHARS)
+    fcm_token: Optional[str] = Field(default=None, max_length=MAX_FCM_TOKEN_CHARS)
+    user_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
+    phone_number: Optional[str] = Field(default=None, max_length=MAX_PHONE_CHARS)
 
 
 class UpdatePreferencesRequest(BaseModel):
-    last_seen: Optional[str] = None  # 'everyone' | 'nobody'
+    last_seen: Optional[str] = Field(default=None, max_length=20)  # 'everyone' | 'nobody'
     read_receipts: Optional[bool] = None
     msg_notifications: Optional[bool] = None
     preview: Optional[bool] = None
@@ -64,9 +79,9 @@ class UpdatePreferencesRequest(BaseModel):
 
 
 class UpdateFcmTokenRequest(BaseModel):
-    fcm_token: str
-    user_id: Optional[str] = None
-    phone_number: Optional[str] = None
+    fcm_token: str = Field(..., max_length=MAX_FCM_TOKEN_CHARS)
+    user_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
+    phone_number: Optional[str] = Field(default=None, max_length=MAX_PHONE_CHARS)
 
 
 # Contact & Chat Overview
@@ -115,22 +130,23 @@ class SyncContactsResponse(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    receiver_id: str
+    receiver_id: str = Field(..., max_length=MAX_ID_CHARS)
+    # Text length is checked in the endpoint (413 "Message is too long", as before)
     content: str
-    temp_msg_id: Optional[str] = None
+    temp_msg_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
     reply_to: Optional[Any] = None
     metadata: Optional[Any] = None
 
 
 class CreateStatusRequest(BaseModel):
-    type: str = "image" # 'image' | 'video' | 'text'
-    media_url: Optional[str] = None
-    caption: Optional[str] = None
-    bg_gradient: Optional[str] = "#1E293B"
+    type: str = Field(default="image", max_length=20)  # 'image' | 'video' | 'text'
+    media_url: Optional[str] = Field(default=None, max_length=MAX_MEDIA_URL_CHARS)
+    caption: Optional[str] = Field(default=None, max_length=MAX_CAPTION_CHARS)
+    bg_gradient: Optional[str] = Field(default="#1E293B", max_length=50)
 
 
 class EditMessageRequest(BaseModel):
-    content: str
+    content: str = Field(..., max_length=MAX_MESSAGE_CHARS)
 
 
 # Voice Calling Schemas
@@ -173,26 +189,26 @@ class CallEndRequest(BaseModel):
 # Meeting / Calendar Schemas
 class MeetingCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
-    description: Optional[str] = None
+    description: Optional[str] = Field(default=None, max_length=MAX_MEETING_DESCRIPTION_CHARS)
     start_time: datetime
     end_time: datetime
-    timezone: Optional[str] = "UTC"
-    location: Optional[str] = None
-    meeting_link: Optional[str] = None
-    attendees: Optional[List[str]] = None
-    status: Optional[str] = "SCHEDULED"
+    timezone: Optional[str] = Field(default="UTC", max_length=50)
+    location: Optional[str] = Field(default=None, max_length=255)
+    meeting_link: Optional[str] = Field(default=None, max_length=500)
+    attendees: Optional[List[str]] = Field(default=None, max_length=200)
+    status: Optional[str] = Field(default="SCHEDULED", max_length=20)
 
 
 class MeetingUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=MAX_MEETING_DESCRIPTION_CHARS)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    timezone: Optional[str] = None
-    location: Optional[str] = None
-    meeting_link: Optional[str] = None
-    attendees: Optional[List[str]] = None
-    status: Optional[str] = None
+    timezone: Optional[str] = Field(default=None, max_length=50)
+    location: Optional[str] = Field(default=None, max_length=255)
+    meeting_link: Optional[str] = Field(default=None, max_length=500)
+    attendees: Optional[List[str]] = Field(default=None, max_length=200)
+    status: Optional[str] = Field(default=None, max_length=20)
 
 
 class MeetingResponse(BaseModel):
@@ -220,10 +236,12 @@ class CheckConflictRequest(BaseModel):
 
 # Personal AI Agent Schemas
 class AgentChatRequest(BaseModel):
+    # Length is checked in the endpoint (400, max MAX_AGENT_MESSAGE_CHARS in main.py)
     content: str
-    client_tz_offset_minutes: Optional[int] = 0
-    client_msg_id: Optional[str] = None  # retries with the same id return the original reply
-    conversation_id: Optional[str] = None
+    # JavaScript getTimezoneOffset(); missing = unknown (the agent then assumes India time)
+    client_tz_offset_minutes: Optional[int] = None
+    client_msg_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)  # retries with the same id return the original reply
+    conversation_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
 
 
 class AgentChatResponse(BaseModel):

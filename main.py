@@ -10,6 +10,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from typing import List, Optional, Any, Dict
 
 import hashlib
@@ -18,10 +19,11 @@ import re
 import time
 from collections import defaultdict, deque
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from sqlalchemy import desc, func, or_, and_, select, update
+from sqlalchemy import desc, false, func, or_, and_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,10 +71,12 @@ from schemas import (
 )
 from sync_service import (
     get_conversation_sync_page,
+    prune_expired_change_logs,
     record_conversation_change,
     record_profile_change_for_contacts,
 )
 import archive
+import rate_limits
 import calllog
 import groups
 import reactions
@@ -117,9 +121,22 @@ if DEV_MODE_EXPOSE_OTP or ALLOW_MASTER_OTP:
         ALLOW_MASTER_OTP,
     )
 
-# Per-phone OTP throttling. In-memory, so limits are per server instance (fine for a single Render instance).
-_otp_send_log: dict[str, deque] = defaultdict(deque)
-_otp_failed_attempts: dict[str, int] = defaultdict(int)
+# OTP throttling. Counts live in Redis (shared by every server process, updated atomically) and
+# fall back to this process's memory when Redis isn't available (see rate_limits.py).
+# Per number: one code per OTP_RESEND_COOLDOWN_SECONDS and OTP_MAX_SENDS_PER_HOUR codes an hour
+# (the existing limits, now shared). Per client IP: OTP_MAX_SENDS_PER_IP_PER_HOUR codes an hour,
+# so one client can't request codes for thousands of different numbers.
+OTP_MAX_SENDS_PER_IP_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_IP_PER_HOUR", "30"))
+
+# Other per-user limits (429 when exceeded)
+PROFILE_LOOKUPS_PER_HOUR = 120   # GET /api/users/{number}: enough for normal use, too few to scan numbers
+UPLOADS_PER_HOUR = 60            # photos + voice notes
+AGENT_MESSAGES_PER_MINUTE = 20   # personal AI agent (each one is a paid LLM call)
+MAX_AGENT_MESSAGE_CHARS = 4000
+# Largest request body accepted at all (a 10 MB upload is ~13.4 MB as base64 + JSON overhead)
+MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
+# Longest base64 string that can decode to MAX_UPLOAD_BYTES (4 chars per 3 bytes, plus padding)
+MAX_UPLOAD_BASE64_CHARS = ((MAX_UPLOAD_BYTES + 2) // 3) * 4
 
 # Contact checks answer "is this number on Flick?", so each account may check a limited number of
 # *different* numbers per day: enough for any address book, too few to scan number ranges.
@@ -142,6 +159,33 @@ def normalize_phone(raw: str) -> str:
     return phone
 
 
+def client_ip(request: Request) -> str:
+    """
+    The caller's IP address, for per-IP limits. Behind Render's proxy request.client is the proxy
+    (uvicorn only trusts X-Forwarded-For from 127.0.0.1 by default), so the first X-Forwarded-For
+    entry is used when present. A client can forge that header, which only lets it dodge the
+    per-IP limit (the per-number limits still apply); trusting the proxy address instead would
+    put every user behind one shared limit.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    first = forwarded.split(",")[0].strip() if forwarded else ""
+    if first:
+        return first[:64]
+    return (request.client.host if request.client else "") or "unknown"
+
+
+async def enforce_rate_limit(key: str, limit: int, window_seconds: int, message: str) -> None:
+    """Counts one request; raises 429 (with Retry-After) when `key` is over `limit` per window."""
+    retry_after = await rate_limits.hit(key, limit, window_seconds)
+    if retry_after is not None:
+        logger.warning("[RateLimit] %s over %d per %ds", key, limit, window_seconds)
+        raise HTTPException(
+            status_code=429,
+            detail=f"{message} Try again in {rate_limits.wait_text(retry_after)}.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
 async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
     """
     Sends the OTP to the user's phone. Returns True when an SMS provider accepted it.
@@ -152,7 +196,7 @@ async def deliver_otp_sms(phone: str, otp_code: str) -> bool:
     return False
 
 
-MAX_MESSAGE_CHARS = 8000
+from schemas import MAX_MESSAGE_CHARS  # noqa: E402 (shared with EditMessageRequest's limit)
 MAX_METADATA_CHARS = 20_000
 MAX_WS_FRAME_CHARS = 100_000
 MAX_CONTACT_LOOKUP = 500
@@ -172,6 +216,79 @@ async def chat_peer_ids(db: AsyncSession, user: User) -> set:
             ids.update(x for x in (uid, phone) if x)
     ids.add(AGENT_USER_ID)
     return ids
+
+
+async def _with_phone_aliases(db: AsyncSession, ids: set) -> set:
+    """Adds each account's id and phone number to a set of ids (messages may use either form)."""
+    if ids:
+        res = await db.execute(select(User.id, User.phone_number).where(or_(User.id.in_(ids), User.phone_number.in_(ids))))
+        for uid, phone in res.all():
+            ids.update(x for x in (uid, phone) if x)
+    return ids
+
+
+# -----------------------------------------------------------------------------
+# Who may see whom (statuses, online / last seen, profile "about")
+#
+# Owner O is visible to viewer V when O has reached out to V or keeps V as a contact:
+#   - O has sent V at least one message, or
+#   - O has V in their saved contacts (SavedContact, reported by O's phone).
+# Only O's own actions count. Before, anyone V had *sent* a message to counted, so a stranger
+# could send "hi" to a number and from then on see that person's statuses and live presence.
+# A normal two-way chat (both have written) makes both sides visible to each other.
+# -----------------------------------------------------------------------------
+async def visible_owner_ids(db: AsyncSession, viewer: User) -> set:
+    """Ids (and phone numbers) of everyone whose statuses / presence `viewer` may see, plus the AI agent."""
+    mine = {i for i in (viewer.id, viewer.phone_number) if i}
+    # They wrote to me (DISTINCT: one row per person, not per message; this runs on every connect)
+    wrote_to_me = await db.execute(select(Message.sender_id).where(Message.receiver_id.in_(mine)).distinct())
+    # They saved me as a contact
+    saved_me = await db.execute(select(SavedContact.user_id).where(SavedContact.contact_id.in_(mine)).distinct())
+    ids = {p for (p,) in [*wrote_to_me.all(), *saved_me.all()] if p and p not in mine}
+    await _with_phone_aliases(db, ids)
+    ids.add(AGENT_USER_ID)
+    return ids
+
+
+async def is_visible_to(db: AsyncSession, owner: User, viewer: User) -> bool:
+    """Whether `viewer` may see `owner`'s statuses / presence / about (same rule as visible_owner_ids)."""
+    if owner.id == viewer.id or owner.id == AGENT_USER_ID:
+        return True
+    owner_ids = [i for i in (owner.id, owner.phone_number) if i]
+    viewer_ids = [i for i in (viewer.id, viewer.phone_number) if i]
+    wrote = await db.execute(
+        select(Message.id).where(Message.sender_id.in_(owner_ids), Message.receiver_id.in_(viewer_ids)).limit(1)
+    )
+    if wrote.first():
+        return True
+    saved = await db.execute(
+        select(SavedContact.id).where(SavedContact.user_id == owner.id, SavedContact.contact_id.in_(viewer_ids)).limit(1)
+    )
+    return saved.first() is not None
+
+
+async def audience_ids(db: AsyncSession, owner: User) -> set:
+    """The reverse of visible_owner_ids: everyone who may see `owner` (for live status updates)."""
+    mine = {i for i in (owner.id, owner.phone_number) if i}
+    wrote_to = await db.execute(select(Message.receiver_id).where(Message.sender_id.in_(mine)).distinct())
+    saved = await db.execute(select(SavedContact.contact_id).where(SavedContact.user_id == owner.id).distinct())
+    return {p for (p,) in [*wrote_to.all(), *saved.all()] if p and p not in mine}
+
+
+# Message metadata (e.g. a photo's URL) goes into the push only when this small: FCM data
+# values must be strings and the whole push must stay under 4 KB (see notifications.py)
+MAX_PUSH_METADATA_CHARS = 1500
+
+
+def push_metadata_field(metadata: Any) -> dict:
+    """{"metadata": "<json>"} for a chat push when the message has small metadata, else {}."""
+    if not metadata:
+        return {}
+    try:
+        text = json.dumps(metadata, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return {}
+    return {"metadata": text} if len(text) < MAX_PUSH_METADATA_CHARS else {}
 
 
 def receipts_shared(*users: Optional[User]) -> bool:
@@ -387,6 +504,29 @@ async def server_keep_alive_loop():
         await asyncio.sleep(20)  # Ping every 20 seconds
 
 
+CHANGE_LOG_PRUNE_INTERVAL_SECONDS = 6 * 3600
+
+
+async def prune_change_logs_loop() -> None:
+    """
+    Deletes delta-sync change log entries past their retention (sync_service.CHANGE_LOG_RETENTION_DAYS)
+    every 6 hours; the table otherwise grows with every message forever. First run shortly
+    after startup. Errors are logged and retried next round.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with async_session_factory() as db:
+                removed = await prune_expired_change_logs(db)
+            if removed:
+                logger.info("[ChangeLog] Pruned %d expired change log entries", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[ChangeLog] Pruning failed: %s", e)
+        await asyncio.sleep(CHANGE_LOG_PRUNE_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown hooks."""
@@ -405,9 +545,11 @@ async def lifespan(app: FastAPI):
     await manager.initialize()
     keep_alive_task = asyncio.create_task(server_keep_alive_loop())
     call_cleanup_task = asyncio.create_task(cleanup_stale_call_sessions_loop())
+    prune_task = asyncio.create_task(prune_change_logs_loop())
     yield
     keep_alive_task.cancel()
     call_cleanup_task.cancel()
+    prune_task.cancel()
     logger.info("Shutting down connection manager...")
     await manager.shutdown()
 
@@ -419,6 +561,57 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+class BodySizeLimitMiddleware:
+    """
+    Rejects request bodies over MAX_REQUEST_BODY_BYTES with 413 before any of it is parsed.
+    Checked from Content-Length up front; a body sent without one (chunked) is counted as it
+    arrives and refused once it goes over. WebSockets have their own frame limit.
+    """
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    too_big = int(value) > self.max_bytes
+                except ValueError:
+                    too_big = False
+                if too_big:
+                    return await self._reject(send)
+                break
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self.max_bytes:
+                    # Raised while the route reads its body: FastAPI turns it into a 413 response
+                    raise HTTPException(status_code=413, detail="Request is too large.")
+            return message
+
+        return await self.app(scope, limited_receive, send)
+
+    @staticmethod
+    async def _reject(send):
+        body = json.dumps({"detail": "Request is too large."}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+# Added before CORS so CORS stays the outermost layer and 413 answers still carry CORS headers
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -522,6 +715,10 @@ async def upload_image(payload: dict, current_user: User = Depends(get_current_u
 
         if file_ext not in ALLOWED_IMAGE_EXTS:
             raise HTTPException(status_code=400, detail="Unsupported image type")
+        # Refuse oversized data before decoding it (decoding would allocate it all first)
+        if not isinstance(image_base64, str) or len(image_base64) > MAX_UPLOAD_BASE64_CHARS:
+            raise HTTPException(status_code=413, detail="Image is too large (max 10 MB)")
+        await enforce_rate_limit(f"upload:{current_user.id}", UPLOADS_PER_HOUR, 3600, "Too many uploads.")
 
         image_bytes = base64.b64decode(image_base64)
         if len(image_bytes) > MAX_UPLOAD_BYTES:
@@ -558,6 +755,10 @@ async def upload_audio(payload: dict, current_user: User = Depends(get_current_u
 
         if "," in audio_base64:
             audio_base64 = audio_base64.split(",", 1)[1]
+        # Refuse oversized data before decoding it (decoding would allocate it all first)
+        if not isinstance(audio_base64, str) or len(audio_base64) > MAX_UPLOAD_BASE64_CHARS:
+            raise HTTPException(status_code=413, detail="Voice note is too large (max 10 MB)")
+        await enforce_rate_limit(f"upload:{current_user.id}", UPLOADS_PER_HOUR, 3600, "Too many uploads.")
 
         audio_bytes = base64.b64decode(audio_base64)
         if len(audio_bytes) > MAX_UPLOAD_BYTES:
@@ -922,7 +1123,7 @@ async def root():
 # Authentication & OTP Endpoints
 # -----------------------------------------------------------------------------
 @app.post("/api/auth/send-otp", response_model=SendOtpResponse)
-async def send_otp(payload: SendOtpRequest, db: AsyncSession = Depends(get_db)):
+async def send_otp(payload: SendOtpRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Generates a 6-digit OTP for the provided phone number.
     In testing/dev mode, returns the OTP in the response for easy instant login.
@@ -932,16 +1133,23 @@ async def send_otp(payload: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     if not digits.isdigit() or not (8 <= len(digits) <= 15):
         raise HTTPException(status_code=400, detail="Enter a valid phone number.")
 
-    # Throttle: one code per cooldown window and a cap per hour, per number
-    now_ts = time.monotonic()
-    sends = _otp_send_log[phone]
-    while sends and now_ts - sends[0] > 3600:
-        sends.popleft()
-    if sends and now_ts - sends[-1] < OTP_RESEND_COOLDOWN_SECONDS:
-        wait = int(OTP_RESEND_COOLDOWN_SECONDS - (now_ts - sends[-1])) + 1
-        raise HTTPException(status_code=429, detail=f"Please wait {wait}s before requesting another code.")
-    if len(sends) >= OTP_MAX_SENDS_PER_HOUR:
-        raise HTTPException(status_code=429, detail="Too many codes requested. Try again in an hour.")
+    # Throttle (shared across server processes via Redis): per client IP, then per number:
+    # one code per cooldown window and a cap per hour
+    await enforce_rate_limit(
+        f"otp_send_ip:{client_ip(request)}", OTP_MAX_SENDS_PER_IP_PER_HOUR, 3600,
+        "Too many login codes requested from this network.",
+    )
+    sends_now, cooldown_left = await rate_limits.incr_counter(f"otp_cooldown:{phone}", OTP_RESEND_COOLDOWN_SECONDS)
+    if sends_now > 1:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait {cooldown_left}s before requesting another code.",
+            headers={"Retry-After": str(cooldown_left)},
+        )
+    await enforce_rate_limit(
+        f"otp_send_phone:{phone}", OTP_MAX_SENDS_PER_HOUR, 3600,
+        "Too many codes requested for this number.",
+    )
 
     otp_code = generate_otp_code(6)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES)
@@ -962,8 +1170,8 @@ async def send_otp(payload: SendOtpRequest, db: AsyncSession = Depends(get_db)):
     db.add(otp_record)
     await db.commit()
 
-    sends.append(now_ts)
-    _otp_failed_attempts.pop(phone, None)
+    # A new code gets a fresh set of verify attempts (the old code was just invalidated above)
+    await rate_limits.reset_counter(f"otp_verify:{phone}")
 
     sms_sent = await deliver_otp_sms(phone, otp_code)
     if not sms_sent and not DEV_MODE_EXPOSE_OTP:
@@ -995,7 +1203,13 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     phone = normalize_phone(payload.phone_number)
     code = (payload.otp_code or "").strip()
 
-    if _otp_failed_attempts[phone] >= OTP_MAX_VERIFY_ATTEMPTS:
+    # Count this attempt BEFORE looking at the code, atomically (Redis INCR, shared by every
+    # server process; in-memory fallback without Redis). Checking first and counting after an
+    # awaited query let many parallel guesses all pass the check. The count lives as long as a
+    # code does and is cleared by a successful login or a new code.
+    attempt_key = f"otp_verify:{phone}"
+    attempts, _ = await rate_limits.incr_counter(attempt_key, OTP_EXPIRY_MINUTES * 60)
+    if attempts > OTP_MAX_VERIFY_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Too many incorrect attempts. Request a new code.")
 
     now = datetime.now(timezone.utc)
@@ -1015,8 +1229,7 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
     otp_record = result.scalars().first()
 
     if not otp_record and not (ALLOW_MASTER_OTP and code == MASTER_OTP_CODE):
-        _otp_failed_attempts[phone] += 1
-        if _otp_failed_attempts[phone] >= OTP_MAX_VERIFY_ATTEMPTS:
+        if attempts >= OTP_MAX_VERIFY_ATTEMPTS:
             # Burn any outstanding code so it can't be brute-forced further
             await db.execute(
                 update(OtpRecord)
@@ -1027,10 +1240,17 @@ async def verify_otp(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_d
             raise HTTPException(status_code=429, detail="Too many incorrect attempts. Request a new code.")
         raise HTTPException(status_code=400, detail="Invalid or expired OTP code.")
 
-    _otp_failed_attempts.pop(phone, None)
     if otp_record:
-        otp_record.is_used = True
+        # Claim the code atomically: of two requests racing with the same code only one wins
+        claimed = await db.execute(
+            update(OtpRecord)
+            .where(OtpRecord.id == otp_record.id, OtpRecord.is_used == False)  # noqa: E712
+            .values(is_used=True)
+        )
         await db.commit()
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP code.")
+    await rate_limits.reset_counter(attempt_key)
 
     # Find or Create User
     user_stmt = select(User).where(or_(User.id == phone, User.phone_number == phone))
@@ -1082,6 +1302,9 @@ async def logout(current_user: User = Depends(get_current_user), db: AsyncSessio
     current_user.is_online = False
     current_user.last_seen = datetime.now(timezone.utc)
     await db.commit()
+    # The phone's open socket(s) were authenticated with the now-revoked token: close them too
+    # (4401 = "log out"), on whichever server holds them
+    await manager.close_user_sockets(current_user.id, reason="Logged out")
     return {"message": "Logged out"}
 
 
@@ -1124,6 +1347,8 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
 
     await db.delete(current_user)
     await db.commit()
+    # Close the deleted account's phone socket(s) and any browser still connected
+    await manager.close_user_sockets(me, reason="Account deleted")
     logger.info("Deleted account %s", me)
     return {"message": "Account deleted"}
 
@@ -1268,13 +1493,9 @@ async def create_status(
     new_status.user = current_user
     st_dict = new_status.to_dict()
 
-    # Live update for the people this user chats with (the ones who can see it in Updates)
-    peer_rows = await db.execute(
-        select(Message.sender_id, Message.receiver_id).where(
-            or_(Message.sender_id == current_user.id, Message.receiver_id == current_user.id)
-        )
-    )
-    peers = {p for row in peer_rows.all() for p in row if p and p != current_user.id}
+    # Live update only for the people who can see it in Updates (see visible_owner_ids): people
+    # this user has written to or saved, not strangers who merely wrote to them
+    peers = await audience_ids(db, current_user)
     frame = {"type": "status_update", "data": st_dict}
 
     async def notify_peers():
@@ -1293,17 +1514,19 @@ async def get_status_feed(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns active 24h statuses with eager-loaded user profiles from PostgreSQL."""
+    """Returns active 24h statuses (mine, and those of people who let me see them) with their profiles."""
     now = datetime.now(timezone.utc)
+    mine = {i for i in (current_user.id, current_user.phone_number) if i}
+    peers = await visible_owner_ids(db, current_user)
+    # Filtered in SQL: only my statuses and those of people visible to me are loaded
     stmt = (
         select(Status)
         .options(joinedload(Status.user))
-        .where(Status.expires_at > now)
+        .where(Status.expires_at > now, Status.user_id.in_(mine | peers))
         .order_by(Status.created_at.desc())
     )
     result = await db.execute(stmt)
     all_statuses = result.scalars().all()
-    peers = await chat_peer_ids(db, current_user)
 
     my_statuses = []
     contact_dict = {}
@@ -1349,7 +1572,8 @@ async def mark_status_viewed(
         if not st:
             raise HTTPException(status_code=404, detail="Status not found")
         return {"message": "Own status", "viewsCount": len(json.loads(st.viewers or "[]"))}
-    if st.user_id not in await chat_peer_ids(db, current_user):
+    owner = await db.get(User, st.user_id)
+    if owner is None or not await is_visible_to(db, owner, current_user):
         raise HTTPException(status_code=404, detail="Status not found")
 
     viewers = []
@@ -1395,7 +1619,14 @@ async def get_user_public_profile(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Returns a user's public profile information (username, avatar, avatar_color, online status)."""
+    """
+    A user's profile. Anyone signed in gets id / name / avatar (enough to start a chat with a
+    number); about, online status and last seen only when that user lets the caller see them
+    (see visible_owner_ids). Lookups are rate limited per caller so numbers can't be scanned.
+    """
+    await enforce_rate_limit(
+        f"profile_lookup:{current_user.id}", PROFILE_LOOKUPS_PER_HOUR, 3600, "Too many profile lookups."
+    )
     uid_str = str(user_id).strip()
     digits = "".join(filter(str.isdigit, uid_str))
 
@@ -1415,18 +1646,24 @@ async def get_user_public_profile(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    is_online = await manager.is_user_online(user.id, user.phone_number)
-    return {
+    profile = {
         "id": user.id,
         "phone_number": user.phone_number,
         "username": user.username,
         "avatar_url": user.avatar_url,
         "avatar_color": user.avatar_color or "#FFB800",
         "avatar": user.username[:2].upper() if user.username and len(user.username) >= 2 else "FK",
-        "quote": user.quote or "Hey there! I am using Flick.",
-        "is_online": is_online,
-        "last_seen": user.visible_last_seen(viewer=current_user),
     }
+    if await is_visible_to(db, user, current_user):
+        profile.update({
+            "quote": user.quote or "Hey there! I am using Flick.",
+            "is_online": await manager.is_user_online(user.id, user.phone_number),
+            "last_seen": user.visible_last_seen(viewer=current_user),
+        })
+    else:
+        # Not visible: the keys stay (older apps read them) but say nothing about this person
+        profile.update({"quote": None, "is_online": False, "last_seen": None})
+    return profile
 
 
 async def resolve_user_context(user_opt: Optional[User], db: AsyncSession) -> User:
@@ -1450,6 +1687,9 @@ async def list_available_contacts(
     await ensure_personal_agent_user(db)
     # Only people you've chatted with: listing every user would let anyone harvest phone numbers
     peers = await chat_peer_ids(db, current_user)
+    # Online / last seen / about only for people who let this user see them (visible_owner_ids);
+    # someone you wrote to but who never wrote back or saved you stays in your list without them
+    visible = await visible_owner_ids(db, current_user)
     stmt = (
         select(User)
         .where(User.id != current_user.id, or_(User.id.in_(peers), User.phone_number.in_(peers)))
@@ -1477,7 +1717,9 @@ async def list_available_contacts(
             continue
         seen_identifiers.add(norm_key)
 
-        is_online = await manager.is_user_online(u.id, u.phone_number)
+        shows_presence = u.id in visible or u.phone_number in visible
+        is_online = shows_presence and await manager.is_user_online(u.id, u.phone_number)
+        about = (u.quote or "Hey there! I am using Flick.") if shows_presence else None
 
         # Collect target user identifier aliases
         u_ids = {u.id, u.phone_number}
@@ -1536,16 +1778,16 @@ async def list_available_contacts(
                     avatar=initials,
                     avatar_color=u.avatar_color,
                     avatar_url=u.avatar_url,
-                    quote=u.quote or "Hey there! I am using Flick.",
+                    quote=about,
                     online=is_online,
-                    last_message=latest_msg.content if latest_msg else (u.quote or "Tap to start conversation"),
+                    last_message=latest_msg.content if latest_msg else (about or "Tap to start conversation"),
                     time=(
                         iso_utc(latest_msg.timestamp)
                         if latest_msg and latest_msg.timestamp
                         else ""
                     ),
                     unread=unread_count,
-                    last_seen=u.visible_last_seen(viewer=current_user),
+                    last_seen=u.visible_last_seen(viewer=current_user) if shows_presence else None,
                 )
             )
         )
@@ -1657,7 +1899,10 @@ async def _users_with_numbers(db: AsyncSession, me: User, numbers: set[str]) -> 
     return users
 
 
-async def _contact_item(u: User, viewer: User) -> ChatContactItem:
+async def _contact_item(u: User, viewer: User, visible: set) -> ChatContactItem:
+    """A contact on Flick. Online / last seen / about only when `u` lets `viewer` see them (visible_owner_ids)."""
+    shows_presence = u.id in visible or u.phone_number in visible
+    about = (u.quote or "Hey there! I am using Flick.") if shows_presence else None
     initials = (
         "".join([part[0] for part in u.username.split()[:2]]).upper()
         if u.username
@@ -1670,12 +1915,12 @@ async def _contact_item(u: User, viewer: User) -> ChatContactItem:
         avatar=initials,
         avatar_color=u.avatar_color,
         avatar_url=u.avatar_url,
-        quote=u.quote or "Hey there! I am using Flick.",
-        online=await manager.is_user_online(u.id),
-        last_message=u.quote or "Available on Flick",
+        quote=about,
+        online=shows_presence and await manager.is_user_online(u.id),
+        last_message=about or "Available on Flick",
         time="",
         unread=0,
-        last_seen=u.visible_last_seen(viewer=viewer),
+        last_seen=u.visible_last_seen(viewer=viewer) if shows_presence else None,
     )
 
 
@@ -1695,7 +1940,8 @@ async def sync_device_contacts(
     _allow_contact_check(current_user.id, cleaned_numbers)
 
     users = await _users_with_numbers(db, current_user, cleaned_numbers)
-    registered_contacts = [await _contact_item(u, current_user) for u in users]
+    visible = await visible_owner_ids(db, current_user)
+    registered_contacts = [await _contact_item(u, current_user, visible) for u in users]
     return SyncContactsResponse(
         registered_users=registered_contacts,
         total_synced=len(registered_contacts),
@@ -1738,7 +1984,8 @@ async def list_contacts_on_flick(
         .where(SavedContact.user_id == current_user.id)
         .order_by(User.username.asc())
     )
-    return [await _contact_item(u, current_user) for u in result.scalars().all()]
+    visible = await visible_owner_ids(db, current_user)
+    return [await _contact_item(u, current_user, visible) for u in result.scalars().all()]
 
 
 # -----------------------------------------------------------------------------
@@ -1819,7 +2066,14 @@ async def get_messages_with_user(
                     Message.sender_id.endswith(other_last10) & Message.receiver_id.endswith(cur_last10)
                     if cur_last10 and other_last10 else False
                 ),
-            )
+            ),
+            # "Deleted for me" by this person: left out here, in SQL, before OFFSET/LIMIT. Filtering
+            # after the LIMIT returned short pages, which the app took as "no older messages".
+            # (COALESCE: rows from before these columns existed have NULL there.)
+            ~or_(
+                and_(Message.sender_id.in_(cur_ids), func.coalesce(Message.hidden_for_sender, false())),
+                and_(Message.receiver_id.in_(cur_ids), func.coalesce(Message.hidden_for_receiver, false())),
+            ),
         )
         .order_by(desc(Message.timestamp))
         .offset(offset)
@@ -1831,9 +2085,6 @@ async def get_messages_with_user(
     reaction_map = await reactions.reactions_for(db, [m.id for m in ordered_messages])
     out = []
     for msg in ordered_messages:
-        # "Deleted for me" by this person: not shown to them
-        if (msg.sender_id in cur_ids and msg.hidden_for_sender) or (msg.receiver_id in cur_ids and msg.hidden_for_receiver):
-            continue
         m = msg.to_dict()
         m["reactions"] = reaction_map.get(msg.id, [])
         # My message read while (or sent while) read receipts were off for either of us:
@@ -1852,6 +2103,7 @@ async def send_message_rest(
 ):
     """Sends a message via REST with immediate DB persistence and WebSocket dispatch."""
     receiver_id = payload.receiver_id
+    sender_id = current_user.id
     content = payload.content.strip()
     client_temp_id = payload.temp_msg_id or f"temp_{int(datetime.now().timestamp() * 1000)}"
 
@@ -1866,9 +2118,7 @@ async def send_message_rest(
             await manager.send_to_my_devices(current_user.id, {"type": "message_sent_sync", "data": sent})
         return {"status": "success", "temp_msg_id": client_temp_id, **sent}
 
-    # A retry of a send that already reached us (e.g. the response was lost on a slow network)
-    existing = await find_client_message(db, current_user.id, payload.temp_msg_id)
-    if existing is not None:
+    def duplicate_response(existing: Message) -> dict:
         existing_dict = existing.to_dict()
         return {
             "status": "success",
@@ -1877,6 +2127,11 @@ async def send_message_rest(
             "message_id": existing_dict["message_id"],
             **existing_dict,
         }
+
+    # A retry of a send that already reached us (e.g. the response was lost on a slow network)
+    existing = await find_client_message(db, current_user.id, payload.temp_msg_id)
+    if existing is not None:
+        return duplicate_response(existing)
 
     rec_stmt = select(User).where(User.id == receiver_id)
     rec_res = await db.execute(rec_stmt)
@@ -1912,7 +2167,16 @@ async def send_message_rest(
         receipt_hidden=not receipts_shared(current_user, receiver_user),
     )
     db.add(new_msg)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # A parallel retry with the same temp_msg_id was stored first (unique index on
+        # sender_id + client_msg_id): answer with that message instead of failing
+        await db.rollback()  # expires loaded objects: use the id captured before, not current_user.id
+        existing = await find_client_message(db, sender_id, payload.temp_msg_id)
+        if existing is None:
+            raise
+        return duplicate_response(existing)
     await db.refresh(new_msg)
 
     # Record conversation changes for delta sync
@@ -1944,6 +2208,7 @@ async def send_message_rest(
                 "message_id": message_dict["message_id"],
                 "sender_id": current_user.id,
                 "sender_name": current_user.username or "Flick User",
+                **push_metadata_field(message_dict.get("metadata")),
             },
         )
     )
@@ -2115,14 +2380,12 @@ async def flush_offline_messages(user_id: str) -> None:
 
         # 1. Deliver pending frames to connected user
         for msg in pending_messages:
+            # Same shape as a live chat_message frame (Message.to_dict(): metadata such as photos
+            # and voice notes, reply_to quotes, ...); replayed frames used to drop both
             msg_payload = {
                 "type": "chat_message",
                 "data": {
-                    "message_id": msg.id,
-                    "sender_id": msg.sender_id,
-                    "receiver_id": msg.receiver_id,
-                    "content": msg.content,
-                    "timestamp": iso_utc(msg.timestamp),
+                    **msg.to_dict(),
                     "status": "DELIVERED",
                     "is_offline_replay": True,
                 },
@@ -2168,9 +2431,17 @@ async def handle_personal_agent_reply(user_id: str, content: str, client_metadat
         await manager.send_personal_message(user_id, typing_start)
         await asyncio.sleep(0.4)
 
-        tz_offset = 0
+        tz_offset = None  # unknown unless the app sent it (the agent then assumes India time)
         if isinstance(client_metadata, dict):
-            tz_offset = client_metadata.get("tz_offset_minutes", 0)
+            tz_offset = client_metadata.get("tz_offset_minutes")
+
+        # Same limits as /api/agent/chat. The message itself is already stored, so over the
+        # limit the agent answers with a short note instead of calling the AI.
+        limit_note = None
+        try:
+            await check_agent_limits(user_id, content)
+        except HTTPException as limit_err:
+            limit_note = str(limit_err.detail)
 
         async with async_session_factory() as db:
             # Look up current user
@@ -2192,10 +2463,16 @@ async def handle_personal_agent_reply(user_id: str, content: str, client_metadat
             # Ensure agent user exists
             await ensure_personal_agent_user(db)
 
-            # Process AI request with user's calendar and message context
-            agent_result = await process_personal_agent_message(current_user, content, db, tz_offset)
+            if limit_note:
+                agent_result = {"reply": limit_note, "action": "general_chat"}
+            else:
+                # Process AI request with user's calendar and message context. The agent ends its
+                # read transaction before calling Gemini, so no DB connection waits on the AI.
+                agent_result = await process_personal_agent_message(current_user, content, db, tz_offset)
+            await db.commit()  # meeting changes made by the agent, if any
 
-            # Save AI response message to DB
+        # Save the AI response in a new short session
+        async with async_session_factory() as db:
             now = datetime.now(timezone.utc)
             reply_metadata = {
                 "is_agent": True,
@@ -2279,8 +2556,10 @@ async def list_user_meetings(
     if date_str:
         try:
             d = datetime.strptime(date_str, "%Y-%m-%d").date()
-            d_start = datetime.combine(d, time.min).replace(tzinfo=timezone.utc)
-            d_end = datetime.combine(d, time.max).replace(tzinfo=timezone.utc)
+            # dt_time (datetime.time), not the `time` module imported at the top of this file:
+            # `time.min` raised AttributeError and the except below silently dropped the filter
+            d_start = datetime.combine(d, dt_time.min).replace(tzinfo=timezone.utc)
+            d_end = datetime.combine(d, dt_time.max).replace(tzinfo=timezone.utc)
             stmt = stmt.where(Meeting.start_time >= d_start, Meeting.start_time <= d_end)
         except Exception:
             pass
@@ -2451,35 +2730,82 @@ async def get_agent_profile(
     }
 
 
+def agent_reply_client_id(user_id: str, client_msg_id: str) -> str:
+    """
+    client_msg_id of the agent's answer to a user's question. The agent is the sender of every
+    answer, so the key must include the user (two people can pick the same id), and it must fit
+    the 64-character column: hence a hash.
+    """
+    digest = hashlib.sha256(f"{user_id}:{client_msg_id}".encode()).hexdigest()[:40]
+    return f"reply:{digest}"
+
+
+async def find_agent_reply(db: AsyncSession, user_id: str, client_msg_id: Optional[str]) -> Optional[Message]:
+    """The agent's stored answer to this user's question, if any (also the older "reply:<id>" form)."""
+    if not client_msg_id:
+        return None
+    res = await db.execute(
+        select(Message).where(
+            Message.sender_id == AGENT_USER_ID,
+            Message.receiver_id == user_id,
+            Message.client_msg_id.in_([agent_reply_client_id(user_id, client_msg_id), f"reply:{client_msg_id}"]),
+        )
+    )
+    return res.scalars().first()
+
+
+async def check_agent_limits(user_id: str, content: str) -> None:
+    """Personal agent: message length cap (400) and per-user rate limit (429); each message is an LLM call."""
+    if len(content or "") > MAX_AGENT_MESSAGE_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Message is too long for the AI agent (max {MAX_AGENT_MESSAGE_CHARS} characters).",
+        )
+    await enforce_rate_limit(
+        f"agent:{user_id}", AGENT_MESSAGES_PER_MINUTE, 60, "You're sending messages to the AI agent too quickly."
+    )
+
+
 @app.post("/api/agent/chat", response_model=AgentChatResponse)
 async def chat_with_agent_endpoint(
     payload: AgentChatRequest,
     user_opt: Optional[User] = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
-    """Direct REST endpoint to chat with Personal AI Agent and execute calendar actions."""
+    """
+    Direct REST endpoint to chat with Personal AI Agent and execute calendar actions.
+
+    No database connection is held while the AI thinks: the question is committed first, the
+    agent ends its read transaction before calling Gemini (see call_gemini_agent), and the
+    answer is saved in a new, short session afterwards.
+    """
     current_user = await resolve_user_context(user_opt, db)
+    await check_agent_limits(current_user.id, payload.content)
     await ensure_personal_agent_user(db)
+
+    def stored_answer(question: Message, answered: Message) -> dict:
+        meta = (answered.to_dict().get("metadata") or {})
+        return {
+            "reply": answered.content,
+            "action": meta.get("action"),
+            "meeting": meta.get("meeting"),
+            "meetings": meta.get("meetings"),
+            "suggested_actions": meta.get("suggested_actions"),
+            "user_message_id": question.id,
+            "message_id": answered.id,
+            "timestamp": iso_utc(answered.timestamp),
+        }
 
     # A retried question we already answered: return the stored reply instead of
     # asking the AI again (which could, for example, book the same meeting twice)
     previous = await find_client_message(db, current_user.id, payload.client_msg_id)
     if previous is not None:
-        answered = await find_client_message(db, AGENT_USER_ID, f"reply:{payload.client_msg_id}")
+        answered = await find_agent_reply(db, current_user.id, payload.client_msg_id)
         if answered is not None:
-            meta = (answered.to_dict().get("metadata") or {})
-            return {
-                "reply": answered.content,
-                "action": meta.get("action"),
-                "meeting": meta.get("meeting"),
-                "meetings": meta.get("meetings"),
-                "suggested_actions": meta.get("suggested_actions"),
-                "user_message_id": previous.id,
-                "message_id": answered.id,
-                "timestamp": iso_utc(answered.timestamp),
-            }
+            return stored_answer(previous, answered)
 
-    # 1. Save user query message to persistent database
+    # 1. Save the question and commit it now (a retry arriving mid-processing then sees it,
+    #    and the request's DB connection goes back to the pool before the AI call)
     now = datetime.now(timezone.utc)
     if previous is not None:
         user_msg = previous  # stored earlier but never answered: answer it now, don't duplicate it
@@ -2495,19 +2821,27 @@ async def chat_with_agent_endpoint(
             client_msg_id=payload.client_msg_id,
         )
         db.add(user_msg)
-        if payload.client_msg_id:
-            # Commit the question first so a retry that arrives mid-processing sees it
+        try:
             await db.commit()
+        except IntegrityError:
+            # The same question (same client_msg_id) was stored by a parallel retry just now
+            await db.rollback()
+            await db.refresh(current_user)  # the rollback expired it; the agent reads it below
+            user_msg = await find_client_message(db, current_user.id, payload.client_msg_id)
+            if user_msg is None:
+                raise
+    user_msg_id = user_msg.id
 
-    # 2. Process query via Personal AI Agent engine
+    # 2. Process query via Personal AI Agent engine (it releases its connection before calling Gemini)
     res = await process_personal_agent_message(
         current_user=current_user,
         content=payload.content,
         db=db,
-        tz_offset_minutes=payload.client_tz_offset_minutes or 0,
+        tz_offset_minutes=payload.client_tz_offset_minutes,
     )
+    await db.commit()  # meeting changes made by the agent, if any
 
-    # 3. Save AI response message with metadata to persistent database
+    # 3. Save the answer in a new short session
     reply_metadata = {
         "is_agent": True,
         "action": res.get("action"),
@@ -2515,29 +2849,38 @@ async def chat_with_agent_endpoint(
         "meetings": res.get("meetings"),
         "suggested_actions": res.get("suggested_actions"),
     }
-    agent_msg = Message(
-        sender_id=AGENT_USER_ID,
-        receiver_id=current_user.id,
-        content=(res.get("reply") or "I am your personal AI assistant.").strip(),
-        reply_to=json.dumps({"metadata": reply_metadata}),
-        timestamp=datetime.now(timezone.utc),
-        status=MessageStatus.READ,
-        delivered_at=now,
-        read_at=now,
-        client_msg_id=f"reply:{payload.client_msg_id}" if payload.client_msg_id else None,
-    )
-    db.add(agent_msg)
-    await db.commit()
-    await db.refresh(user_msg)
-    await db.refresh(agent_msg)
+    async with async_session_factory() as save_db:
+        agent_msg = Message(
+            sender_id=AGENT_USER_ID,
+            receiver_id=current_user.id,
+            content=(res.get("reply") or "I am your personal AI assistant.").strip(),
+            reply_to=json.dumps({"metadata": reply_metadata}),
+            timestamp=datetime.now(timezone.utc),
+            status=MessageStatus.READ,
+            delivered_at=now,
+            read_at=now,
+            client_msg_id=(
+                agent_reply_client_id(current_user.id, payload.client_msg_id) if payload.client_msg_id else None
+            ),
+        )
+        save_db.add(agent_msg)
+        try:
+            await save_db.commit()
+        except IntegrityError:
+            # A parallel retry of this question already stored its answer: return that one
+            await save_db.rollback()
+            answered = await find_agent_reply(save_db, current_user.id, payload.client_msg_id)
+            if answered is None:
+                raise
+            return stored_answer(user_msg, answered)
 
-    try:
-        await record_conversation_change(db, user_id=current_user.id, peer_id=AGENT_USER_ID, action="updated")
-        await db.commit()
-    except Exception:
-        pass
+        try:
+            await record_conversation_change(save_db, user_id=current_user.id, peer_id=AGENT_USER_ID, action="updated")
+            await save_db.commit()
+        except Exception:
+            await save_db.rollback()
 
-    res["user_message_id"] = user_msg.id
+    res["user_message_id"] = user_msg_id
     res["message_id"] = agent_msg.id
     res["timestamp"] = iso_utc(agent_msg.timestamp)
 
@@ -2548,6 +2891,14 @@ async def chat_with_agent_endpoint(
 # Simulated AI / Bot Auto-Responder (Takes Flick to the Next Level 🚀)
 # -----------------------------------------------------------------------------
 async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: str) -> None:
+    """Demo-bot reply (SEED_DEMO_USERS only). Runs as a background task: never raises, logs instead."""
+    try:
+        await _handle_bot_auto_reply(sender_id, receiver_id, user_content)
+    except Exception as e:
+        logger.warning("Demo bot reply to %s failed: %s", sender_id, e)
+
+
+async def _handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: str) -> None:
     """Simulates smart interactive chat when messaging demo bot / contacts."""
     bot_names = {
         "1": "Rahul Sharma",
@@ -2660,17 +3011,19 @@ async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: 
             u_res = await db.execute(u_stmt)
             target_user = u_res.scalar_one_or_none()
 
-            b_stmt = select(User).where(User.id == bot_id)
+            # The bot is the receiver of the user's message (bot_id / bot_reply used to be
+            # undefined names here, so this push always raised NameError)
+            b_stmt = select(User).where(User.id == receiver_id)
             b_res = await db.execute(b_stmt)
             bot_user = b_res.scalar_one_or_none()
 
             if target_user and target_user.fcm_token:
                 await send_push_notification(
                     fcm_token=target_user.fcm_token,
-                    sender_name=bot_user.username if bot_user else "Rahul Sharma",
-                    content=bot_reply,
+                    sender_name=bot_user.username if bot_user else bot_name,
+                    content=reply_text,
                     data_payload={
-                        "sender_id": bot_id,
+                        "sender_id": receiver_id,
                         "receiver_id": sender_id,
                         "message_id": bot_msg.id,
                     },
@@ -2737,8 +3090,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.refresh_presence(user_id)
     async with async_session_factory() as db:
         me_obj = await db.get(User, user_id)
-        my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
-    # Presence changes reach this user only for the people they chat with (like WhatsApp)
+        my_peer_ids = await visible_owner_ids(db, me_obj) if me_obj else set()
+    # Presence changes reach this user only for people who let them see it: who wrote to them
+    # or saved them as a contact (visible_owner_ids), not anyone they merely wrote to
     manager.watch_presence(user_id, my_peer_ids)
     try:
         await manager.send_online_snapshot(websocket, my_peer_ids)
@@ -2811,12 +3165,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         "temp_msg_id": client_msg_id, "reason": "Message is too long"}}))
                     continue
 
-                async with async_session_factory() as db:
-                    # The app re-sends queued messages after reconnecting; if this one already
-                    # arrived, just confirm it again instead of storing and forwarding a duplicate
-                    existing = await find_client_message(db, user_id, client_msg_id)
-                if existing is not None:
-                    dup = existing.to_dict()
+                async def ack_duplicate(existing_msg: Message) -> None:
+                    dup = existing_msg.to_dict()
                     await websocket.send_text(json.dumps({
                         "type": "ack_sent",
                         "data": {
@@ -2828,6 +3178,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             "duplicate": True,
                         },
                     }))
+
+                async with async_session_factory() as db:
+                    # The app re-sends queued messages after reconnecting; if this one already
+                    # arrived, just confirm it again instead of storing and forwarding a duplicate
+                    existing = await find_client_message(db, user_id, client_msg_id)
+                if existing is not None:
+                    await ack_duplicate(existing)
                     continue
 
                 async with async_session_factory() as db:
@@ -2874,7 +3231,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         ),
                     )
                     db.add(new_msg)
-                    await db.commit()
+                    try:
+                        await db.commit()
+                    except IntegrityError:
+                        # The same message (same temp id) arrived twice at once, e.g. over the
+                        # socket and the REST fallback: the unique index kept one; confirm that one
+                        await db.rollback()
+                        existing = await find_client_message(db, user_id, client_msg_id)
+                        if existing is None:
+                            raise
+                        await ack_duplicate(existing)
+                        continue
                     await db.refresh(new_msg)
 
                     try:
@@ -2923,6 +3290,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                             "type": "chat_message",
                             "message_id": message_dict["message_id"],
                             "sender_id": user_id,
+                            **push_metadata_field(message_dict.get("metadata")),
                         },
                     )
                 )
@@ -3109,8 +3477,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 # The chat list re-syncs all green dots at once (on open, and as a periodic safety net)
                 async with async_session_factory() as db:
                     me_obj = await db.get(User, user_id)
-                    my_peer_ids = await chat_peer_ids(db, me_obj) if me_obj else set()
-                manager.watch_presence(user_id, my_peer_ids)  # new chats since the last refresh
+                    my_peer_ids = await visible_owner_ids(db, me_obj) if me_obj else set()
+                manager.watch_presence(user_id, my_peer_ids)  # people who wrote / saved me since the last refresh
                 await manager.send_online_snapshot(websocket, my_peer_ids)
 
             elif frame_type == "query_presence":
@@ -3118,6 +3486,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if target_id:
                     target_last_seen = None
                     is_target_online = False
+                    target_visible = False
                     async with async_session_factory() as db:
                         digits = "".join(filter(str.isdigit, str(target_id)))
                         t_stmt = select(User).where(
@@ -3130,20 +3499,24 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                         )
                         t_res = await db.execute(t_stmt)
                         target_user = t_res.scalars().first()
-                        if target_user:
+                        me_obj = await db.get(User, user_id) if target_user else None
+                        # Only people who let me see them (wrote to me / saved me, see
+                        # visible_owner_ids). Anyone else, or an unknown id: offline, no last
+                        # seen, and no live updates, so a stranger learns nothing.
+                        target_visible = bool(target_user and me_obj and await is_visible_to(db, target_user, me_obj))
+                        if target_visible:
                             is_target_online = await manager.is_user_online(target_user.id, target_user.phone_number)
                             # Hidden if they chose "Nobody", or if I did (then I can't see anyone's)
                             target_last_seen = (
                                 None if manager.is_last_seen_hidden(user_id) else target_user.visible_last_seen()
                             )
-                        else:
-                            is_target_online = await manager.is_user_online(target_id)
                     try:
                         aliases = [target_id]
                         if target_user:
                             aliases.extend([target_user.id, target_user.phone_number])
-                        # They opened this chat: keep them posted when this person comes and goes
-                        manager.watch_presence(user_id, aliases)
+                        if target_visible:
+                            # They opened this chat: keep them posted when this person comes and goes
+                            manager.watch_presence(user_id, aliases)
                         await websocket.send_text(json.dumps({
                             "type": "presence_update",
                             "data": {

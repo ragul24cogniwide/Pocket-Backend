@@ -106,6 +106,38 @@ def local_to_utc(local_wall: datetime, tz_offset_minutes: int) -> datetime:
     return (local_wall.replace(tzinfo=None) + timedelta(minutes=tz_offset_minutes)).replace(tzinfo=timezone.utc)
 
 
+# Used when the app didn't say which timezone the user is in (most Flick users are in India)
+DEFAULT_USER_TIMEZONE = "Asia/Kolkata"
+
+
+def normalize_tz_offset(value: Any) -> Optional[int]:
+    """A getTimezoneOffset() value from the app as int minutes, or None if missing / not believable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return minutes if -16 * 60 <= minutes <= 16 * 60 else None
+
+
+def default_meeting_start_utc(tz_offset_minutes: int, tz_known: bool) -> datetime:
+    """
+    Tomorrow at 15:00 in the user's local time (UTC). Without a known timezone: 15:00 in
+    DEFAULT_USER_TIMEZONE. (It used to be 15:00 UTC, i.e. 8:30 PM for a user in India.)
+    """
+    if tz_known:
+        local_tomorrow = (get_user_current_time(tz_offset_minutes) + timedelta(days=1)).date()
+        return local_to_utc(datetime.combine(local_tomorrow, time(15, 0)), tz_offset_minutes)
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(DEFAULT_USER_TIMEZONE)
+    except Exception:  # no tz database on this machine: India has no DST, so a fixed +05:30 is exact
+        zone = timezone(timedelta(hours=5, minutes=30))
+    local_tomorrow = (datetime.now(zone) + timedelta(days=1)).date()
+    return datetime.combine(local_tomorrow, time(15, 0), tzinfo=zone).astimezone(timezone.utc)
+
+
 def parse_date_string(text: str, user_now: datetime) -> Optional[date]:
     """Extracts target date from natural language relative terms or dates."""
     lowered = text.lower()
@@ -359,6 +391,7 @@ async def call_gemini_agent(
     db: AsyncSession,
     tz_offset_minutes: int,
     user_now: datetime,
+    tz_known: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     Invokes Google Gemini with the user's live calendar, contacts context,
@@ -379,6 +412,7 @@ async def call_gemini_agent(
 
     # 1. Fetch upcoming meetings for context
     meetings_ctx_str = "No upcoming meetings scheduled."
+    existing_meetings = []  # stays defined if the query fails (reschedule / cancel read it below)
     try:
         stmt_meetings = (
             select(Meeting)
@@ -429,6 +463,20 @@ async def call_gemini_agent(
             msgs_ctx_str = "\n".join(msgs_context)
     except Exception as e:
         logger.warning("Could not fetch messages context for Gemini: %s", e)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # Done reading: end the transaction so the pooled DB connection goes back to the pool while
+    # we wait for Gemini (up to GEMINI_TIMEOUT_SECONDS per try). Holding it here let a handful of
+    # slow AI requests use up the whole pool and stall every chat. The session stays usable
+    # (sessions are created with expire_on_commit=False); its next query or the meeting writes
+    # below simply check a connection out again for a short new transaction.
+    try:
+        await db.commit()
+    except Exception as e:
+        logger.warning("Could not end the DB transaction before calling Gemini: %s", e)
         try:
             await db.rollback()
         except Exception:
@@ -604,7 +652,7 @@ Example JSON:
                 pass
 
         if not parsed_start:
-            parsed_start = (user_now + timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+            parsed_start = default_meeting_start_utc(tz_offset_minutes, tz_known)
 
         parsed_end = parsed_start + timedelta(minutes=duration_minutes)
 
@@ -739,7 +787,8 @@ async def _process_personal_agent_message_raw(
     current_user: User,
     content: str,
     db: AsyncSession,
-    tz_offset_minutes: int = 0
+    tz_offset_minutes: int = 0,
+    tz_known: bool = True,
 ) -> Dict[str, Any]:
     """
     Core intelligent handler for user's personal AI agent.
@@ -814,6 +863,7 @@ async def _process_personal_agent_message_raw(
                 db=db,
                 tz_offset_minutes=tz_offset_minutes,
                 user_now=user_now,
+                tz_known=tz_known,
             )
             if gemini_result:
                 return gemini_result
@@ -1206,13 +1256,16 @@ async def process_personal_agent_message(
     current_user: User,
     content: str,
     db: AsyncSession,
-    tz_offset_minutes: int = 0
+    tz_offset_minutes: Optional[int] = 0
 ) -> Dict[str, Any]:
     """
     Public entry point for user's personal AI agent.
     Guarantees that all response strings are sanitized and free of raw asterisks (**).
+    tz_offset_minutes is JavaScript's getTimezoneOffset(); None means the app didn't send one.
     """
-    res = await _process_personal_agent_message_raw(current_user, content, db, tz_offset_minutes)
+    tz_offset = normalize_tz_offset(tz_offset_minutes)
+    tz_known = tz_offset is not None
+    res = await _process_personal_agent_message_raw(current_user, content, db, tz_offset or 0, tz_known)
     if not res:
         res = {
             "reply": "I am your personal AI assistant. How can I assist you today?",

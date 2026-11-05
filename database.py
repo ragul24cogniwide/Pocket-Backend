@@ -86,6 +86,50 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+# Indexes added after the tables existed (create_all never adds indexes to an existing table).
+# Each runs in its own transaction, so one failing (e.g. a Postgres error aborting the
+# transaction) can't take the others down, and a failure is logged without stopping startup.
+# Plain CREATE INDEX (not CONCURRENTLY) so a failed build rolls back cleanly instead of leaving
+# an invalid index behind; it briefly blocks writes to messages only the first time it runs.
+MESSAGE_INDEXES = [
+    # Conversation history / latest message / unread counts: sender + receiver, newest first
+    (
+        "ix_messages_sender_receiver_ts",
+        "CREATE INDEX IF NOT EXISTS ix_messages_sender_receiver_ts ON messages (sender_id, receiver_id, timestamp)",
+    ),
+    # Offline queue flush and unread counts: messages to me in a given status
+    (
+        "ix_messages_receiver_status",
+        "CREATE INDEX IF NOT EXISTS ix_messages_receiver_status ON messages (receiver_id, status)",
+    ),
+    # One stored message per (sender, app-generated id): two retries of the same send arriving at
+    # once can't both be stored. The send paths catch the IntegrityError and return the first.
+    (
+        "uq_messages_sender_client_msg",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_sender_client_msg ON messages (sender_id, client_msg_id) "
+        "WHERE client_msg_id IS NOT NULL",
+    ),
+]
+
+
+async def _ensure_message_indexes(db_logger) -> None:
+    for name, ddl in MESSAGE_INDEXES:
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(ddl))
+        except Exception as e:
+            if name.startswith("uq_"):
+                db_logger.warning(
+                    "Skipped unique index %s (startup continues; duplicate sends are then only caught "
+                    "by the lookup before insert). Usually this means duplicate (sender_id, client_msg_id) "
+                    "rows already exist; find them with: SELECT sender_id, client_msg_id, COUNT(*) FROM messages "
+                    "WHERE client_msg_id IS NOT NULL GROUP BY 1, 2 HAVING COUNT(*) > 1. Error: %s",
+                    name, e,
+                )
+            else:
+                db_logger.warning("Could not create index %s (startup continues): %s", name, e)
+
+
 async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
     import asyncio
@@ -132,6 +176,8 @@ async def init_db() -> None:
                 db_logger.error("Failed to initialize database tables after %d attempts: %s", max_retries, e)
                 raise
             await asyncio.sleep(2)
+
+    await _ensure_message_indexes(db_logger)
 
     # Demo contacts are for local testing only: in production every real user would see them
     if os.getenv("SEED_DEMO_USERS", "false").lower() != "true":
