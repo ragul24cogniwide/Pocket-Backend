@@ -56,18 +56,24 @@ def _credentials_from_env() -> Optional[dict]:
         # strict=False: a pasted key may contain real line breaks inside the JSON string
         return _fix_private_key(json.loads(raw, strict=False))
 
-    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
-    client_email = os.getenv("FIREBASE_CLIENT_EMAIL", "").strip()
-    private_key = os.getenv("FIREBASE_PRIVATE_KEY", "")
-    if project_id and client_email and private_key.strip():
+    # Separate variables: FIREBASE_PROJECT_ID etc., or the JSON's own field names (project_id, ...)
+    def field(name: str) -> str:
+        return (os.getenv(f"FIREBASE_{name.upper()}") or os.getenv(name) or "").strip()
+
+    project_id, client_email, private_key = field("project_id"), field("client_email"), field("private_key")
+    if project_id or client_email or private_key:
+        missing = [n for n, v in (("project_id", project_id), ("client_email", client_email),
+                                  ("private_key", private_key)) if not v]
+        if missing:
+            raise ValueError("missing " + ", ".join(missing))
         return _fix_private_key({
             "type": "service_account",
             "project_id": project_id,
             "client_email": client_email,
             "private_key": private_key,
-            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", "").strip(),
-            "client_id": os.getenv("FIREBASE_CLIENT_ID", "").strip(),
-            "token_uri": "https://oauth2.googleapis.com/token",
+            "private_key_id": field("private_key_id"),
+            "client_id": field("client_id"),
+            "token_uri": field("token_uri") or "https://oauth2.googleapis.com/token",
         })
     return None
 
@@ -77,7 +83,7 @@ def _credentials_from_env() -> Optional[dict]:
 #      FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY variables (Render: Environment)
 #   2. a file: FIREBASE_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS, a Render Secret File in
 #      /etc/secrets, or the *firebase-adminsdk*.json next to this file (local development)
-#   3. Application Default Credentials (Google Cloud hosting)
+#   3. Application Default Credentials (only on Google Cloud, when GOOGLE_CLOUD_PROJECT is set)
 try:
     # FIREBASE_DISABLED=true (local test servers): never contact Firebase, log pushes instead
     if os.getenv("FIREBASE_DISABLED", "").strip().lower() == "true":
@@ -93,9 +99,11 @@ try:
             logger.info("Firebase Admin SDK initialized from environment variables (project %s)",
                         env_info.get("project_id"))
     except Exception as e:
-        # The error type only: the message could quote part of the key
-        logger.error("Firebase credentials in the environment could not be used (%s). Check that "
-                     "FIREBASE_CREDENTIALS_JSON holds the complete JSON file.", type(e).__name__)
+        # Only our own "missing ..." text, or the error type: other messages could quote part of the key
+        detail = str(e) if str(e).startswith("missing ") else type(e).__name__
+        logger.error("Firebase credentials in the environment could not be used (%s). Set "
+                     "FIREBASE_CREDENTIALS_JSON to the complete JSON file, or project_id, client_email "
+                     "and private_key as separate variables.", detail)
 
     if not firebase_initialized:
         for cred_path in _credential_files():
@@ -109,16 +117,20 @@ try:
             except Exception as e:
                 logger.warning("Could not use Firebase credentials file %s: %s", os.path.basename(cred_path), e)
 
-    if not firebase_initialized:
+    # Google's default login only exists on Google Cloud; elsewhere (Render) it "starts" fine and then
+    # every push fails with "Project ID is required", so say clearly that pushes are off instead.
+    if not firebase_initialized and (os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT")):
         try:
             firebase_admin.initialize_app()
             firebase_initialized = True
             logger.info("Firebase Admin SDK initialized with Application Default Credentials")
-        except Exception:
-            logger.error(
-                "Push notifications are OFF: no Firebase credentials found. Set FIREBASE_CREDENTIALS_JSON "
-                "to the contents of the service-account JSON file (Render: Environment)."
-            )
+        except Exception as e:
+            logger.warning("Application Default Credentials could not be used: %s", type(e).__name__)
+    if not firebase_initialized:
+        logger.error(
+            "Push notifications are OFF: no Firebase credentials found. Set FIREBASE_CREDENTIALS_JSON "
+            "to the contents of the service-account JSON file (Render: Environment)."
+        )
 except Exception as e:
     logger.warning("Firebase Admin initialization skipped: %s", e)
 
