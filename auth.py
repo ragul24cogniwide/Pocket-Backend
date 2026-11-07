@@ -14,6 +14,7 @@ from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
+from identity import id_forms, same_identity  # noqa: F401 (same_identity is imported from here by main.py)
 from models import User, WebSession
 
 # The signing secret must come from the environment. A default baked into the
@@ -90,27 +91,12 @@ def decode_access_token(token: str) -> Optional[dict]:
         return None
 
 
-def same_identity(a: Optional[str], b: Optional[str]) -> bool:
-    """True when two user ids / phone numbers refer to the same person (tolerates +91 vs bare digits)."""
-    if not a or not b:
-        return False
-    a, b = str(a).strip(), str(b).strip()
-    if a == b:
-        return True
-    da = "".join(filter(str.isdigit, a))
-    db_ = "".join(filter(str.isdigit, b))
-    return len(da) >= 10 and len(db_) >= 10 and da[-10:] == db_[-10:]
-
-
 async def _find_user(db: AsyncSession, identifier: str) -> Optional[User]:
-    identifier = str(identifier).strip()
-    digits = "".join(filter(str.isdigit, identifier))
-    conditions = [User.id == identifier, User.phone_number == identifier]
-    if len(digits) >= 10:
-        last10 = digits[-10:]
-        conditions.append(User.phone_number.endswith(last10))
-        conditions.append(User.id.endswith(last10))
-    result = await db.execute(select(User).where(or_(*conditions)))
+    """A user by id or phone number, in any spelling of the same full number (see identity.py)."""
+    forms = id_forms(identifier)
+    if not forms:
+        return None
+    result = await db.execute(select(User).where(or_(User.id.in_(forms), User.phone_number.in_(forms))))
     return result.scalars().first()
 
 

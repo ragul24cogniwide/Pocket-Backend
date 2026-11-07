@@ -38,6 +38,7 @@ from auth import (
     web_session_id,
 )
 from connection_manager import manager, PHONE_DEVICE
+from identity import id_forms
 from database import async_session_factory, get_db, init_db
 from models import Message, MessageStatus, OtpRecord, SavedContact, User, Status, Meeting, iso_utc
 from notifications import send_push_notification
@@ -315,37 +316,22 @@ async def dispatch_push_to_user(
     """Dispatches high-priority push notification to offline receiver with phone tolerance."""
     try:
         async with async_session_factory() as push_db:
-            # 1. Look up receiver with active token prioritization
-            rec_digits = "".join(filter(str.isdigit, str(receiver_id)))
-            rec_last10 = rec_digits[-10:] if len(rec_digits) >= 10 else rec_digits
+            # 1. Look up receiver with active token prioritization (exact spellings of the same
+            # full number only: a suffix match could pick someone else's phone, see identity.py)
+            rec_forms = id_forms(receiver_id)
             r_stmt = (
                 select(User)
-                .where(
-                    or_(
-                        User.id == receiver_id,
-                        User.phone_number == receiver_id,
-                        User.phone_number.endswith(rec_last10) if len(rec_last10) >= 7 else False,
-                        User.id.endswith(rec_last10) if len(rec_last10) >= 7 else False,
-                    )
-                )
+                .where(or_(User.id.in_(rec_forms), User.phone_number.in_(rec_forms)))
                 .order_by(desc(User.fcm_token.isnot(None)), desc(User.last_seen))
             )
             r_res = await push_db.execute(r_stmt)
             rec_user = r_res.scalars().first()
 
             # 2. Look up sender name
-            send_digits = "".join(filter(str.isdigit, str(sender_id)))
-            send_last10 = send_digits[-10:] if len(send_digits) >= 10 else send_digits
+            send_forms = id_forms(sender_id)
             s_stmt = (
                 select(User)
-                .where(
-                    or_(
-                        User.id == sender_id,
-                        User.phone_number == sender_id,
-                        User.phone_number.endswith(send_last10) if len(send_last10) >= 7 else False,
-                        User.id.endswith(send_last10) if len(send_last10) >= 7 else False,
-                    )
-                )
+                .where(or_(User.id.in_(send_forms), User.phone_number.in_(send_forms)))
                 .order_by(desc(User.last_seen))
             )
             s_res = await push_db.execute(s_stmt)
@@ -457,11 +443,12 @@ async def resolve_call_target(target_id: str) -> str:
                 await call_db.execute(select(User).where(or_(User.id == key, User.phone_number == key)))
             ).scalars().first()
             if user_obj is None:
-                digits = "".join(filter(str.isdigit, key))
-                if len(digits) >= 10:  # ids saved by older app versions without the country code
-                    user_obj = (
-                        await call_db.execute(select(User).where(User.phone_number.endswith(digits[-10:])))
-                    ).scalars().first()
+                # Ids saved by older app versions in another spelling (e.g. without the country
+                # code): the same full number only, never a different number with the same ending
+                forms = id_forms(key)
+                user_obj = (
+                    await call_db.execute(select(User).where(or_(User.id.in_(forms), User.phone_number.in_(forms))))
+                ).scalars().first()
             if user_obj is not None:
                 resolved = user_obj.id
     except Exception as e:
@@ -828,19 +815,16 @@ CALL_NOT_ALLOWED = "You can call people in your contacts, and anyone who has mes
 
 
 async def find_user(db: AsyncSession, any_id: str) -> Optional[User]:
-    """A user by id or phone number (any common format of the same 10 digits)."""
+    """A user by id or phone number, in any spelling of the same full number (see identity.py)."""
     uid = str(any_id or "").strip()
-    digits = "".join(filter(str.isdigit, uid))
-    res = await db.execute(
-        select(User).where(
-            or_(
-                User.id == uid,
-                User.phone_number == uid,
-                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-            )
-        )
-    )
+    if not uid:
+        return None
+    # An exact match first; other spellings of the number only when there is none
+    exact = (await db.execute(select(User).where(or_(User.id == uid, User.phone_number == uid)))).scalars().first()
+    if exact is not None:
+        return exact
+    forms = id_forms(uid)
+    res = await db.execute(select(User).where(or_(User.id.in_(forms), User.phone_number.in_(forms))))
     return res.scalars().first()
 
 
@@ -1627,22 +1611,7 @@ async def get_user_public_profile(
     await enforce_rate_limit(
         f"profile_lookup:{current_user.id}", PROFILE_LOOKUPS_PER_HOUR, 3600, "Too many profile lookups."
     )
-    uid_str = str(user_id).strip()
-    digits = "".join(filter(str.isdigit, uid_str))
-
-    stmt = (
-        select(User)
-        .where(
-            or_(
-                User.id == uid_str,
-                User.phone_number == uid_str,
-                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-            )
-        )
-    )
-    res = await db.execute(stmt)
-    user = res.scalars().first()
+    user = await find_user(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1701,14 +1670,8 @@ async def list_available_contacts(
     contacts = []
     seen_identifiers = set()
 
-    # Pre-calculate current_user identifiers
-    cur_ids = {current_user.id, current_user.phone_number}
-    cur_digits = "".join(filter(str.isdigit, str(current_user.id)))
-    cur_last10 = cur_digits[-10:] if len(cur_digits) >= 7 else cur_digits
-    if cur_last10:
-        cur_ids.add(cur_last10)
-        cur_ids.add(f"+91{cur_last10}")
-    cur_ids = {str(x) for x in cur_ids if x}
+    # Pre-calculate current_user identifiers (every spelling of this account's own number only)
+    cur_ids = id_forms(current_user.id, current_user.phone_number)
 
     for u in users:
         # Avoid duplicate contacts pointing to the same account (two people can share a display name)
@@ -1722,13 +1685,7 @@ async def list_available_contacts(
         about = (u.quote or "Hey there! I am using Flick.") if shows_presence else None
 
         # Collect target user identifier aliases
-        u_ids = {u.id, u.phone_number}
-        u_digits = "".join(filter(str.isdigit, str(u.id)))
-        u_last10 = u_digits[-10:] if len(u_digits) >= 7 else u_digits
-        if u_last10:
-            u_ids.add(u_last10)
-            u_ids.add(f"+91{u_last10}")
-        u_ids = {str(x) for x in u_ids if x}
+        u_ids = id_forms(u.id, u.phone_number)
 
         # Get latest message between current_user and u
         msg_stmt = (
@@ -1737,14 +1694,6 @@ async def list_available_contacts(
                 or_(
                     Message.sender_id.in_(cur_ids) & Message.receiver_id.in_(u_ids),
                     Message.sender_id.in_(u_ids) & Message.receiver_id.in_(cur_ids),
-                    (
-                        Message.sender_id.endswith(cur_last10) & Message.receiver_id.endswith(u_last10)
-                        if cur_last10 and u_last10 else False
-                    ),
-                    (
-                        Message.sender_id.endswith(u_last10) & Message.receiver_id.endswith(cur_last10)
-                        if cur_last10 and u_last10 else False
-                    ),
                 )
             )
             .order_by(desc(Message.timestamp))
@@ -2009,48 +1958,15 @@ async def get_messages_with_user(
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
-    # 1. Collect all possible identifier aliases for current_user
-    cur_ids = {current_user.id, current_user.phone_number}
-    cur_digits = "".join(filter(str.isdigit, str(current_user.id)))
-    cur_last10 = cur_digits[-10:] if len(cur_digits) >= 7 else cur_digits
-    if cur_last10:
-        cur_ids.add(cur_last10)
-        cur_ids.add(f"+91{cur_last10}")
-        if cur_digits:
-            cur_ids.add(f"+{cur_digits}")
+    # 1. Every stored spelling of my own number (and only mine: see identity.py). Matching by the
+    # last 10 digits used to pull in the chats of another person whose number ends the same way.
+    cur_ids = id_forms(current_user.id, current_user.phone_number)
 
-    # 2. Collect all possible identifier aliases for other_user
-    other_ids = {other_user_id}
-    other_digits = "".join(filter(str.isdigit, str(other_user_id)))
-    other_last10 = other_digits[-10:] if len(other_digits) >= 7 else other_digits
-    if other_last10:
-        other_ids.add(other_last10)
-        other_ids.add(f"+91{other_last10}")
-        if other_digits:
-            other_ids.add(f"+{other_digits}")
-
-    # Look up other user in DB to retrieve their exact db id & phone_number
-    o_stmt = (
-        select(User)
-        .where(
-            or_(
-                User.id == other_user_id,
-                User.phone_number == other_user_id,
-                User.phone_number.endswith(other_last10) if other_last10 else False,
-                User.id.endswith(other_last10) if other_last10 else False,
-            )
-        )
-        .order_by(desc(User.last_seen))
-    )
-    o_res = await db.execute(o_stmt)
-    o_user = o_res.scalars().first()
+    # 2. The same for the other person, plus their exact db id & phone_number
+    other_ids = id_forms(other_user_id)
+    o_user = await find_user(db, other_user_id)
     if o_user:
-        other_ids.add(o_user.id)
-        other_ids.add(o_user.phone_number)
-
-    # Clean out None or empty values
-    cur_ids = {str(i) for i in cur_ids if i}
-    other_ids = {str(i) for i in other_ids if i}
+        other_ids |= id_forms(o_user.id, o_user.phone_number)
 
     stmt = (
         select(Message)
@@ -2058,14 +1974,6 @@ async def get_messages_with_user(
             or_(
                 Message.sender_id.in_(cur_ids) & Message.receiver_id.in_(other_ids),
                 Message.sender_id.in_(other_ids) & Message.receiver_id.in_(cur_ids),
-                (
-                    Message.sender_id.endswith(cur_last10) & Message.receiver_id.endswith(other_last10)
-                    if cur_last10 and other_last10 else False
-                ),
-                (
-                    Message.sender_id.endswith(other_last10) & Message.receiver_id.endswith(cur_last10)
-                    if cur_last10 and other_last10 else False
-                ),
             ),
             # "Deleted for me" by this person: left out here, in SQL, before OFFSET/LIMIT. Filtering
             # after the LIMIT returned short pages, which the app took as "no older messages".
@@ -3488,17 +3396,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     is_target_online = False
                     target_visible = False
                     async with async_session_factory() as db:
-                        digits = "".join(filter(str.isdigit, str(target_id)))
-                        t_stmt = select(User).where(
-                            or_(
-                                User.id == str(target_id),
-                                User.phone_number == str(target_id),
-                                User.phone_number.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                                User.id.endswith(digits[-10:]) if len(digits) >= 10 else False,
-                            )
-                        )
-                        t_res = await db.execute(t_stmt)
-                        target_user = t_res.scalars().first()
+                        target_user = await find_user(db, str(target_id))
                         me_obj = await db.get(User, user_id) if target_user else None
                         # Only people who let me see them (wrote to me / saved me, see
                         # visible_owner_ids). Anyone else, or an unknown id: offline, no last

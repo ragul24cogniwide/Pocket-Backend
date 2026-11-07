@@ -26,6 +26,8 @@ import redis.asyncio as aioredis
 from fastapi import WebSocket
 from dotenv import load_dotenv
 
+from identity import canonical_id, ids_forms
+
 load_dotenv()
 
 logger = logging.getLogger("ConnectionManager")
@@ -71,15 +73,15 @@ class ConnectionManager:
         self.active_devices: dict[str, set[str]] = {}
         # The one pub/sub listener of this server (see _listen_cluster)
         self._cluster_listener_task: Optional[asyncio.Task] = None
-        # alias (phone / last-10 digits) -> primary socket user_id
+        # alias (every spelling of the user's full number, see identity.py) -> primary socket user_id
         self.id_aliases: dict[str, str] = {}
         self.user_aliases: dict[str, set[str]] = {}
         # Linked browsers (Flick Web), next to the phone's socket: {user_id: {WebSocket: session_id}}
         self.linked: dict[str, dict[WebSocket, str]] = {}
-        # alias (id / phone / last-10 digits) -> user_id, for users with a linked browser open
+        # alias (id / every spelling of the phone number) -> user_id, for users with a linked browser open
         self.linked_aliases: dict[str, str] = {}
         # Whose presence each connected user receives (the people they chat with), and the reverse:
-        # {owner user_id: {ids}} and {id: {owner user_ids}}. Ids include phone and last-10 forms.
+        # {owner user_id: {ids}} and {id: {owner user_ids}}. Ids include every spelling of each number.
         self.presence_peers: dict[str, set[str]] = {}
         self.presence_watchers: dict[str, set[str]] = {}
         # When this server last wrote a user's presence keys, and for which ids: {user_id: (time, ids)}
@@ -87,29 +89,14 @@ class ConnectionManager:
 
     @staticmethod
     def _canonical_id(user_id: str) -> str:
-        s = str(user_id).strip()
-        digits = "".join(filter(str.isdigit, s))
-        if len(digits) >= 10:
-            return digits[-10:]
-        return s
+        """The full international form (E.164) of a phone id; other ids as they are (identity.py).
+        Not the last 10 digits: those are shared by different people in different countries."""
+        return canonical_id(user_id)
 
     @staticmethod
-    def _last10(value: str) -> str:
-        digits = "".join(filter(str.isdigit, str(value or "")))
-        return digits[-10:] if len(digits) >= 10 else ""
-
-    def _id_forms(self, ids: Iterable[Optional[str]]) -> set[str]:
-        """Every form an id can be written in here: as given, and its last 10 digits."""
-        forms: set[str] = set()
-        for value in ids:
-            s = str(value).strip() if value else ""
-            if not s:
-                continue
-            forms.add(s)
-            last10 = self._last10(s)
-            if last10:
-                forms.add(last10)
-        return forms
+    def _id_forms(ids: Iterable[Optional[str]]) -> set[str]:
+        """Every spelling of these ids: as given, plus every spelling of the same full number."""
+        return ids_forms(ids)
 
     async def initialize(self) -> None:
         """Connects to Redis with a capped connection pool (SSL for Render/Redis Cloud)."""
@@ -171,19 +158,8 @@ class ConnectionManager:
         primary = str(primary_id).strip()
         collected = self.user_aliases.setdefault(primary, set())
         collected.add(primary)
-        canon = self._canonical_id(primary)
-        if canon:
-            collected.add(canon)
-        for alias in aliases or []:
-            if not alias:
-                continue
-            value = str(alias).strip()
-            if not value:
-                continue
-            collected.add(value)
-            extra = self._canonical_id(value)
-            if extra:
-                collected.add(extra)
+        # Every spelling of the same full number (never another number with the same last digits)
+        collected.update(self._id_forms([primary, *(aliases or [])]))
         for alias in list(collected):
             self.id_aliases[alias] = primary
         return list(collected)
@@ -357,10 +333,7 @@ class ConnectionManager:
         await websocket.accept()
         sockets = self.linked.setdefault(user_id, {})
         sockets[websocket] = session_id
-        alias_set = set()
-        for alias in [user_id, *aliases]:
-            if alias:
-                alias_set.update({str(alias), self._canonical_id(str(alias))})
+        alias_set = self._id_forms([user_id, *aliases])
         for alias in alias_set:
             self.linked_aliases[alias] = user_id
         # The tab reports right away whether it's in use (presence_online / presence_offline);
@@ -447,10 +420,11 @@ class ConnectionManager:
     # Messaging & Routing
     # -------------------------------------------------------------------------
     def _find_all_local_ws(self, user_id: str, include_linked: bool = True) -> list[WebSocket]:
-        """Finds all active local WebSocket connections matching exact ID or phone digits.
+        """Finds all active local WebSocket connections of this account (any spelling of its id).
 
-        Ids of 10+ digits are looked up through the alias index (every connection registers its
-        last 10 digits), so this doesn't go through every open connection on each message.
+        Looked up through the alias index (every connection registers each spelling of its full
+        number), so this doesn't go through every open connection on each message. Only the same
+        full number matches: never a different number that merely ends with the same digits.
         """
         matched: list[WebSocket] = []
         uid_str = str(user_id).strip()
@@ -459,14 +433,6 @@ class ConnectionManager:
             ws = self.active_connections.get(key) if key else None
             if ws is not None and ws not in matched:
                 matched.append(ws)
-
-        digits = "".join(filter(str.isdigit, uid_str))
-        if not matched and 8 <= len(digits) < 10:
-            # A short or partial number: compare digits with every connection (rare)
-            for conn_id, ws in list(self.active_connections.items()):
-                conn_digits = "".join(filter(str.isdigit, str(conn_id)))
-                if conn_digits and (digits.endswith(conn_digits) or conn_digits.endswith(digits)):
-                    matched.append(ws)
         if include_linked:
             matched.extend(ws for ws in self._linked_sockets(uid_str) if ws not in matched)
         return matched
@@ -679,7 +645,7 @@ class ConnectionManager:
         )
 
     def is_away(self, *ids: Optional[str]) -> bool:
-        """mark_away stores every form of the ids (with their last 10 digits), so this is a few lookups."""
+        """mark_away stores every spelling of the ids, so this is a few lookups."""
         if not self.away:
             return False
         for i in ids:
@@ -688,8 +654,7 @@ class ConnectionManager:
             s = str(i)
             if s in self.away or self.id_aliases.get(s) in self.away:
                 return True
-            last10 = self._last10(s)
-            if last10 and last10 in self.away:
+            if self._canonical_id(s) in self.away:
                 return True
         return False
 

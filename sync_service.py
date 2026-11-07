@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, func, or_, select, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from identity import id_forms
 from models import ChatArchive, ConversationChangeLog, Group, GroupMember, GroupMessage, Message, User, UserSyncSequence, iso_utc
 from schemas import ChatContactItem, SyncConversationsResponse
 
@@ -187,22 +188,10 @@ async def _build_snapshot(db: AsyncSession, user_id: str, peer_id: str, version:
     if not peer:
         return None
 
-    # Calculate identifier aliases
-    cur_ids = {user_id}
-    cur_digits = "".join(filter(str.isdigit, str(user_id)))
-    cur_last10 = cur_digits[-10:] if len(cur_digits) >= 7 else cur_digits
-    if cur_last10:
-        cur_ids.add(cur_last10)
-        cur_ids.add(f"+91{cur_last10}")
-
-    u_ids = {peer.id, peer.phone_number}
-    u_digits = "".join(filter(str.isdigit, str(peer.id)))
-    u_last10 = u_digits[-10:] if len(u_digits) >= 7 else u_digits
-    if u_last10:
-        u_ids.add(u_last10)
-        u_ids.add(f"+91{u_last10}")
-    cur_ids = {str(x) for x in cur_ids if x}
-    u_ids = {str(x) for x in u_ids if x}
+    # Calculate identifier aliases: every stored spelling of each full number, and only that
+    # number (matching by the last 10 digits mixed up different people: see identity.py)
+    cur_ids = id_forms(user_id)
+    u_ids = id_forms(peer.id, peer.phone_number)
 
     # Latest message
     msg_stmt = (
@@ -211,14 +200,6 @@ async def _build_snapshot(db: AsyncSession, user_id: str, peer_id: str, version:
             or_(
                 Message.sender_id.in_(cur_ids) & Message.receiver_id.in_(u_ids),
                 Message.sender_id.in_(u_ids) & Message.receiver_id.in_(cur_ids),
-                (
-                    Message.sender_id.endswith(cur_last10) & Message.receiver_id.endswith(u_last10)
-                    if cur_last10 and u_last10 else False
-                ),
-                (
-                    Message.sender_id.endswith(u_last10) & Message.receiver_id.endswith(cur_last10)
-                    if cur_last10 and u_last10 else False
-                ),
             )
         )
         .order_by(desc(Message.timestamp))
