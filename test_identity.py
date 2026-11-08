@@ -79,7 +79,7 @@ async def _seed():
 
 
 async def _history(me_id: str, other_id: str) -> set[str]:
-    from main import get_messages_with_user
+    from message_routes import get_messages_with_user
     async with async_session_factory() as db:
         me = await db.get(User, me_id)
         rows = await get_messages_with_user(other_id, limit=50, offset=0, current_user=me, db=db)
@@ -113,7 +113,7 @@ async def test_chat_list_row_is_not_shared():
 
 
 async def test_find_user_picks_the_right_person():
-    from main import find_user
+    from core import find_user
     await _seed()
     async with async_session_factory() as db:
         assert (await find_user(db, "4155551234")).id == INDIA

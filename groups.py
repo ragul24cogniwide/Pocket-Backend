@@ -30,7 +30,8 @@ from auth import get_current_user
 from connection_manager import manager
 from database import async_session_factory, get_db
 from models import Group, GroupMember, GroupMessage, User, iso_utc
-from notifications import send_push_notification
+from notification_stack import group_chat_notification
+from notifications import chat_thread_key, send_push_notification
 from reactions import delete_reactions, reactions_for
 from schemas import CreateGroupRequest, GroupAdminRequest, GroupMembersRequest, UpdateGroupRequest
 from sync_service import AGENT_USER_ID, GROUP_ID_PREFIX, group_initials, is_group_id, record_conversation_change
@@ -375,6 +376,17 @@ async def send_group_message(
         now = datetime.now(timezone.utc)
         extra = {}
         if reply_to:
+            # Quoting a message by the id its phone gave it while sending (before the server's id
+            # arrived): store the server's id, so tapping the quote finds it on every device
+            ref = reply_to.get("id") if isinstance(reply_to, dict) else None
+            if ref:
+                quoted = (
+                    await db.execute(
+                        select(GroupMessage.id).where(GroupMessage.group_id == group_id, GroupMessage.client_msg_id == str(ref))
+                    )
+                ).scalars().first()
+                if quoted is not None and quoted != ref:
+                    reply_to = {**reply_to, "id": quoted}
             extra["reply_to"] = reply_to
         if metadata:
             extra["metadata"] = metadata
@@ -418,12 +430,18 @@ async def push_group_message(group: Group, sender: User, content: str, recipient
         prefs = user.prefs()
         if not prefs.get("msg_notifications", True):
             continue
-        body = content if prefs.get("preview", True) else "New message"
         try:
+            # One notification per group (like WhatsApp): its unread messages, each with who wrote it
+            async with async_session_factory() as db:
+                title, body = await group_chat_notification(
+                    db, group.id, group.name, user, f"{display_name(sender)}: {content}",
+                    preview=prefs.get("preview", True),
+                )
             await send_push_notification(
                 fcm_token=user.fcm_token,
-                sender_name=group.name,
-                content=f"{display_name(sender)}: {body}",
+                sender_name=title,
+                content=body,
+                thread_key=chat_thread_key(group.id),
                 data_payload={
                     "type": "group_message",
                     "group_id": group.id,
@@ -437,7 +455,17 @@ async def push_group_message(group: Group, sender: User, content: str, recipient
             logger.warning("Group push to %s failed: %s", user.id, e)
 
 
-async def group_history(user: User, group_id: str, limit: int = 50, offset: int = 0) -> list:
+async def group_history(
+    user: User, group_id: str, limit: int = 50, offset: int = 0, before: Optional[str] = None
+) -> list:
+    """
+    A page of the group's history for this member, oldest first (same rules as one-to-one history:
+    `before` = the id of the oldest message the app has; see message_routes.get_messages_with_user).
+
+    Messages this member deleted "for me" are skipped while the page is collected, so a page is
+    only short at the start of the history: the app reads a short page as "nothing older" and
+    removes what the server didn't return, so a short page in the middle would wipe older messages.
+    """
     limit = max(1, min(int(limit), HISTORY_MAX_PAGE))
     offset = max(0, int(offset))
     async with async_session_factory() as db:
@@ -445,11 +473,29 @@ async def group_history(user: User, group_id: str, limit: int = 50, offset: int 
         visible = [GroupMessage.group_id == group_id, GroupMessage.timestamp >= me.joined_at]
         if me.left_at is not None:
             visible.append(GroupMessage.timestamp <= me.left_at)
-        rows = (
-            await db.execute(
-                select(GroupMessage).where(*visible).order_by(desc(GroupMessage.timestamp)).offset(offset).limit(limit)
-            )
-        ).scalars().all()
+        if before:
+            anchor = await db.get(GroupMessage, str(before))
+            if anchor is not None and anchor.group_id == group_id:
+                # Same time as the anchor may come again (the app drops duplicates): none is skipped
+                visible += [GroupMessage.timestamp <= anchor.timestamp, GroupMessage.id != anchor.id]
+                offset = 0
+        rows: list = []
+        raw_offset = offset
+        while len(rows) < limit:
+            batch = (
+                await db.execute(
+                    select(GroupMessage)
+                    .where(*visible)
+                    .order_by(desc(GroupMessage.timestamp), desc(GroupMessage.id))
+                    .offset(raw_offset)
+                    .limit(limit)
+                )
+            ).scalars().all()
+            raw_offset += len(batch)
+            rows.extend(m for m in batch if user.id not in m.hidden_ids())
+            if len(batch) < limit:
+                break  # the start of the history
+        rows = rows[:limit]
         members = await active_members(db, group_id)
         marks = receipt_marks(members, user.id)
         senders = await users_by_id(db, [m.sender_id for m in rows])
@@ -457,8 +503,6 @@ async def group_history(user: User, group_id: str, limit: int = 50, offset: int 
 
     out = []
     for msg in reversed(rows):
-        if user.id in msg.hidden_ids():
-            continue
         d = msg.to_dict(senders.get(msg.sender_id))
         d["status"] = tick_for(msg.timestamp, marks) if msg.sender_id == user.id and msg.kind == "text" else "READ"
         d["reactions"] = reaction_map.get(msg.id, [])

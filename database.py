@@ -4,6 +4,7 @@ Optimized for Neon PostgreSQL (asyncpg) with SSL and connection pooling,
 plus fallback to SQLite for local development.
 """
 
+import logging
 import os
 import ssl
 from collections.abc import AsyncGenerator
@@ -130,6 +131,34 @@ async def _ensure_message_indexes(db_logger) -> None:
                 db_logger.warning("Could not create index %s (startup continues): %s", name, e)
 
 
+ALEMBIC_INI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alembic.ini")
+
+
+async def run_migrations(db_logger) -> None:
+    """
+    Applies the Alembic revisions the database doesn't have yet (migrations/versions/). On a
+    database that predates migrations this records the baseline (which changes nothing) and then
+    applies any later revisions. Runs on the app's own engine, in one transaction.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(ALEMBIC_INI)
+    logging.getLogger("alembic.runtime.plugins").setLevel(logging.WARNING)  # one line per plugin otherwise
+
+    def upgrade(sync_conn) -> None:
+        cfg.attributes["connection"] = sync_conn
+        command.upgrade(cfg, "head")
+
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(upgrade)
+        db_logger.info("Database migrations are up to date.")
+    except Exception as e:
+        db_logger.error("Database migration failed (the schema is unchanged): %s", e)
+        raise
+
+
 async def init_db() -> None:
     """Creates database tables automatically on startup if missing and seeds default contacts."""
     import asyncio
@@ -164,10 +193,16 @@ async def init_db() -> None:
                     "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 0;",
                     "CREATE INDEX IF NOT EXISTS ix_messages_client_msg_id ON messages (client_msg_id);",
                 ]:
+                    # Legacy column patches from before migrations (see migrations/README.md); new
+                    # schema changes are Alembic revisions. Each runs in a savepoint so one failing
+                    # can't abort the others, and a failure is logged instead of hidden.
                     try:
-                        await conn.execute(text(ddl))
-                    except Exception:
-                        pass
+                        async with conn.begin_nested():
+                            await conn.execute(text(ddl))
+                    except Exception as ddl_err:
+                        # SQLite has no "IF NOT EXISTS" / "ALTER COLUMN": expected there, so quiet
+                        log = db_logger.debug if conn.dialect.name == "sqlite" else db_logger.warning
+                        log("Schema patch skipped (%s): %s", ddl, str(ddl_err).splitlines()[0])
             db_logger.info("Database schema initialized and verified successfully.")
             break
         except Exception as e:
@@ -178,6 +213,7 @@ async def init_db() -> None:
             await asyncio.sleep(2)
 
     await _ensure_message_indexes(db_logger)
+    await run_migrations(db_logger)
 
     # Demo contacts are for local testing only: in production every real user would see them
     if os.getenv("SEED_DEMO_USERS", "false").lower() != "true":

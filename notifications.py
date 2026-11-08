@@ -172,9 +172,15 @@ async def send_push_notification(
     content: str,
     data_payload: Optional[dict] = None,
     silent: bool = False,
+    thread_key: Optional[str] = None,
 ) -> bool:
     """
     Sends a high-priority push notification to an offline user via FCM.
+
+    `thread_key` (chat_thread_key): every push of one chat carries it, so the phone shows ONE
+    notification per chat, like WhatsApp: on Android a new one replaces the last (same tag), on
+    iOS likewise (apns-collapse-id) and they stack by chat (thread-id). The app removes that
+    chat's notification when the chat is read (see send_clear_notification).
     """
     if not fcm_token:
         return False
@@ -184,6 +190,8 @@ async def send_push_notification(
         return True
 
     try:
+        if thread_key:
+            data_payload = {**(data_payload or {}), "thread": thread_key}
         data_strings = fit_push_data(data_payload)
         content = (content or "")[:MAX_PUSH_BODY_CHARS]
         sender_name = (sender_name or "Flick")[:MAX_PUSH_TITLE_CHARS]
@@ -214,18 +222,21 @@ async def send_push_notification(
                     default_vibrate_timings=True,
                     visibility="public" if is_call else "private",
                     sticky=True if is_call else False,
+                    tag=thread_key,
                 ),
             ),
             apns=messaging.APNSConfig(
                 headers={
                     "apns-priority": "10",
                     "apns-push-type": "alert",
+                    **({"apns-collapse-id": thread_key[:64]} if thread_key else {}),
                 },
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
                         sound=None if silent else "default",
                         badge=1,
                         content_available=True,
+                        thread_id=thread_key,
                     )
                 ),
             ),
@@ -237,3 +248,35 @@ async def send_push_notification(
         logger.error("Failed to send FCM push notification: %s", e)
         return False
 
+
+def chat_thread_key(chat_id: str) -> str:
+    """The key of one chat's notification on the receiver's phone: the other person's id for a
+    one-to-one chat, the group's id for a group. The app builds the same key to remove it."""
+    return f"chat_{chat_id}"
+
+
+async def send_clear_notification(fcm_token: Optional[str], thread_key: str) -> bool:
+    """
+    A silent push telling the phone to remove one chat's notification: the chat was read on
+    another device (e.g. Flick Web). Nothing is shown; the app's push handler removes it.
+    """
+    if not fcm_token or not thread_key:
+        return False
+    if not firebase_initialized:
+        logger.info("[Mock FCM] Clear %s on %s...", thread_key, fcm_token[:12])
+        return True
+    try:
+        message = messaging.Message(
+            data={"type": "chat_read", "thread": thread_key},
+            token=fcm_token,
+            android=messaging.AndroidConfig(priority="high", ttl=timedelta(hours=12)),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "5", "apns-push-type": "background"},
+                payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)),
+            ),
+        )
+        await asyncio.to_thread(messaging.send, message)
+        return True
+    except Exception as e:
+        logger.warning("Failed to send clear-notification push: %s", e)
+        return False
