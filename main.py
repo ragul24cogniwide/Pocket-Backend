@@ -26,6 +26,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,7 +54,7 @@ import web_sessions  # noqa: E402
 from ai_agent import ensure_personal_agent_user  # noqa: E402
 from call_routes import cleanup_stale_call_sessions_loop  # noqa: E402
 from connection_manager import manager  # noqa: E402
-from core import MAX_REQUEST_BODY_BYTES  # noqa: E402
+from core import DOCUMENT_UPLOAD_PATH, MAX_DOCUMENT_REQUEST_BYTES, MAX_REQUEST_BODY_BYTES  # noqa: E402
 from database import async_session_factory, init_db  # noqa: E402
 from sync_service import prune_expired_change_logs  # noqa: E402
 
@@ -142,17 +143,19 @@ class BodySizeLimitMiddleware:
     arrives and refused once it goes over. WebSockets have their own frame limit.
     """
 
-    def __init__(self, app, max_bytes: int):
+    def __init__(self, app, max_bytes: int, per_path: Optional[dict] = None):
         self.app = app
         self.max_bytes = max_bytes
+        self.per_path = per_path or {}  # path -> its own limit (document uploads: 20 MB files)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        max_bytes = self.per_path.get(scope.get("path"), self.max_bytes)
         for name, value in scope.get("headers") or []:
             if name == b"content-length":
                 try:
-                    too_big = int(value) > self.max_bytes
+                    too_big = int(value) > max_bytes
                 except ValueError:
                     too_big = False
                 if too_big:
@@ -166,7 +169,7 @@ class BodySizeLimitMiddleware:
             message = await receive()
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
-                if received > self.max_bytes:
+                if received > max_bytes:
                     # Raised while the route reads its body: FastAPI turns it into a 413 response
                     raise HTTPException(status_code=413, detail="Request is too large.")
             return message
@@ -185,7 +188,11 @@ class BodySizeLimitMiddleware:
 
 
 # Added before CORS so CORS stays the outermost layer and 413 answers still carry CORS headers
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+app.add_middleware(
+    BodySizeLimitMiddleware,
+    max_bytes=MAX_REQUEST_BODY_BYTES,
+    per_path={DOCUMENT_UPLOAD_PATH: MAX_DOCUMENT_REQUEST_BYTES},
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

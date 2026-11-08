@@ -63,6 +63,11 @@ AGENT_MESSAGES_PER_MINUTE = 20   # personal AI agent (each one is a paid LLM cal
 MAX_AGENT_MESSAGE_CHARS = 4000
 # Largest request body accepted at all (a 10 MB upload is ~13.4 MB as base64 + JSON overhead)
 MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
+# Documents (any file, like WhatsApp): up to 20 MB, sent as a normal file upload (multipart, no
+# base64), so the request is only a little bigger than the file
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
+DOCUMENT_UPLOAD_PATH = "/api/upload/document"
+MAX_DOCUMENT_REQUEST_BYTES = MAX_DOCUMENT_BYTES + 512 * 1024
 # Longest base64 string that can decode to MAX_UPLOAD_BYTES (4 chars per 3 bytes, plus padding)
 MAX_UPLOAD_BASE64_CHARS = ((MAX_UPLOAD_BYTES + 2) // 3) * 4
 

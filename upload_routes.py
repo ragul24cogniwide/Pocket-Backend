@@ -1,9 +1,9 @@
-"""Photo and voice-note uploads."""
+"""Photo, voice-note and document uploads."""
 
 import logging
 
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, File, HTTPException, UploadFile
 
 from auth import (
     get_current_user,
@@ -15,6 +15,7 @@ import media_store
 from core import (
     ALLOWED_IMAGE_EXTS,
     MAX_UPLOAD_BASE64_CHARS,
+    MAX_DOCUMENT_BYTES,
     MAX_UPLOAD_BYTES,
     UPLOADS_PER_HOUR,
     enforce_rate_limit,
@@ -116,3 +117,40 @@ async def upload_audio(payload: dict, current_user: User = Depends(get_current_u
     except Exception as e:
         logger.error("Audio upload failed: %s", e)
         raise HTTPException(status_code=500, detail="Audio upload failed")
+
+
+@router.post("/api/upload/document")
+async def upload_document(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+    """
+    Any file (PDF, Word, Excel, zip, ...) up to 20 MB, sent as a normal file upload (multipart).
+    Returns its URL plus the name, size and type to show in the chat. Served as a download (see
+    media_store.headers_for), so a file can never run as a page of this site.
+    """
+    await enforce_rate_limit(f"upload:{current_user.id}", UPLOADS_PER_HOUR, 3600, "Too many uploads.")
+    chunks, size = [], 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_DOCUMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Documents can be up to 20 MB")
+        chunks.append(chunk)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    original = file.filename or "file"
+    name = media_store.document_name(original)
+    try:
+        media_url = await media_store.save_media("documents", name, b"".join(chunks), current_user.id)
+    except Exception as e:
+        logger.error("Document upload failed: %s", e)
+        raise HTTPException(status_code=500, detail="Document upload failed")
+    logger.info("Saved document (%d bytes) as %s", size, name)
+    return {
+        "status": "success",
+        "media_url": media_url,
+        "url": media_url,
+        "file_name": (original.replace("\\", "/").rsplit("/", 1)[-1] or "file")[:200],
+        "size": size,
+        "mime_type": (file.content_type or "application/octet-stream")[:100],
+    }
