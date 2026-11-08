@@ -620,8 +620,11 @@ async def mark_group_read(user_id: str, group_id: str) -> None:
         await push_receipt_changes(group_id, before, members)
 
 
-async def mark_delivered_on_connect(user_id: str) -> None:
-    """A member came online: everything sent to their groups so far has now reached them."""
+async def mark_delivered_on_connect(user_id: str, only: Optional[Iterable[str]] = None) -> None:
+    """
+    A member came online (or, with `only`, their phone got a push for these groups): everything
+    sent to those groups so far has now reached them (grey double ticks for the senders).
+    """
     async with async_session_factory() as db:
         mine = (
             await db.execute(
@@ -629,6 +632,9 @@ async def mark_delivered_on_connect(user_id: str) -> None:
             )
         ).scalars().all()
         group_ids = [m.group_id for m in mine]
+    if only is not None:
+        wanted = {str(g) for g in only}
+        group_ids = [g for g in group_ids if g in wanted]
     now = datetime.now(timezone.utc)
     for gid in group_ids:
         async with async_session_factory() as db:

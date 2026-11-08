@@ -572,3 +572,42 @@ async def read_group_and_clear(user_id: str, group_id: str) -> None:
     """A group read on Flick Web: mark it read, then remove its notification from the phone."""
     await groups.mark_group_read(user_id, group_id)
     await clear_chat_notification(user_id, group_id)
+
+
+async def mark_messages_delivered(user_id: str, message_ids: list) -> int:
+    """
+    These messages reached this person's phone (over the socket, or as a push while the app was
+    closed): SENT becomes DELIVERED and each sender sees grey double ticks. Only messages sent TO
+    this person count (no fake receipts); read or already delivered ones are left as they are.
+    Returns how many changed.
+    """
+    ids = [str(i) for i in dict.fromkeys(message_ids or []) if i][:200]
+    if not ids:
+        return 0
+    now = datetime.now(timezone.utc)
+    async with async_session_factory() as db:
+        me = await db.get(User, user_id)
+        mine = id_forms(user_id, me.phone_number if me else None)
+        rows = (
+            await db.execute(
+                select(Message.id, Message.sender_id).where(
+                    Message.id.in_(ids),
+                    Message.receiver_id.in_(mine),
+                    Message.status == MessageStatus.SENT,
+                )
+            )
+        ).all()
+        if not rows:
+            return 0
+        await db.execute(
+            update(Message)
+            .where(Message.id.in_([r.id for r in rows]), Message.status == MessageStatus.SENT)
+            .values(status=MessageStatus.DELIVERED, delivered_at=now)
+        )
+        await db.commit()
+    for r in rows:
+        await manager.send_personal_message(r.sender_id, {
+            "type": "ack_delivered",
+            "data": {"message_id": r.id, "receiver_id": user_id, "delivered_at": now.isoformat()},
+        })
+    return len(rows)

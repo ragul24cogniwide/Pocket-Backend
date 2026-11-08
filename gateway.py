@@ -15,7 +15,7 @@ from auth import (
 )
 from connection_manager import manager, PHONE_DEVICE
 from database import async_session_factory
-from models import Message, MessageStatus, User
+from models import Message, User
 from sync_service import (
     record_conversation_change,
 )
@@ -35,6 +35,7 @@ from messaging import (
     SendError,
     clear_chat_notification,
     flush_offline_messages,
+    mark_messages_delivered,
     read_group_and_clear,
     send_direct_message,
 )
@@ -228,41 +229,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # 3. READ & DELIVERY RECEIPTS
             # -----------------------------------------------------------------
             elif frame_type == "ack_delivered":
-                sender_id = data.get("sender_id")
-                message_id = data.get("message_id")
-                if sender_id and message_id:
-                    now = datetime.now(timezone.utc)
-                    async with async_session_factory() as db:
-                        check = await db.execute(
-                            select(Message.id, Message.status, Message.sender_id).where(
-                                Message.id == message_id, Message.receiver_id == user_id
-                            )
-                        )
-                        row = check.fetchone()
-                        if row is None:
-                            continue  # not a message addressed to me: ignore (no fake receipts)
-                        sender_id = row.sender_id
-                        if row.status != MessageStatus.READ:
-                            stmt = (
-                                update(Message)
-                                .where(
-                                    Message.id == message_id,
-                                    Message.status == MessageStatus.SENT,
-                                )
-                                .values(status=MessageStatus.DELIVERED, delivered_at=now)
-                            )
-                            await db.execute(stmt)
-                            await db.commit()
-
-                    ack_del_frame = {
-                        "type": "ack_delivered",
-                        "data": {
-                            "message_id": message_id,
-                            "receiver_id": user_id,
-                            "delivered_at": now.isoformat(),
-                        },
-                    }
-                    await manager.send_personal_message(sender_id, ack_del_frame)
+                # The app got a message over the socket: grey double ticks for its sender
+                if data.get("message_id"):
+                    await mark_messages_delivered(user_id, [data.get("message_id")])
 
             elif frame_type == "mark_read":
                 sender_id = data.get("sender_id")  # original sender of the messages being read

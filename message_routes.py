@@ -1,7 +1,9 @@
 """One-to-one messages: history, send, edit, delete."""
 
 import logging
-from typing import Optional
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
 from datetime import datetime
 
 
@@ -27,7 +29,7 @@ import groups
 import reactions
 from groups import GroupError, is_group_id
 from fastapi import APIRouter
-from messaging import SendError, send_direct_message
+from messaging import SendError, mark_messages_delivered, send_direct_message
 from core import (
     find_user,
 )
@@ -162,6 +164,25 @@ async def send_message_rest(
         "message_id": message_dict["message_id"],
         **message_dict,
     }
+
+
+class DeliveredRequest(BaseModel):
+    message_ids: List[str] = Field(default_factory=list, max_length=200)
+    group_ids: List[str] = Field(default_factory=list, max_length=50)
+
+
+@router.post("/api/messages/delivered")
+async def messages_delivered(payload: DeliveredRequest, current_user: User = Depends(get_current_user)):
+    """
+    The phone got these messages as push notifications (the app wasn't open): like WhatsApp, the
+    senders see grey double ticks now, not only when the app is opened. Group messages: the
+    groups the pushes were for.
+    """
+    changed = await mark_messages_delivered(current_user.id, payload.message_ids)
+    groups_reached = [g for g in payload.group_ids if is_group_id(g)]
+    if groups_reached:
+        await groups.mark_delivered_on_connect(current_user.id, only=groups_reached)
+    return {"status": "success", "delivered": changed}
 
 
 @router.put("/api/messages/{message_id}")
