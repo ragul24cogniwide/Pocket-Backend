@@ -228,6 +228,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # -----------------------------------------------------------------
             # 3. READ & DELIVERY RECEIPTS
             # -----------------------------------------------------------------
+            elif frame_type == "ack_group_delivered":
+                # A group message reached this device: grey double ticks for its sender (only for
+                # groups this person is a member of; see groups.mark_delivered_on_connect)
+                group_id = data.get("group_id")
+                if is_group_id(group_id):
+                    asyncio.create_task(groups.mark_delivered_on_connect(user_id, only=[group_id]))
+
             elif frame_type == "ack_delivered":
                 # The app got a message over the socket: grey double ticks for its sender
                 if data.get("message_id"):

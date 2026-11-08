@@ -416,7 +416,10 @@ async def send_group_message(
         offline_users = list((await users_by_id(db, [m.user_id for m in others if m.user_id not in online_ids])).values())
 
     frame = {"type": "group_message", "data": {**message_dict, **group_card(group)}}
-    await fanout([m.user_id for m in others if m.user_id in online_ids], frame)
+    # Live to every member with a connection, including a Flick Web tab that's open but not being
+    # looked at (it counts as away, not online): it shows the message and confirms delivery
+    # ("ack_group_delivered"). Members not using Flick right now also get a push, below.
+    await fanout([m.user_id for m in others], frame)
     _background(record_changes(group_id, [m.user_id for m in members]))
     if offline_users:
         _background(push_group_message(group, sender, content, offline_users, message_dict["message_id"]))

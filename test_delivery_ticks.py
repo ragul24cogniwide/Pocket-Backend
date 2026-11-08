@@ -165,3 +165,62 @@ def test_an_open_flick_web_tab_also_gives_two_ticks(client, monkeypatch):
         web.send_text(json.dumps({"type": "ack_delivered", "data": {"message_id": mid, "sender_id": ALICE}}))
         assert _next(wa, "ack_delivered")["data"]["message_id"] == mid
     assert _status(client, mid) == "DELIVERED"
+
+
+def test_group_message_reaches_a_flick_web_tab_nobody_is_looking_at(client, monkeypatch):
+    """Bob has only Flick Web open, in a background tab (away): the group message still arrives
+    live, the tab confirms it, and it counts as delivered to him (grey double ticks for Alice)."""
+    _reset(client)
+    a, b = _token(client, ALICE), _token(client, BOB)
+    start = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    async def setup():
+        async with async_session_factory() as db:
+            db.add(Group(id=GROUP, name="G", created_by=ALICE))
+            for uid in (ALICE, BOB):
+                db.add(GroupMember(group_id=GROUP, user_id=uid, joined_at=start, last_delivered_at=start, last_read_at=start))
+            await db.commit()
+    client.portal.call(setup)
+
+    async def bob_delivered_at():
+        async with async_session_factory() as db:
+            m = (await db.execute(select(GroupMember).where(GroupMember.group_id == GROUP, GroupMember.user_id == BOB))).scalars().first()
+            t = m.last_delivered_at
+            return t.replace(tzinfo=t.tzinfo or timezone.utc)
+
+    import gateway
+    original = gateway.user_from_token
+
+    async def bob_on_web(token, db):
+        user = await original(token, db)
+        if user is not None and user.id == BOB:
+            user.web_session_id = "web-session-1"
+        return user
+
+    monkeypatch.setattr(gateway, "user_from_token", bob_on_web)
+    with client.websocket_connect(f"/ws/{BOB}?token={b}") as web:  # a tab that never reported "in use"
+        sent = client.post("/api/messages/send", headers=_h(a), json={"receiver_id": GROUP, "content": "dinner?"}).json()
+        assert sent["status"] == "SENT"  # Bob isn't using Flick right now
+        sent_at = datetime.fromisoformat(sent["timestamp"].replace("Z", "+00:00"))
+        assert client.portal.call(bob_delivered_at) < sent_at  # not delivered to him yet
+
+        got = _next(web, "group_message")["data"]  # before the fix, an away tab never got it
+        assert got["message_id"] == sent["message_id"]
+        # What Flick Web's socket.js now does with every group message it receives
+        web.send_text(json.dumps({"type": "ack_group_delivered", "data": {"group_id": GROUP}}))
+        web.send_text(json.dumps({"type": "ping"}))
+        _next(web, "pong")
+    client.portal.call(lambda: __import__("asyncio").sleep(0.2))
+    assert client.portal.call(bob_delivered_at) >= sent_at  # delivered: two grey ticks for Alice
+
+    # A group someone isn't in can't be "delivered" to them
+    e = _token(client, EVE)
+    with client.websocket_connect(f"/ws/{EVE}?token={e}") as ws:
+        ws.send_text(json.dumps({"type": "ack_group_delivered", "data": {"group_id": GROUP}}))
+        ws.send_text(json.dumps({"type": "ping"}))
+        _next(ws, "pong")
+
+    async def eve_member():
+        async with async_session_factory() as db:
+            return (await db.execute(select(GroupMember).where(GroupMember.group_id == GROUP, GroupMember.user_id == EVE))).scalars().first()
+    assert client.portal.call(eve_member) is None
