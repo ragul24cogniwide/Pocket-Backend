@@ -141,3 +141,27 @@ def test_group_push_delivery_reaches_the_member(client):
             return m.last_delivered_at
     got = client.portal.call(delivered_at)
     assert got is not None and got.replace(tzinfo=got.tzinfo or timezone.utc) > start + timedelta(minutes=4)
+
+
+def test_an_open_flick_web_tab_also_gives_two_ticks(client, monkeypatch):
+    """Bob's phone is closed but Flick Web is open: the tab confirms delivery, Alice sees two ticks."""
+    _reset(client)
+    a, b = _token(client, ALICE), _token(client, BOB)
+    import gateway
+    original = gateway.user_from_token
+
+    async def bob_on_web(token, db):
+        user = await original(token, db)
+        if user is not None and user.id == BOB:
+            user.web_session_id = "web-session-1"
+        return user
+
+    monkeypatch.setattr(gateway, "user_from_token", bob_on_web)
+    with client.websocket_connect(f"/ws/{ALICE}?token={a}") as wa, client.websocket_connect(f"/ws/{BOB}?token={b}") as web:
+        mid = client.post("/api/messages/send", headers=_h(a), json={"receiver_id": BOB, "content": "on web?"}).json()["message_id"]
+        got = _next(web, "chat_message")["data"]
+        assert got["message_id"] == mid
+        # What Flick Web's socket.js does with every chat_message it receives
+        web.send_text(json.dumps({"type": "ack_delivered", "data": {"message_id": mid, "sender_id": ALICE}}))
+        assert _next(wa, "ack_delivered")["data"]["message_id"] == mid
+    assert _status(client, mid) == "DELIVERED"
