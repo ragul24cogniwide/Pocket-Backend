@@ -17,7 +17,8 @@ from auth import (
 from connection_manager import manager
 from identity import id_forms
 from database import get_db
-from models import Message, User
+from models import Device, Message, User
+import devices
 from schemas import (
     EditMessageRequest,
     SendMessageRequest,
@@ -49,6 +50,7 @@ async def get_messages_with_user(
     before: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    device: Optional[Device] = Depends(devices.current_device),
 ):
     """
     A page of message history, oldest first: the latest `limit` messages, or the `limit` messages
@@ -65,7 +67,10 @@ async def get_messages_with_user(
     other_user_id = other_user_id.strip()
     if is_group_id(other_user_id):
         try:
-            return await groups.group_history(current_user, other_user_id, limit, offset, before)
+            page = await groups.group_history(current_user, other_user_id, limit, offset, before)
+            # Downloading it counts as this device having it (devices.py, watch mode)
+            await devices.mark_delivered(devices.device_id_of(device), [m.get("message_id") for m in page], "history")
+            return page
         except GroupError as ge:
             raise HTTPException(status_code=ge.status_code, detail=ge.reason)
     limit = max(1, min(int(limit), 100))
@@ -123,6 +128,8 @@ async def get_messages_with_user(
         if msg.receipt_hidden and m.get("sender_id") in cur_ids and str(m.get("status", "")).upper() == "READ":
             m["status"] = "DELIVERED"
         out.append(m)
+    # Downloading it counts as this device having it (devices.py, watch mode)
+    await devices.mark_delivered(devices.device_id_of(device), [m.get("message_id") for m in out], "history")
     return out
 
 
@@ -131,6 +138,7 @@ async def send_message_rest(
     payload: SendMessageRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    device: Optional[Device] = Depends(devices.current_device),
 ):
     """Sends a message via REST with immediate DB persistence and WebSocket dispatch."""
     receiver_id = payload.receiver_id
@@ -141,7 +149,8 @@ async def send_message_rest(
     if is_group_id(receiver_id):
         try:
             sent = await groups.send_group_message(
-                current_user.id, receiver_id, content, payload.temp_msg_id, payload.reply_to, payload.metadata
+                current_user.id, receiver_id, content, payload.temp_msg_id, payload.reply_to, payload.metadata,
+                sender_device_id=devices.device_id_of(device),
             )
         except GroupError as ge:
             raise HTTPException(status_code=ge.status_code, detail=ge.reason)
@@ -153,6 +162,7 @@ async def send_message_rest(
         result = await send_direct_message(
             sender_id, receiver_id, content, payload.temp_msg_id, payload.reply_to, payload.metadata,
             sender_name=current_user.username or "Flick User",
+            sender_device_id=devices.device_id_of(device),
         )
     except SendError as se:
         raise HTTPException(status_code=se.status_code, detail=se.reason)
@@ -172,16 +182,24 @@ class DeliveredRequest(BaseModel):
 
 
 @router.post("/api/messages/delivered")
-async def messages_delivered(payload: DeliveredRequest, current_user: User = Depends(get_current_user)):
+async def messages_delivered(
+    payload: DeliveredRequest,
+    current_user: User = Depends(get_current_user),
+    device: Optional[Device] = Depends(devices.current_device),
+):
     """
     The phone got these messages as push notifications (the app wasn't open): like WhatsApp, the
     senders see grey double ticks now, not only when the app is opened. Group messages: the
     groups the pushes were for.
     """
     changed = await mark_messages_delivered(current_user.id, payload.message_ids)
+    device_id = devices.device_id_of(device)
+    await devices.mark_delivered(device_id, payload.message_ids, "push")
     groups_reached = [g for g in payload.group_ids if is_group_id(g)]
     if groups_reached:
         await groups.mark_delivered_on_connect(current_user.id, only=groups_reached)
+        for group_id in groups_reached:
+            await devices.mark_group_delivered(device_id, group_id, via="push")
     return {"status": "success", "delivered": changed}
 
 
@@ -268,6 +286,7 @@ async def delete_message(
         receiver_id = msg.receiver_id
         sender_id = msg.sender_id
         await reactions.delete_reactions(db, message_id)
+        await devices.forget_message(db, message_id)  # nobody has to get it any more
         await db.delete(msg)
         await db.commit()
 

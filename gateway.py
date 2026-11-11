@@ -19,6 +19,7 @@ from models import Message, User
 from sync_service import (
     record_conversation_change,
 )
+import devices
 import groups
 import web_sessions
 from groups import GroupError, is_group_id
@@ -87,6 +88,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         user_id = user_obj.id
         user_obj.is_online = True
         await db.commit()
+        # Which of this person's devices the socket is (devices.py): the phone app sends its key
+        # (header, or ?device= where headers can't be set); a browser is its web session
+        device = await devices.resolve_device(
+            db, user_obj, websocket.headers.get(devices.DEVICE_HEADER) or websocket.query_params.get("device")
+        )
+        device_id = device.id if device else None
         alias_ids = [user_obj.id, user_obj.phone_number]
         if user_obj.prefs().get("last_seen") == "nobody":
             manager.last_seen_hidden.update(a for a in alias_ids if a)
@@ -154,7 +161,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 if is_group_id(receiver_id):
                     try:
                         sent = await groups.send_group_message(
-                            user_id, receiver_id, content, client_msg_id, data.get("reply_to"), data.get("metadata")
+                            user_id, receiver_id, content, client_msg_id, data.get("reply_to"), data.get("metadata"),
+                            sender_device_id=device_id,
                         )
                     except GroupError as ge:
                         await websocket.send_text(json.dumps({"type": "message_error", "data": {
@@ -198,7 +206,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 try:
                     result = await send_direct_message(
                         user_id, receiver_id, content, client_msg_id, data.get("reply_to"), data.get("metadata"),
-                        exclude_ws=websocket, on_stored=send_ack,
+                        exclude_ws=websocket, on_stored=send_ack, sender_device_id=device_id,
                     )
                 except SendError as se:
                     await websocket.send_text(json.dumps({"type": "message_error", "data": {
@@ -228,17 +236,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             # -----------------------------------------------------------------
             # 3. READ & DELIVERY RECEIPTS
             # -----------------------------------------------------------------
+            elif frame_type == "device_ack":
+                # This device stored these messages (any it was sent: received, from a group, or
+                # sent from my other device): devices.py bookkeeping only, no ticks change
+                ids = data.get("message_ids")
+                if isinstance(ids, list):
+                    await devices.mark_delivered(device_id, [str(i) for i in ids if isinstance(i, (str, int))], "socket")
+
             elif frame_type == "ack_group_delivered":
                 # A group message reached this device: grey double ticks for its sender (only for
                 # groups this person is a member of; see groups.mark_delivered_on_connect)
                 group_id = data.get("group_id")
                 if is_group_id(group_id):
                     asyncio.create_task(groups.mark_delivered_on_connect(user_id, only=[group_id]))
+                    if data.get("message_id"):
+                        await devices.mark_delivered(device_id, [str(data.get("message_id"))], "socket")
+                    else:  # apps from before device_ack: the group's messages so far
+                        await devices.mark_group_delivered(device_id, group_id)
 
             elif frame_type == "ack_delivered":
                 # The app got a message over the socket: grey double ticks for its sender
                 if data.get("message_id"):
                     await mark_messages_delivered(user_id, [data.get("message_id")])
+                    await devices.mark_delivered(device_id, [str(data.get("message_id"))], "socket")
 
             elif frame_type == "mark_read":
                 sender_id = data.get("sender_id")  # original sender of the messages being read

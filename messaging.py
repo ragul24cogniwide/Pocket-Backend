@@ -35,6 +35,7 @@ from database import async_session_factory
 from identity import id_forms
 from models import Message, MessageStatus, User
 from notifications import chat_thread_key, send_clear_notification, send_push_notification
+import devices
 import groups
 from schemas import MAX_MESSAGE_CHARS
 from sync_service import record_conversation_change
@@ -459,6 +460,7 @@ async def send_direct_message(
     sender_name: Optional[str] = None,
     exclude_ws: Optional[WebSocket] = None,
     on_stored: Optional[Callable[[dict], Awaitable[None]]] = None,
+    sender_device_id: Optional[str] = None,
 ) -> SendResult:
     """
     Stores a one-to-one message once and delivers it everywhere it has to go:
@@ -531,6 +533,13 @@ async def send_direct_message(
             logger.warning("Failed to record conversation change for send: %s", sync_err)
 
         message_dict = new_msg.to_dict()
+        stored_at = new_msg.timestamp
+
+    # Which devices have to get it (devices.py, watch mode). Before anything is sent, so a quick
+    # confirmation always finds its row; the device it was sent from isn't one of them.
+    await devices.expect_deliveries(
+        message_dict["message_id"], stored_at, [receiver_id], sender_id, sender_device_id
+    )
 
     if on_stored is not None:
         await on_stored(message_dict)

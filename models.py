@@ -710,3 +710,73 @@ class MediaFile(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
+
+
+class Device(Base):
+    """
+    One of a person's devices: their phone, or a browser linked to it (Flick Web). Every message
+    has to reach each of them (see MessageDelivery); this is what lets the server, later on, keep
+    a message only until all of them have it.
+
+    A phone is identified by a random key it makes when it logs in (`client_key`, sent with every
+    request); a browser by its web session ("web:<session id>"). An account has one phone at a
+    time: a newly registered phone replaces the previous one.
+    """
+    __tablename__ = "devices"
+    __table_args__ = (UniqueConstraint("user_id", "client_key", name="uq_devices_user_key"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # phone | web
+    platform: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # android | ios | web
+    name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    app_version: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    web_session_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    fcm_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self, current_id: Optional[str] = None) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "platform": self.platform,
+            "name": self.name,
+            "app_version": self.app_version,
+            "created_at": iso_utc(self.created_at),
+            "last_seen_at": iso_utc(self.last_seen_at),
+            "current": self.id == current_id,
+        }
+
+
+class MessageDelivery(Base):
+    """
+    "This device has to get this message", and when it did (delivered_at). Written when the
+    message is sent, for each device that should get it: the receiver's (or every group member's)
+    devices, and the sender's other devices. Watch mode for now: nothing is deleted because of it.
+    """
+    __tablename__ = "message_deliveries"
+    __table_args__ = (
+        UniqueConstraint("message_id", "device_id", name="uq_message_deliveries_message_device"),
+        Index("ix_message_deliveries_device_pending", "device_id", "delivered_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    chat_kind: Mapped[str] = mapped_column(String(10), nullable=False)  # direct | group
+    group_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    message_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # the device's owner
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # How it got there: socket | push | history (for the report)
+    delivered_via: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)

@@ -36,6 +36,7 @@ from auth import create_web_token, get_current_user, get_phone_user, web_session
 from connection_manager import manager
 from database import get_db
 from models import User, WebSession
+import devices
 
 logger = logging.getLogger("FlickWeb")
 
@@ -314,6 +315,7 @@ async def revoke_session(db: AsyncSession, user_id: str, session_id: str) -> boo
     if session is None or session.user_id != user_id or session.revoked_at is not None:
         return False
     session.revoked_at = datetime.now(timezone.utc)
+    await devices.revoke_web_device(db, user_id, session_id)
     await db.commit()
     for ticket, info in list(_ws_tickets.items()):
         if info["sid"] == session_id:
@@ -330,5 +332,7 @@ async def revoke_all_sessions(db: AsyncSession, user_id: str) -> None:
     await db.execute(
         update(WebSession).where(WebSession.id.in_(ids)).values(revoked_at=datetime.now(timezone.utc))
     )
+    for sid in ids:
+        await devices.revoke_web_device(db, user_id, sid)
     for sid in ids:
         await manager.close_linked_session(user_id, sid)

@@ -18,7 +18,7 @@ from auth import (
 )
 from connection_manager import manager
 from database import get_db
-from models import Message, OtpRecord, SavedContact, User, Status, Meeting, iso_utc
+from models import Device, Message, OtpRecord, SavedContact, User, Status, Meeting, iso_utc
 from schemas import (
     AuthResponse,
     SendOtpRequest,
@@ -37,6 +37,7 @@ import archive
 import rate_limits
 import calllog
 import groups
+import devices
 import web_sessions
 from fastapi import APIRouter
 from core import (
@@ -236,6 +237,7 @@ async def logout(current_user: User = Depends(get_current_user), db: AsyncSessio
         await web_sessions.revoke_session(db, current_user.id, sid)
         return {"message": "Logged out"}
     await web_sessions.revoke_all_sessions(db, current_user.id)
+    await devices.revoke_all_devices(db, current_user.id)  # the phone and every browser are signed out
     current_user.token_version = (current_user.token_version or 0) + 1  # every older token stops working
     current_user.fcm_token = None
     current_user.is_online = False
@@ -260,6 +262,7 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
         )
     )
     peers = {p for row in peer_rows.all() for p in row if p and p != me}
+    my_message_ids = [m for (m,) in (await db.execute(select(Message.id).where(Message.sender_id == me))).all()]
 
     await db.execute(sql_delete(Message).where(or_(Message.sender_id == me, Message.receiver_id == me)))
     await db.execute(sql_delete(Status).where(Status.user_id == me))
@@ -269,6 +272,8 @@ async def delete_my_account(current_user: User = Depends(get_phone_user), db: As
     await db.execute(sql_delete(UserSyncSequence).where(UserSyncSequence.user_id == me))
     await groups.remove_user_from_all_groups(db, current_user)
     await web_sessions.revoke_all_sessions(db, me)
+    # Its devices, and the delivery bookkeeping of its devices and of the messages it sent
+    await devices.delete_user_devices(db, me, my_message_ids)
     from models import MessageReaction
     await db.execute(sql_delete(MessageReaction).where(MessageReaction.user_id == me))
     await archive.delete_archives_for(db, me)
@@ -364,6 +369,7 @@ async def update_user_profile(
 @router.post("/api/users/fcm-token")
 async def update_fcm_token(
     payload: UpdateFcmTokenRequest,
+    request: Request,
     current_user: User = Depends(get_phone_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -376,6 +382,14 @@ async def update_fcm_token(
     )
     current_user.fcm_token = payload.fcm_token
     await db.commit()
+    # Kept on the phone's device too (pushes will go per device later; see devices.py)
+    device = await devices.resolve_device(db, current_user, request.headers.get(devices.DEVICE_HEADER))
+    if device is not None and device.fcm_token != payload.fcm_token:
+        await db.execute(
+            update(Device).where(Device.fcm_token == payload.fcm_token, Device.id != device.id).values(fcm_token=None)
+        )
+        device.fcm_token = payload.fcm_token
+        await db.commit()
     logger.info("Updated FCM token for user %s", current_user.id)
     return {"message": "FCM token updated successfully"}
 

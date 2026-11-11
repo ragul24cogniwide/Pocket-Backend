@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user
 from connection_manager import manager
+import devices
 from database import async_session_factory, get_db
 from models import Group, GroupMember, GroupMessage, User, iso_utc
 from notification_stack import group_chat_notification
@@ -342,6 +343,7 @@ async def send_group_message(
     client_msg_id: Optional[str] = None,
     reply_to=None,
     metadata=None,
+    sender_device_id: Optional[str] = None,
 ) -> dict:
     """Stores a group message and delivers it to every member. Returns the sender's ack data."""
     content = (content or "").strip()
@@ -414,6 +416,12 @@ async def send_group_message(
         message_dict = msg.to_dict(sender)
         status = "DELIVERED" if others and len(online_ids) == len(others) else "SENT"
         offline_users = list((await users_by_id(db, [m.user_id for m in others if m.user_id not in online_ids])).values())
+
+    # Which devices have to get it (devices.py, watch mode): every member's, and the sender's
+    # other devices. Before anything is sent, so a quick confirmation always finds its row.
+    await devices.expect_deliveries(
+        message_dict["message_id"], now, [m.user_id for m in others], sender_id, sender_device_id, group_id=group_id
+    )
 
     frame = {"type": "group_message", "data": {**message_dict, **group_card(group)}}
     # Live to every member with a connection, including a Flick Web tab that's open but not being
@@ -554,6 +562,7 @@ async def delete_group_message(user: User, message_id: str, for_everyone: bool) 
         group_id = msg.group_id
         if for_everyone and msg.sender_id == user.id and member.left_at is None and msg.kind == "text":
             await delete_reactions(db, message_id)
+            await devices.forget_message(db, message_id)
             await db.delete(msg)
             await db.commit()
             member_ids = [m.user_id for m in await active_members(db, group_id)]

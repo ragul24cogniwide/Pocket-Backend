@@ -39,6 +39,7 @@ import agent_routes  # noqa: E402
 import archive  # noqa: E402
 import auth_routes  # noqa: E402
 import call_routes  # noqa: E402
+import devices  # noqa: E402
 import calllog  # noqa: E402
 import gateway  # noqa: E402
 import groups  # noqa: E402
@@ -95,6 +96,10 @@ async def prune_change_logs_loop() -> None:
                 removed = await prune_expired_change_logs(db)
             if removed:
                 logger.info("[ChangeLog] Pruned %d expired change log entries", removed)
+            async with async_session_factory() as db:
+                pruned = await devices.prune_deliveries(db)
+            if pruned:
+                logger.info("[Devices] Pruned %d old delivery records", pruned)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -219,3 +224,5 @@ app.include_router(message_routes.router)
 app.include_router(meeting_routes.router)
 app.include_router(agent_routes.router)
 app.include_router(gateway.router)
+# Devices and per-device delivery tracking (watch mode, see devices.py)
+app.include_router(devices.router)
