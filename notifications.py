@@ -245,8 +245,52 @@ async def send_push_notification(
         logger.info("FCM push sent successfully: %s", response)
         return True
     except Exception as e:
+        if await _forget_if_dead(fcm_token, e):
+            return False
         logger.error("Failed to send FCM push notification: %s", e)
         return False
+
+
+def _server_project() -> str:
+    try:
+        return firebase_admin.get_app().project_id or "?"
+    except Exception:
+        return "?"
+
+
+async def _forget_if_dead(fcm_token: str, error: Exception) -> bool:
+    """
+    A token Firebase will never accept again: "SenderId mismatch" (the phone got it from another
+    Firebase project, e.g. an app built before the project changed) or "Unregistered" (app
+    uninstalled / token expired). It is removed from the account and device, so it isn't tried on
+    every message; the phone sends a fresh one the next time the app is opened.
+    Returns True when the token was such a dead one.
+    """
+    mismatch = isinstance(error, messaging.SenderIdMismatchError) or "SenderId mismatch" in str(error)
+    gone = isinstance(error, messaging.UnregisteredError)
+    if not (mismatch or gone):
+        return False
+    try:
+        from sqlalchemy import update
+        from database import async_session_factory
+        from models import Device, User
+
+        async with async_session_factory() as db:
+            await db.execute(update(User).where(User.fcm_token == fcm_token).values(fcm_token=None))
+            await db.execute(update(Device).where(Device.fcm_token == fcm_token).values(fcm_token=None))
+            await db.commit()
+    except Exception as db_err:
+        logger.warning("Could not remove a dead push token: %s", type(db_err).__name__)
+    if mismatch:
+        logger.warning(
+            "Push token %s... is from another Firebase project than this server's (%s): the phone "
+            "runs an app built with an old google-services.json. Token removed; that phone gets "
+            "notifications again once it runs the new app build.",
+            fcm_token[:12], _server_project(),
+        )
+    else:
+        logger.info("Push token %s... is no longer registered (app removed or token expired): removed", fcm_token[:12])
+    return True
 
 
 def chat_thread_key(chat_id: str) -> str:
@@ -278,5 +322,7 @@ async def send_clear_notification(fcm_token: Optional[str], thread_key: str) -> 
         await asyncio.to_thread(messaging.send, message)
         return True
     except Exception as e:
+        if await _forget_if_dead(fcm_token, e):
+            return False
         logger.warning("Failed to send clear-notification push: %s", e)
         return False
