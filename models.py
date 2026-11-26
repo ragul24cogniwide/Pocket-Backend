@@ -780,3 +780,29 @@ class MessageDelivery(Base):
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # How it got there: socket | push | history (for the report)
     delivered_via: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+
+class Couple(Base):
+    """
+    Two people paired as a couple (Flick for lovers). user_a made the invite code; user_b joined
+    with it (None while the code is waiting). Each side keeps its own nickname for the other, its
+    own mood and its own time zone; the anniversary and the milestones ("Our story") are shared.
+    """
+    __tablename__ = "couples"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_a: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_b: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    invite_code: Mapped[str] = mapped_column(String(16), nullable=False, unique=True, index=True)
+    anniversary: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)  # YYYY-MM-DD
+    nickname_a: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # what A calls B
+    nickname_b: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # what B calls A
+    mood_a: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    mood_b: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    tz_a: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # minutes east of UTC
+    tz_b: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    milestones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    paired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

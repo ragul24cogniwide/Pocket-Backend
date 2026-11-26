@@ -42,6 +42,7 @@ import auth_routes  # noqa: E402
 import call_routes  # noqa: E402
 import devices  # noqa: E402
 import calllog  # noqa: E402
+import couple_routes  # noqa: E402
 import gateway  # noqa: E402
 import groups  # noqa: E402
 import media_store  # noqa: E402
@@ -243,6 +244,8 @@ app.include_router(web_sessions.router)
 app.include_router(reactions.router)
 app.include_router(archive.router)
 app.include_router(calllog.router)
+# Couples: pairing, anniversary, nicknames, mood, "Our story" (see couple_routes.py)
+app.include_router(couple_routes.router)
 
 app.include_router(admin_routes.router)
 # Photos / voice notes: stored in the database, served from /uploads/... (see media_store.py)
