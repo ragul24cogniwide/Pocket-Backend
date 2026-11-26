@@ -51,7 +51,9 @@ router = APIRouter()
 WS_CLOSE_UNAUTHORIZED = 4401  # app-defined close code: the client should log the user out
 # The app pings every 10s. Silence this long means the phone is gone (lost signal, switched
 # networks) even if TCP hasn't noticed yet, so mark it offline now instead of minutes later.
-WS_IDLE_TIMEOUT_SECONDS = 25
+# 40 s, not less: on 2G / weak signal one or two pings can arrive late (a photo uploading at the
+# same time fills the line), and dropping a socket that still works costs a full reconnect.
+WS_IDLE_TIMEOUT_SECONDS = 40
 WS_LINKED_IDLE_TIMEOUT_SECONDS = 90
 
 

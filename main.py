@@ -33,6 +33,7 @@ logging.basicConfig(level=logging.INFO)
 import httpx  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
 
 import admin_routes  # noqa: E402
 import agent_routes  # noqa: E402
@@ -61,7 +62,15 @@ from sync_service import prune_expired_change_logs  # noqa: E402
 
 logger = logging.getLogger("Main")
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://pocket-backend-7lmx.onrender.com").strip().rstrip("/")
+# This server's own public address, for the keep-alive ping: Railway sets RAILWAY_PUBLIC_DOMAIN
+# (host only), Render sets RENDER_EXTERNAL_URL; SERVER_PUBLIC_URL overrides both.
+_RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+RENDER_EXTERNAL_URL = (
+    os.getenv("SERVER_PUBLIC_URL")
+    or (f"https://{_RAILWAY_DOMAIN}" if _RAILWAY_DOMAIN else "")
+    or os.getenv("RENDER_EXTERNAL_URL")
+    or "https://pocket-backend-production-0fa43272.up.railway.app"
+).strip().rstrip("/")
 
 
 async def server_keep_alive_loop():
@@ -141,6 +150,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+class ApiGZipMiddleware:
+    """
+    Compresses API answers (JSON) for clients that accept gzip: chat history, chat lists and
+    sync pages get 70-80% smaller, which is what makes them load on slow mobile networks.
+    The phone app (OkHttp / NSURLSession) and browsers unpack it automatically.
+
+    Only /api/ paths: photos, voice notes and documents under /uploads/ are already compressed
+    and are served with byte ranges (seeking in a voice note), which gzip would break.
+    Small answers (under 1 KB) are sent as they are; compressing them doesn't pay off.
+    """
+
+    def __init__(self, app, minimum_size: int = 1024, compresslevel: int = 6):
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").startswith("/api/"):
+            await self.gzip(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
 class BodySizeLimitMiddleware:
     """
     Rejects request bodies over MAX_REQUEST_BODY_BYTES with 413 before any of it is parsed.
@@ -198,6 +229,8 @@ app.add_middleware(
     max_bytes=MAX_REQUEST_BODY_BYTES,
     per_path={DOCUMENT_UPLOAD_PATH: MAX_DOCUMENT_REQUEST_BYTES},
 )
+# Smaller API answers on slow networks (see ApiGZipMiddleware); inside CORS like the size limit
+app.add_middleware(ApiGZipMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
