@@ -302,8 +302,8 @@ async def send_direct_message(
       1. a retry of a message already stored (same sender + client_msg_id) returns that message
       2. too long / unknown receiver -> SendError (nothing stored)
       3. stored as SENT, or DELIVERED when the receiver is connected right now
-      4. delta-sync change records for both people
-      5. `on_stored(message)` (the gateway acknowledges the sender here, before anything else)
+      4. `on_stored(message)` (the gateway acknowledges the sender here, right after it is stored)
+      5. delta-sync change records for both people
       6. the receiver's devices, the sender's other devices (not `exclude_ws`), a push notification,
          and a demo bot reply
 
@@ -361,6 +361,14 @@ async def send_direct_message(
                 raise
             return SendResult(existing.to_dict(), duplicate=True)
         await db.refresh(new_msg)
+        message_dict = new_msg.to_dict()
+        stored_at = new_msg.timestamp
+
+        # The message is safe in the database: tell the sender now (one tick), before the
+        # bookkeeping below. With the database far away that bookkeeping takes many round trips,
+        # and on a weak signal (a theatre) every second until the tick shows counts.
+        if on_stored is not None:
+            await on_stored(message_dict)
 
         try:
             await record_conversation_change(db, user_id=sender_id, peer_id=receiver_id, action="updated")
@@ -369,17 +377,11 @@ async def send_direct_message(
         except Exception as sync_err:
             logger.warning("Failed to record conversation change for send: %s", sync_err)
 
-        message_dict = new_msg.to_dict()
-        stored_at = new_msg.timestamp
-
     # Which devices have to get it (devices.py, watch mode). Before anything is sent, so a quick
     # confirmation always finds its row; the device it was sent from isn't one of them.
     await devices.expect_deliveries(
         message_dict["message_id"], stored_at, [receiver_id], sender_id, sender_device_id
     )
-
-    if on_stored is not None:
-        await on_stored(message_dict)
 
     await manager.send_personal_message(receiver_id, {"type": "chat_message", "data": message_dict})
     # The sender's other devices (phone / browsers) show it as sent too
