@@ -51,8 +51,6 @@ TOUCH_EVERY = timedelta(hours=1)
 # Bookkeeping kept for the report: delivered rows this long, never-delivered rows longer
 DELIVERED_RETENTION_DAYS = 30
 PENDING_RETENTION_DAYS = 60
-# Messages to/from the AI agent stay on the server (the AI has to read them): not tracked
-AGENT_USER_ID = "ai_assistant"
 
 
 def _now() -> datetime:
@@ -217,8 +215,6 @@ async def expect_deliveries(
     (not the one it was sent from). Call BEFORE the message is sent out, so a quick confirmation
     always finds its row. Returns how many rows were written. Never raises.
     """
-    if sender_id == AGENT_USER_ID or AGENT_USER_ID in recipient_ids:
-        return 0
     try:
         async with async_session_factory() as db:
             devices = await active_devices(db, [*recipient_ids, sender_id])

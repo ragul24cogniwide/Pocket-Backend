@@ -1,13 +1,12 @@
 """User profiles, the chat list, conversation delta sync and phone-contact matching."""
 
 import logging
-from datetime import datetime, timezone
 from typing import List, Optional
 
 import time
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import desc, func, or_, and_, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import (
@@ -27,15 +26,8 @@ from schemas import (
     SyncConversationsResponse,
 )
 from sync_service import (
+    OLD_AGENT_ID,
     get_conversation_sync_page,
-)
-from ai_agent import (
-    ensure_personal_agent_user,
-    AGENT_USER_ID,
-    AGENT_NAME,
-    AGENT_AVATAR,
-    AGENT_AVATAR_COLOR,
-    AGENT_QUOTE,
 )
 from fastapi import APIRouter
 from core import (
@@ -103,7 +95,6 @@ async def list_available_contacts(
 ):
     """Lists registered users excluding current user, with real-time online status."""
     current_user = await resolve_user_context(user_opt, db)
-    await ensure_personal_agent_user(db)
     # Only people you've chatted with: listing every user would let anyone harvest phone numbers
     peers = await chat_peer_ids(db, current_user)
     # Online / last seen / about only for people who let this user see them (visible_owner_ids);
@@ -193,43 +184,7 @@ async def list_available_contacts(
 
     # Sort contacts: active conversations with recent messages first, then remaining contacts
     contacts.sort(key=lambda x: (x[0], x[1].name), reverse=True)
-    normal_contacts = [c[1] for c in contacts if c[1].id != AGENT_USER_ID]
-
-    # Prepend User's Personal AI Agent at the very top of conversations
-    agent_msg_stmt = (
-        select(Message)
-        .where(
-            or_(
-                and_(Message.sender_id == current_user.id, Message.receiver_id == AGENT_USER_ID),
-                and_(Message.sender_id == AGENT_USER_ID, Message.receiver_id == current_user.id),
-            )
-        )
-        .order_by(desc(Message.timestamp))
-        .limit(1)
-    )
-    agent_msg_res = await db.execute(agent_msg_stmt)
-    latest_agent_msg = agent_msg_res.scalars().first()
-
-    agent_item = ChatContactItem(
-        id=AGENT_USER_ID,
-        phone_number="+00000000000",
-        name=AGENT_NAME,
-        avatar=AGENT_AVATAR,
-        avatar_color=AGENT_AVATAR_COLOR,
-        avatar_url=None,
-        quote=AGENT_QUOTE,
-        online=True,
-        last_message=latest_agent_msg.content if latest_agent_msg else "Your personal AI agent is ready. Ask me anything!",
-        time=(
-            iso_utc(latest_agent_msg.timestamp)
-            if latest_agent_msg and latest_agent_msg.timestamp
-            else ""
-        ),
-        unread=0,
-        last_seen=datetime.now(timezone.utc).isoformat(),
-    )
-
-    return [agent_item] + normal_contacts
+    return [c[1] for c in contacts if c[1].id != OLD_AGENT_ID]
 
 
 # -----------------------------------------------------------------------------

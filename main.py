@@ -15,7 +15,6 @@ includes the routers, in this order (the order routes are matched in):
     user_routes       profiles, chat list, delta sync, contacts
     message_routes    one-to-one message history / send / edit / delete
     meeting_routes    calendar
-    agent_routes      the personal AI agent
     gateway           the WebSocket gateway (/ws/{user_id})
 
 Shared helpers live in core.py; message delivery shared by REST and WebSocket in messaging.py.
@@ -36,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
 
 import admin_routes  # noqa: E402
-import agent_routes  # noqa: E402
 import archive  # noqa: E402
 import auth_routes  # noqa: E402
 import call_routes  # noqa: E402
@@ -54,7 +52,6 @@ import status_routes  # noqa: E402
 import upload_routes  # noqa: E402
 import user_routes  # noqa: E402
 import web_sessions  # noqa: E402
-from ai_agent import ensure_personal_agent_user  # noqa: E402
 from call_routes import cleanup_stale_call_sessions_loop  # noqa: E402
 from connection_manager import manager  # noqa: E402
 from core import DOCUMENT_UPLOAD_PATH, MAX_DOCUMENT_REQUEST_BYTES, MAX_REQUEST_BODY_BYTES  # noqa: E402
@@ -126,11 +123,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Error during init_db: %s", e)
 
-    async with async_session_factory() as session:
-        try:
-            await ensure_personal_agent_user(session)
-        except Exception as ag_err:
-            logger.warning("Could not auto-provision AI agent: %s", ag_err)
     logger.info("Initializing connection manager & Redis Pub/Sub...")
     await manager.initialize()
     keep_alive_task = asyncio.create_task(server_keep_alive_loop())
@@ -258,7 +250,6 @@ app.include_router(status_routes.router)
 app.include_router(user_routes.router)
 app.include_router(message_routes.router)
 app.include_router(meeting_routes.router)
-app.include_router(agent_routes.router)
 app.include_router(gateway.router)
 # Devices and per-device delivery tracking (watch mode, see devices.py)
 app.include_router(devices.router)

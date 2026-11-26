@@ -8,7 +8,7 @@ PUT /api/chats/{peer_id}/archive  {"archived": true | false}
   devices (phone / Flick Web) get a live `chat_archived` frame.
 - Archived chats stay archived when new messages arrive (WhatsApp's "Keep chats archived").
 - You can archive chats you actually have: a person you've exchanged messages with, or a group
-  you're (or were) in. The AI agent chat stays pinned and can't be archived.
+  you're (or were) in.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,7 +20,7 @@ from auth import get_current_user
 from connection_manager import manager
 from database import get_db
 from models import ChatArchive, GroupMember, Message, User
-from sync_service import AGENT_USER_ID, is_group_id, record_conversation_change
+from sync_service import is_group_id, record_conversation_change
 
 router = APIRouter(prefix="/api/chats", tags=["archive"])
 
@@ -32,8 +32,6 @@ class ArchiveRequest(BaseModel):
 async def _resolve_chat(db: AsyncSession, me: User, peer_id: str) -> str:
     """The chat's canonical id, or 404 if the caller has no such chat."""
     peer_id = (peer_id or "").strip()
-    if peer_id == AGENT_USER_ID:
-        raise HTTPException(status_code=400, detail="The Flick AI Agent chat can't be archived")
     if is_group_id(peer_id):
         member = (
             await db.execute(select(GroupMember.id).where(GroupMember.group_id == peer_id, GroupMember.user_id == me.id))

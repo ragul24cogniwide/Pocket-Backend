@@ -257,7 +257,7 @@ def test_older_app_versions_are_one_legacy_phone_until_the_new_app_registers(cli
     assert device_of(client, BOB, devices.LEGACY_PHONE_KEY).revoked_at is not None
 
 
-def test_signed_out_inactive_and_ai_agent_are_not_expected(client):
+def test_signed_out_and_inactive_devices_are_not_expected(client):
     reset(client)
     register(client, ALICE, ALICE_PHONE)
     register(client, BOB, BOB_PHONE)
@@ -276,10 +276,6 @@ def test_signed_out_inactive_and_ai_agent_are_not_expected(client):
     assert device_of(client, BOB, f"web:{bob_sid}").revoked_at is not None
     m = client.post("/api/messages/send", headers=phone_auth(ALICE, ALICE_PHONE), json={"receiver_id": BOB, "content": "x"}).json()["message_id"]
     assert rows(client, m) == {}
-
-    # The AI agent's chat stays on the server: not tracked
-    n = run(client, lambda: devices.expect_deliveries("agent-msg", datetime.now(timezone.utc), [devices.AGENT_USER_ID], ALICE, None))
-    assert n == 0
 
 
 def test_phone_logout_signs_out_every_device_and_account_deletion_removes_them(client):

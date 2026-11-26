@@ -3,7 +3,7 @@ Pydantic v2 schemas for authentication, users, and real-time messaging payloads.
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel, Field
 
 # Input size limits (longer values are rejected with 422 before reaching the database).
@@ -232,30 +232,6 @@ class CheckConflictRequest(BaseModel):
     start_time: datetime
     end_time: datetime
     exclude_meeting_id: Optional[str] = None
-
-
-# Personal AI Agent Schemas
-class AgentChatRequest(BaseModel):
-    # Length is checked in the endpoint (400, max MAX_AGENT_MESSAGE_CHARS in main.py)
-    content: str
-    # JavaScript getTimezoneOffset(); missing = unknown (the agent then assumes India time)
-    client_tz_offset_minutes: Optional[int] = None
-    client_msg_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)  # retries with the same id return the original reply
-    conversation_id: Optional[str] = Field(default=None, max_length=MAX_ID_CHARS)
-
-
-class AgentChatResponse(BaseModel):
-    reply: str
-    action: Optional[str] = None # e.g. "meeting_scheduled", "schedule_list", "meeting_updated", "meeting_cancelled", "conversation_summary", "clarification_needed"
-    meeting: Optional[Dict[str, Any]] = None
-    meetings: Optional[List[Dict[str, Any]]] = None
-    suggested_actions: Optional[List[str]] = None
-    user_message_id: Optional[str] = None
-    message_id: Optional[str] = None
-    timestamp: Optional[str] = None
-
-
-
 
 
 # ---------------------------------------------------------------------------

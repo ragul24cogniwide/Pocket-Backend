@@ -35,7 +35,7 @@ from notification_stack import group_chat_notification
 from notifications import chat_thread_key, send_push_notification
 from reactions import delete_reactions, reactions_for
 from schemas import CreateGroupRequest, GroupAdminRequest, GroupMembersRequest, UpdateGroupRequest
-from sync_service import AGENT_USER_ID, GROUP_ID_PREFIX, group_initials, is_group_id, record_conversation_change
+from sync_service import OLD_AGENT_ID, GROUP_ID_PREFIX, group_initials, is_group_id, record_conversation_change
 
 logger = logging.getLogger("Groups")
 
@@ -159,7 +159,7 @@ async def resolve_people(db: AsyncSession, raw_ids: Iterable[str], me: User) -> 
         u = found.get(val)
         if u is None:
             missing.append(val)
-        elif u.id not in (me.id, AGENT_USER_ID):
+        elif u.id not in (me.id, OLD_AGENT_ID):
             people[u.id] = u
     if missing:
         raise GroupError("Some of these people aren't on Flick", 404)

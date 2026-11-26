@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, func, or_, select, delete, update
+from sqlalchemy import desc, func, or_, select, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from identity import id_forms
@@ -18,11 +18,9 @@ from schemas import ChatContactItem, SyncConversationsResponse
 
 logger = logging.getLogger("SyncService")
 
-AGENT_USER_ID = "ai_assistant"
-AGENT_NAME = "Flick AI Agent"
-AGENT_AVATAR = "AI"
-AGENT_AVATAR_COLOR = "#FFB800"
-AGENT_QUOTE = "Your Personal AI Collaboration Assistant ⚡"
+# The account of the AI agent older versions had. Flick no longer has an AI agent: its chat is
+# never listed and nothing can be sent to it (its old rows simply stay unused in the database).
+OLD_AGENT_ID = "ai_assistant"
 
 GROUP_ID_PREFIX = "grp_"
 
@@ -151,36 +149,8 @@ async def build_conversation_snapshot(
 async def _build_snapshot(db: AsyncSession, user_id: str, peer_id: str, version: int = 0) -> Optional[dict]:
     if is_group_id(peer_id):
         return await build_group_snapshot(db, user_id, peer_id, version=version)
-    if peer_id == AGENT_USER_ID:
-        agent_msg_stmt = (
-            select(Message)
-            .where(
-                or_(
-                    and_(Message.sender_id == user_id, Message.receiver_id == AGENT_USER_ID),
-                    and_(Message.sender_id == AGENT_USER_ID, Message.receiver_id == user_id),
-                )
-            )
-            .order_by(desc(Message.timestamp))
-            .limit(1)
-        )
-        msg_res = await db.execute(agent_msg_stmt)
-        latest_agent_msg = msg_res.scalars().first()
-
-        return {
-            "id": AGENT_USER_ID,
-            "phone_number": "+00000000000",
-            "name": AGENT_NAME,
-            "avatar": AGENT_AVATAR,
-            "avatar_color": AGENT_AVATAR_COLOR,
-            "avatar_url": None,
-            "quote": AGENT_QUOTE,
-            "online": False,  # Volatile presence is WebSocket-only
-            "last_message": latest_agent_msg.content if latest_agent_msg else "Your personal AI agent is ready. Ask me anything!",
-            "time": iso_utc(latest_agent_msg.timestamp) if latest_agent_msg and latest_agent_msg.timestamp else "",
-            "unread": 0,
-            "last_seen": None,
-            "version": version,
-        }
+    if peer_id == OLD_AGENT_ID:
+        return None
 
     peer_stmt = select(User).where(User.id == peer_id)
     peer_res = await db.execute(peer_stmt)
@@ -387,7 +357,7 @@ async def build_all_conversations_for_user(
             or_(Message.sender_id.in_(my_ids), Message.receiver_id.in_(my_ids))
         )
     )
-    peer_ids = {p for row in pair_rows.all() for p in row if p and p not in my_ids and p != AGENT_USER_ID}
+    peer_ids = {p for row in pair_rows.all() for p in row if p and p not in my_ids and p != OLD_AGENT_ID}
     if not peer_ids:
         users = []
     else:
@@ -418,11 +388,6 @@ async def build_all_conversations_for_user(
         snap = await build_conversation_snapshot(db, current_user.id, gid, version=base_version)
         if snap:
             conversations.append(snap)
-
-    # Prepend AI agent
-    agent_snap = await build_conversation_snapshot(db, current_user.id, AGENT_USER_ID, version=base_version)
-    if agent_snap:
-        conversations = [agent_snap] + conversations
 
     return conversations
 

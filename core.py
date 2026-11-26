@@ -18,9 +18,6 @@ from models import Message, SavedContact, User
 from notification_stack import direct_chat_notification
 from notifications import chat_thread_key, send_push_notification
 import rate_limits
-from ai_agent import (
-    AGENT_USER_ID,
-)
 
 
 logger = logging.getLogger("Main")
@@ -59,8 +56,6 @@ OTP_MAX_SENDS_PER_IP_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_IP_PER_HOUR", "
 # Other per-user limits (429 when exceeded)
 PROFILE_LOOKUPS_PER_HOUR = 120   # GET /api/users/{number}: enough for normal use, too few to scan numbers
 UPLOADS_PER_HOUR = 60            # photos + voice notes
-AGENT_MESSAGES_PER_MINUTE = 20   # personal AI agent (each one is a paid LLM call)
-MAX_AGENT_MESSAGE_CHARS = 4000
 # Largest request body accepted at all (a 10 MB upload is ~13.4 MB as base64 + JSON overhead)
 MAX_REQUEST_BODY_BYTES = 15 * 1024 * 1024
 # Documents (any file, like WhatsApp): up to 20 MB, sent as a normal file upload (multipart, no
@@ -137,7 +132,7 @@ DEMO_BOTS_ENABLED = os.getenv("SEED_DEMO_USERS", "false").lower() == "true"
 
 
 async def chat_peer_ids(db: AsyncSession, user: User) -> set:
-    """Ids (and phone numbers) of everyone this user has exchanged messages with, plus the AI agent."""
+    """Ids (and phone numbers) of everyone this user has exchanged messages with."""
     mine = {i for i in (user.id, user.phone_number) if i}
     # Each person once (DISTINCT), not one row per message: this runs every few seconds per user
     sent_to = await db.execute(select(Message.receiver_id).where(Message.sender_id.in_(mine)).distinct())
@@ -147,7 +142,6 @@ async def chat_peer_ids(db: AsyncSession, user: User) -> set:
         res = await db.execute(select(User.id, User.phone_number).where(or_(User.id.in_(ids), User.phone_number.in_(ids))))
         for uid, phone in res.all():
             ids.update(x for x in (uid, phone) if x)
-    ids.add(AGENT_USER_ID)
     return ids
 
 
@@ -171,7 +165,7 @@ async def _with_phone_aliases(db: AsyncSession, ids: set) -> set:
 # A normal two-way chat (both have written) makes both sides visible to each other.
 # -----------------------------------------------------------------------------
 async def visible_owner_ids(db: AsyncSession, viewer: User) -> set:
-    """Ids (and phone numbers) of everyone whose statuses / presence `viewer` may see, plus the AI agent."""
+    """Ids (and phone numbers) of everyone whose statuses / presence `viewer` may see."""
     mine = {i for i in (viewer.id, viewer.phone_number) if i}
     # They wrote to me (DISTINCT: one row per person, not per message; this runs on every connect)
     wrote_to_me = await db.execute(select(Message.sender_id).where(Message.receiver_id.in_(mine)).distinct())
@@ -179,13 +173,12 @@ async def visible_owner_ids(db: AsyncSession, viewer: User) -> set:
     saved_me = await db.execute(select(SavedContact.user_id).where(SavedContact.contact_id.in_(mine)).distinct())
     ids = {p for (p,) in [*wrote_to_me.all(), *saved_me.all()] if p and p not in mine}
     await _with_phone_aliases(db, ids)
-    ids.add(AGENT_USER_ID)
     return ids
 
 
 async def is_visible_to(db: AsyncSession, owner: User, viewer: User) -> bool:
     """Whether `viewer` may see `owner`'s statuses / presence / about (same rule as visible_owner_ids)."""
-    if owner.id == viewer.id or owner.id == AGENT_USER_ID:
+    if owner.id == viewer.id:
         return True
     owner_ids = [i for i in (owner.id, owner.phone_number) if i]
     viewer_ids = [i for i in (viewer.id, viewer.phone_number) if i]

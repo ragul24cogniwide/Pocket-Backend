@@ -21,13 +21,30 @@ from schemas import (
     MeetingUpdate,
     CheckConflictRequest,
 )
-from ai_agent import (
-    check_meeting_conflicts,
-)
 from fastapi import APIRouter
 from core import resolve_user_context
 
 logger = logging.getLogger("Main")
+
+
+async def check_meeting_conflicts(
+    db: AsyncSession,
+    user_id: str,
+    start_time: datetime,
+    end_time: datetime,
+    exclude_meeting_id: Optional[str] = None,
+) -> list:
+    """This user's scheduled meetings that overlap the proposed time slot."""
+    stmt = select(Meeting).where(
+        Meeting.user_id == user_id,
+        Meeting.status == "SCHEDULED",
+        Meeting.start_time < end_time,
+        Meeting.end_time > start_time,
+    )
+    if exclude_meeting_id:
+        stmt = stmt.where(Meeting.id != exclude_meeting_id)
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
 
 router = APIRouter()
 

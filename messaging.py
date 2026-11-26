@@ -1,32 +1,23 @@
 """Message delivery shared by the REST routes and the WebSocket gateway: sending a one-to-one
-message, offline replay, the personal AI agent's replies and the demo bots."""
+message, offline replay and the demo bots."""
 
 import asyncio
-import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import HTTPException, WebSocket
-from sqlalchemy import or_, select, update
+from fastapi import WebSocket
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_agent import (
-    AGENT_USER_ID,
-    ensure_personal_agent_user,
-    process_personal_agent_message,
-)
 from connection_manager import manager
 from core import (
-    AGENT_MESSAGES_PER_MINUTE,
     DEMO_BOTS_ENABLED,
-    MAX_AGENT_MESSAGE_CHARS,
     MAX_METADATA_CHARS,
     dispatch_push_to_user,
-    enforce_rate_limit,
     find_client_message,
     push_metadata_field,
     receipts_shared,
@@ -38,7 +29,7 @@ from notifications import chat_thread_key, send_clear_notification, send_push_no
 import devices
 import groups
 from schemas import MAX_MESSAGE_CHARS
-from sync_service import record_conversation_change
+from sync_service import OLD_AGENT_ID, record_conversation_change
 
 logger = logging.getLogger("Main")
 
@@ -105,128 +96,7 @@ async def flush_offline_messages(user_id: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Personal AI Agent Background Handler
-# -----------------------------------------------------------------------------
-async def handle_personal_agent_reply(user_id: str, content: str, client_metadata: Optional[Any] = None) -> None:
-    """Invokes the user-isolated Personal AI Agent, performs actions, and sends back the response."""
-    try:
-        # 1. Send typing indicator from agent to user
-        typing_start = {
-            "type": "typing_start",
-            "data": {
-                "sender_id": AGENT_USER_ID,
-                "receiver_id": user_id,
-            },
-        }
-        await manager.send_personal_message(user_id, typing_start)
-        await asyncio.sleep(0.4)
-
-        tz_offset = None  # unknown unless the app sent it (the agent then assumes India time)
-        if isinstance(client_metadata, dict):
-            tz_offset = client_metadata.get("tz_offset_minutes")
-
-        # Same limits as /api/agent/chat. The message itself is already stored, so over the
-        # limit the agent answers with a short note instead of calling the AI.
-        limit_note = None
-        try:
-            await check_agent_limits(user_id, content)
-        except HTTPException as limit_err:
-            limit_note = str(limit_err.detail)
-
-        async with async_session_factory() as db:
-            # Look up current user
-            u_stmt = select(User).where(or_(User.id == user_id, User.phone_number == user_id))
-            u_res = await db.execute(u_stmt)
-            current_user = u_res.scalars().first()
-            if not current_user:
-                current_user = User(
-                    id=user_id,
-                    phone_number=user_id,
-                    username=f"User {user_id[-4:]}" if len(user_id) >= 4 else "Flick User",
-                    avatar_color="#FFB800",
-                    is_online=True,
-                )
-                db.add(current_user)
-                await db.commit()
-                await db.refresh(current_user)
-
-            # Ensure agent user exists
-            await ensure_personal_agent_user(db)
-
-            if limit_note:
-                agent_result = {"reply": limit_note, "action": "general_chat"}
-            else:
-                # Process AI request with user's calendar and message context. The agent ends its
-                # read transaction before calling Gemini, so no DB connection waits on the AI.
-                agent_result = await process_personal_agent_message(current_user, content, db, tz_offset)
-            await db.commit()  # meeting changes made by the agent, if any
-
-        # Save the AI response in a new short session
-        async with async_session_factory() as db:
-            now = datetime.now(timezone.utc)
-            reply_metadata = {
-                "is_agent": True,
-                "action": agent_result.get("action"),
-                "meeting": agent_result.get("meeting"),
-                "meetings": agent_result.get("meetings"),
-                "suggested_actions": agent_result.get("suggested_actions"),
-            }
-            reply_to_str = json.dumps({"metadata": reply_metadata})
-
-            agent_msg = Message(
-                sender_id=AGENT_USER_ID,
-                receiver_id=user_id,
-                content=agent_result.get("reply", "I am your personal AI assistant."),
-                reply_to=reply_to_str,
-                timestamp=now,
-                status=MessageStatus.DELIVERED,
-                delivered_at=now,
-            )
-            db.add(agent_msg)
-            await db.commit()
-            await db.refresh(agent_msg)
-
-            try:
-                await record_conversation_change(db, user_id=user_id, peer_id=AGENT_USER_ID, action="updated")
-                await db.commit()
-            except Exception:
-                pass
-
-            msg_dict = agent_msg.to_dict()
-
-        # Stop typing
-        typing_stop = {
-            "type": "typing_stop",
-            "data": {
-                "sender_id": AGENT_USER_ID,
-                "receiver_id": user_id,
-            },
-        }
-        await manager.send_personal_message(user_id, typing_stop)
-
-        # Dispatch AI message over WebSocket
-        chat_frame = {
-            "type": "chat_message",
-            "data": msg_dict,
-        }
-        await manager.send_personal_message(user_id, chat_frame)
-
-    except Exception as e:
-        logger.error("Error in handle_personal_agent_reply: %s", e, exc_info=True)
-        try:
-            typing_stop = {
-                "type": "typing_stop",
-                "data": {"sender_id": AGENT_USER_ID, "receiver_id": user_id},
-            }
-            await manager.send_personal_message(user_id, typing_stop)
-        except Exception:
-            pass
-
-
-
-
-# -----------------------------------------------------------------------------
-# Simulated AI / Bot Auto-Responder (Takes Flick to the Next Level 🚀)
+# Demo bot auto-responder (demo accounts only, SEED_DEMO_USERS)
 # -----------------------------------------------------------------------------
 async def handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content: str) -> None:
     """Demo-bot reply (SEED_DEMO_USERS only). Runs as a background task: never raises, logs instead."""
@@ -368,47 +238,11 @@ async def _handle_bot_auto_reply(sender_id: str, receiver_id: str, user_content:
                 )
 
 
-# The personal AI agent: idempotent replies and per-user limits (used by the REST route and the gateway)
-def agent_reply_client_id(user_id: str, client_msg_id: str) -> str:
-    """
-    client_msg_id of the agent's answer to a user's question. The agent is the sender of every
-    answer, so the key must include the user (two people can pick the same id), and it must fit
-    the 64-character column: hence a hash.
-    """
-    digest = hashlib.sha256(f"{user_id}:{client_msg_id}".encode()).hexdigest()[:40]
-    return f"reply:{digest}"
-
-
-async def find_agent_reply(db: AsyncSession, user_id: str, client_msg_id: Optional[str]) -> Optional[Message]:
-    """The agent's stored answer to this user's question, if any (also the older "reply:<id>" form)."""
-    if not client_msg_id:
-        return None
-    res = await db.execute(
-        select(Message).where(
-            Message.sender_id == AGENT_USER_ID,
-            Message.receiver_id == user_id,
-            Message.client_msg_id.in_([agent_reply_client_id(user_id, client_msg_id), f"reply:{client_msg_id}"]),
-        )
-    )
-    return res.scalars().first()
-
-
-async def check_agent_limits(user_id: str, content: str) -> None:
-    """Personal agent: message length cap (400) and per-user rate limit (429); each message is an LLM call."""
-    if len(content or "") > MAX_AGENT_MESSAGE_CHARS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Message is too long for the AI agent (max {MAX_AGENT_MESSAGE_CHARS} characters).",
-        )
-    await enforce_rate_limit(
-        f"agent:{user_id}", AGENT_MESSAGES_PER_MINUTE, 60, "You're sending messages to the AI agent too quickly."
-    )
-
-
 # -----------------------------------------------------------------------------
 # Sending a one-to-one message (REST POST /api/messages/send and the WebSocket "send_message")
 # -----------------------------------------------------------------------------
 NOT_ON_FLICK = "This number isn’t on Flick"
+AGENT_REMOVED = "Flick no longer has an AI agent"
 TOO_LONG = "Message is too long"
 
 
@@ -471,7 +305,7 @@ async def send_direct_message(
       4. delta-sync change records for both people
       5. `on_stored(message)` (the gateway acknowledges the sender here, before anything else)
       6. the receiver's devices, the sender's other devices (not `exclude_ws`), a push notification,
-         and the personal AI agent's reply / a demo bot reply
+         and a demo bot reply
 
     Two copies of the same send arriving at once (socket + REST fallback) can't both be stored:
     the unique index on (sender_id, client_msg_id) keeps one and the other returns it.
@@ -484,6 +318,9 @@ async def send_direct_message(
             return SendResult(existing.to_dict(), duplicate=True)
     if len(content) > MAX_MESSAGE_CHARS or len(json.dumps(metadata or {})) > MAX_METADATA_CHARS:
         raise SendError(413, TOO_LONG)
+
+    if receiver_id == OLD_AGENT_ID:
+        raise SendError(410, AGENT_REMOVED)
 
     async with async_session_factory() as db:
         found = await db.execute(select(User).where(User.id.in_([sender_id, receiver_id])))
@@ -557,10 +394,8 @@ async def send_direct_message(
         sender_id=sender_id, receiver_id=receiver_id, content=content, data_payload=push_data,
     ))
 
-    # The personal AI agent answers; demo contacts answer when demo bots are on
-    if receiver_id == AGENT_USER_ID or receiver_id.startswith("agent_"):
-        asyncio.create_task(handle_personal_agent_reply(sender_id, content, metadata))
-    elif DEMO_BOTS_ENABLED:
+    # Demo contacts answer when demo bots are on
+    if DEMO_BOTS_ENABLED:
         asyncio.create_task(handle_bot_auto_reply(sender_id, receiver_id, content))
 
     return SendResult(message_dict, duplicate=False)
