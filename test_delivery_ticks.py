@@ -89,6 +89,33 @@ def test_push_delivery_turns_one_tick_into_two_for_the_sender(client):
         assert client.post("/api/messages/delivered", headers=_h(b), json={"message_ids": [mid]}).json()["delivered"] == 0
 
 
+def test_one_push_for_several_messages_gives_them_all_two_ticks(client):
+    """
+    Bob is offline while Alice sends 3 messages. Firebase keeps only the LAST notification for an
+    offline phone; it lists all three but carries only its own id. When Bob's phone confirms it,
+    the earlier ones reached him too: all three get two ticks (only the last one did before).
+    """
+    _reset(client)
+    a, b = _token(client, ALICE), _token(client, BOB)
+    send = lambda text: client.post(  # noqa: E731
+        "/api/messages/send", headers=_h(a), json={"receiver_id": BOB, "content": text}
+    ).json()["message_id"]
+    m1, m2, m3 = send("hi"), send("hello"), send("tata")
+    with client.websocket_connect(f"/ws/{ALICE}?token={a}") as wa:
+        r = client.post("/api/messages/delivered", headers=_h(b), json={"message_ids": [m3]}).json()
+        assert r["delivered"] == 3
+        assert [_status(client, m) for m in (m1, m2, m3)] == ["DELIVERED"] * 3
+        acked = {_next(wa, "ack_delivered")["data"]["message_id"] for _ in range(3)}
+        assert acked == {m1, m2, m3}  # Alice's screen turns all three to two ticks
+
+    # A message sent after the confirmed one has not reached Bob yet: still one tick
+    m4 = send("Dai dai")
+    assert client.post("/api/messages/delivered", headers=_h(b), json={"message_ids": [m3]}).json()["delivered"] == 0
+    assert _status(client, m4) == "SENT"
+    # Its own push arrives later: then it gets two ticks
+    assert client.post("/api/messages/delivered", headers=_h(b), json={"message_ids": [m4]}).json()["delivered"] == 1
+
+
 def test_nobody_else_can_mark_a_message_delivered_and_read_stays_read(client):
     _reset(client)
     a, b, e = _token(client, ALICE), _token(client, BOB), _token(client, EVE)

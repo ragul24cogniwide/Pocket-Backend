@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import WebSocket
-from sqlalchemy import select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -434,13 +434,29 @@ async def mark_messages_delivered(user_id: str, message_ids: list) -> int:
     async with async_session_factory() as db:
         me = await db.get(User, user_id)
         mine = id_forms(user_id, me.phone_number if me else None)
+        # The newest confirmed message per sender. Everything that sender sent this person BEFORE
+        # it has reached the phone too: while a phone is offline Firebase keeps only the latest
+        # notification (the earlier ones are dropped), and that one lists the earlier messages but
+        # carries only its own id. Without this, only the last of several messages got two ticks.
+        newest = (
+            await db.execute(
+                select(Message.sender_id, func.max(Message.timestamp)).where(
+                    Message.id.in_(ids), Message.receiver_id.in_(mine)
+                ).group_by(Message.sender_id)
+            )
+        ).all()
+        if not newest:
+            return 0
         rows = (
             await db.execute(
                 select(Message.id, Message.sender_id).where(
-                    Message.id.in_(ids),
                     Message.receiver_id.in_(mine),
                     Message.status == MessageStatus.SENT,
-                )
+                    or_(
+                        Message.id.in_(ids),
+                        *[and_(Message.sender_id == sender, Message.timestamp <= ts) for sender, ts in newest],
+                    ),
+                ).order_by(Message.timestamp.desc()).limit(500)
             )
         ).all()
         if not rows:
